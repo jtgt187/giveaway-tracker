@@ -254,7 +254,10 @@ def get_known_urls():
 def update_terms_check(giveaway_id, checked, excluded_countries="", detected_region=None):
     conn = get_connection()
     cursor = conn.cursor()
-    if detected_region and detected_region != "restricted":
+    if detected_region:
+        # Always update country_restriction when a region was detected from
+        # T&C analysis -- including "restricted" (e.g. state-level US
+        # restrictions like "residents of California only").
         cursor.execute("""
             UPDATE giveaways SET terms_checked = ?, terms_excluded = ?, country_restriction = ? WHERE id = ?
         """, (checked, excluded_countries, detected_region, giveaway_id))

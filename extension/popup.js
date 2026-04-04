@@ -8,8 +8,26 @@ function setStatus(msg, duration) {
   const el = document.getElementById('status');
   el.textContent = msg;
   if (duration) {
-    setTimeout(() => { if (el.textContent === msg) el.textContent = ''; }, duration);
+    setTimeout(function() { if (el.textContent === msg) el.textContent = ''; }, duration);
   }
+}
+
+// ── Local download helper ─────────────────────────────────────────────
+// Runs in the popup context which has full DOM access (Blob, URL, <a>).
+// This avoids MV3 service-worker limitations entirely.
+
+function downloadNdjsonFile(entries) {
+  var content = entries.map(function(l) { return JSON.stringify(l); }).join('\n') + '\n';
+  var blob = new Blob([content], { type: 'application/x-ndjson' });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url;
+  a.download = 'gleam-links.ndjson';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  // Revoke after a short delay to ensure the download starts
+  setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
 }
 
 // ── Update counter & unexported badge ─────────────────────────────────
@@ -18,8 +36,8 @@ function updateCount() {
   chrome.runtime.sendMessage({ type: 'get-count' }, function(response) {
     if (chrome.runtime.lastError || !response) return;
 
-    const count = response.count;
-    const unexported = response.unexported;
+    var count = response.count;
+    var unexported = response.unexported;
     knownCount = count;
 
     document.getElementById('count').textContent = count;
@@ -43,18 +61,18 @@ function updateRecentLinks() {
   chrome.runtime.sendMessage({ type: 'get-links' }, function(response) {
     if (chrome.runtime.lastError || !response || !response.links) return;
 
-    const list = document.getElementById('recentList');
-    const recent = response.links.slice(-5).reverse(); // last 5, newest first
+    var list = document.getElementById('recentList');
+    var recent = response.links.slice(-5).reverse(); // last 5, newest first
 
     if (recent.length === 0) {
       list.innerHTML = '<div class="recent-empty">No links yet</div>';
       return;
     }
 
-    list.innerHTML = recent.map(l => {
-      const displayUrl = l.href.replace('https://', '').replace('http://', '');
-      const label = l.text || displayUrl;
-      const page = l.pageUrl ? new URL(l.pageUrl).hostname : '';
+    list.innerHTML = recent.map(function(l) {
+      var displayUrl = l.href.replace('https://', '').replace('http://', '');
+      var label = l.text || displayUrl;
+      var page = l.pageUrl ? new URL(l.pageUrl).hostname : '';
       return '<div class="recent-item">' +
         '<a href="' + escapeHtml(l.href) + '" target="_blank" title="' + escapeHtml(l.href) + '">' +
           escapeHtml(label.substring(0, 60)) +
@@ -70,20 +88,43 @@ function escapeHtml(str) {
 }
 
 // ── Export new links only ─────────────────────────────────────────────
+// Fetches export data from background, downloads locally in popup,
+// then tells background to update the export index.
 
 function exportNew() {
   setStatus('Exporting new links...');
-  chrome.runtime.sendMessage({ type: 'export-new' }, function(response) {
+  chrome.runtime.sendMessage({ type: 'get-export-data' }, function(response) {
     if (chrome.runtime.lastError) {
       setStatus('Export failed: ' + chrome.runtime.lastError.message, 4000);
       return;
     }
-    if (response && response.ok) {
-      setStatus('Exported ' + response.exported + ' new links', 3000);
-      updateCount();
-    } else {
-      setStatus(response ? response.error : 'Export failed', 3000);
+    if (!response || !response.links) {
+      setStatus('Export failed: no data', 4000);
+      return;
     }
+
+    var newEntries = response.links.slice(response.lastExportIndex);
+    if (newEntries.length === 0) {
+      setStatus('No new links since last export', 3000);
+      return;
+    }
+
+    try {
+      downloadNdjsonFile(newEntries);
+    } catch (e) {
+      setStatus('Export failed: ' + e.message, 4000);
+      return;
+    }
+
+    // Tell background to advance the export index
+    chrome.runtime.sendMessage({
+      type: 'mark-exported',
+      upToIndex: response.links.length
+    }, function() {
+      if (chrome.runtime.lastError) return;
+      setStatus('Exported ' + newEntries.length + ' new links', 3000);
+      updateCount();
+    });
   });
 }
 
@@ -91,17 +132,32 @@ function exportNew() {
 
 function downloadAll() {
   setStatus('Preparing download...');
-  chrome.runtime.sendMessage({ type: 'download' }, function(response) {
+  chrome.runtime.sendMessage({ type: 'get-export-data' }, function(response) {
     if (chrome.runtime.lastError) {
       setStatus('Download failed: ' + chrome.runtime.lastError.message, 4000);
       return;
     }
-    if (response && response.ok) {
-      setStatus('Downloaded! Links remain in collection.', 3000);
-      updateCount();
-    } else {
-      setStatus(response ? response.error : 'Download failed', 3000);
+    if (!response || !response.links || response.links.length === 0) {
+      setStatus('No links collected', 3000);
+      return;
     }
+
+    try {
+      downloadNdjsonFile(response.links);
+    } catch (e) {
+      setStatus('Download failed: ' + e.message, 4000);
+      return;
+    }
+
+    // Mark all as exported
+    chrome.runtime.sendMessage({
+      type: 'mark-exported',
+      upToIndex: response.links.length
+    }, function() {
+      if (chrome.runtime.lastError) return;
+      setStatus('Downloaded ' + response.links.length + ' links', 3000);
+      updateCount();
+    });
   });
 }
 
@@ -128,7 +184,7 @@ function loadSettings() {
 }
 
 function onThresholdChange() {
-  const val = parseInt(document.getElementById('thresholdInput').value, 10) || 0;
+  var val = parseInt(document.getElementById('thresholdInput').value, 10) || 0;
   chrome.runtime.sendMessage({ type: 'set-auto-threshold', value: val }, function(response) {
     if (chrome.runtime.lastError) return;
     if (response && response.ok) {

@@ -30,30 +30,31 @@ chrome.storage.local.get(
   }
 );
 
-// ── Download helper ──────────────────────────────────────────────────
+// ── Auto-export download (background-only, fire-and-forget) ─────────
+// Service workers lack Blob/URL.createObjectURL, so use a data URI.
+// This is only used for auto-export where no popup is waiting for a
+// response, avoiding the "message port closed" problem entirely.
 
-function downloadNdjson(entries) {
-  return new Promise((resolve, reject) => {
-    if (entries.length === 0) { reject(new Error('No links to export')); return; }
+function backgroundDownloadNdjson(entries) {
+  if (entries.length === 0) return;
 
+  try {
     const content = entries.map(l => JSON.stringify(l)).join('\n') + '\n';
-    // Service Workers (MV3) don't support URL.createObjectURL — use a data URI instead
     const dataUrl = 'data:application/x-ndjson;base64,' + btoa(unescape(encodeURIComponent(content)));
-    const filename = 'gleam-links.ndjson';
 
     chrome.downloads.download({
       url: dataUrl,
-      filename,
+      filename: 'gleam-links.ndjson',
       saveAs: false,
       conflictAction: 'overwrite'
-    }, (downloadId) => {
+    }, () => {
       if (chrome.runtime.lastError) {
-        reject(chrome.runtime.lastError);
-      } else {
-        resolve(downloadId);
+        console.warn('Gleam Monitor: auto-export download error', chrome.runtime.lastError.message);
       }
     });
-  });
+  } catch (e) {
+    console.warn('Gleam Monitor: auto-export encoding error', e);
+  }
 }
 
 // ── Auto-export check ────────────────────────────────────────────────
@@ -63,12 +64,9 @@ function checkAutoExport() {
   const unexported = links.length - lastExportIndex;
   if (unexported >= autoExportThreshold) {
     const newEntries = links.slice(lastExportIndex);
-    downloadNdjson(newEntries).then(() => {
-      lastExportIndex = links.length;
-      persist();
-    }).catch(e => {
-      console.warn('Gleam Monitor: auto-export failed', e);
-    });
+    backgroundDownloadNdjson(newEntries);
+    lastExportIndex = links.length;
+    persist();
   }
 }
 
@@ -109,36 +107,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // ── Download ALL links ──
-  if (msg.type === 'download') {
-    if (links.length === 0) {
-      sendResponse({ ok: false, error: 'No links collected' });
-      return true;
-    }
-    downloadNdjson(links).then(() => {
-      lastExportIndex = links.length;
-      persist();
-      sendResponse({ ok: true });
-    }).catch(e => {
-      sendResponse({ ok: false, error: String(e.message || e) });
-    });
+  // ── Get export data (links + index so popup can build the file) ──
+  if (msg.type === 'get-export-data') {
+    sendResponse({ links, lastExportIndex });
     return true;
   }
 
-  // ── Download only NEW (unexported) links ──
-  if (msg.type === 'export-new') {
-    const newEntries = links.slice(lastExportIndex);
-    if (newEntries.length === 0) {
-      sendResponse({ ok: false, error: 'No new links since last export' });
-      return true;
-    }
-    downloadNdjson(newEntries).then(() => {
-      lastExportIndex = links.length;
+  // ── Mark links as exported (called by popup after successful download) ──
+  if (msg.type === 'mark-exported') {
+    const idx = parseInt(msg.upToIndex, 10);
+    if (idx > lastExportIndex) {
+      lastExportIndex = idx;
       persist();
-      sendResponse({ ok: true, exported: newEntries.length });
-    }).catch(e => {
-      sendResponse({ ok: false, error: String(e.message || e) });
-    });
+    }
+    sendResponse({ ok: true, lastExportIndex });
     return true;
   }
 

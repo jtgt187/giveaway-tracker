@@ -11,27 +11,33 @@ from playwright.sync_api import sync_playwright
 def _run_in_thread(fn, *args, **kwargs):
     """Run *fn* in a dedicated thread so Playwright gets a clean event loop.
 
-    On Windows, Streamlit's ``ProactorEventLoop`` does not support
-    ``subprocess_exec``, which Playwright needs to launch the browser
-    process.  Running in a separate thread side-steps the issue because
-    the thread creates its own event loop.  We also explicitly set a
-    ``SelectorEventLoop`` on Windows so that ``asyncio.create_subprocess_exec``
-    (used internally by Playwright) works correctly.
+    On Windows, Streamlit's already-running ``ProactorEventLoop`` cannot be
+    reused by Playwright to launch browser subprocesses.  Running in a
+    separate thread with a *fresh* ``ProactorEventLoop`` (via
+    ``asyncio.new_event_loop()``) side-steps the issue.
     """
 
     def _wrapper():
         _original_loop = None
+        _new_loop = None
         try:
             _original_loop = asyncio.get_event_loop()
         except RuntimeError:
             _original_loop = None
         if sys.platform == "win32":
-            asyncio.set_event_loop(asyncio.SelectorEventLoop())
+            # ProactorEventLoop (the default on Windows) is the only loop
+            # type that supports subprocess creation.  SelectorEventLoop
+            # does NOT support subprocesses on Windows.
+            _new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(_new_loop)
         try:
             return fn(*args, **kwargs)
         finally:
-            if sys.platform == "win32" and _original_loop is not None:
-                asyncio.set_event_loop(_original_loop)
+            if sys.platform == "win32":
+                if _new_loop is not None:
+                    _new_loop.close()
+                if _original_loop is not None:
+                    asyncio.set_event_loop(_original_loop)
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         future: Future = pool.submit(_wrapper)
