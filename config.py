@@ -24,11 +24,34 @@ DEFAULT_CONFIG = {
 
 def load_config():
     if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            saved = json.load(f)
-        config = DEFAULT_CONFIG.copy()
-        config.update(saved)
-        return config
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            config = DEFAULT_CONFIG.copy()
+            config.update(saved)
+            return config
+        except (json.JSONDecodeError, ValueError) as e:
+            # Config file is malformed (e.g. unescaped backslashes in Windows paths).
+            # Try to salvage by reading as raw text and fixing common issues.
+            try:
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                    raw = f.read()
+                # Fix unescaped backslashes (common with Windows paths pasted manually)
+                fixed = raw.replace("\\", "\\\\")
+                saved = json.loads(fixed)
+                config = DEFAULT_CONFIG.copy()
+                config.update(saved)
+                # Re-save with proper escaping so this doesn't happen again
+                save_config(config)
+                return config
+            except (json.JSONDecodeError, ValueError, OSError):
+                # Completely broken -- back up and start fresh
+                backup = CONFIG_PATH + ".bak"
+                try:
+                    os.replace(CONFIG_PATH, backup)
+                except OSError:
+                    pass
+                return DEFAULT_CONFIG.copy()
     return DEFAULT_CONFIG.copy()
 
 
