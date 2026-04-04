@@ -579,6 +579,12 @@ CUSTOM_CSS = """
     .ga-badge-not_eligible { background: rgba(239,68,68,0.15); color: #f87171; }
     .ga-table .ga-muted { color: var(--text-tertiary); }
 
+    /* Highlighted row (last-clicked giveaway) */
+    .ga-row-clicked {
+        background: rgba(99,102,241,0.08) !important;
+        border-left: 3px solid var(--accent-primary) !important;
+    }
+
     /* Account status cards */
     .account-grid {
         display: grid;
@@ -662,6 +668,25 @@ CUSTOM_CSS = """
 """
 
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+# JavaScript for highlighting last-clicked giveaway row
+st.markdown("""
+<script>
+document.addEventListener('click', function(e) {
+    var link = e.target.closest('a.ga-clickable');
+    if (!link) return;
+    // Remove highlight from all rows
+    document.querySelectorAll('.ga-row-clicked').forEach(function(el) {
+        el.classList.remove('ga-row-clicked');
+    });
+    // Highlight the clicked row (the parent stHorizontalBlock)
+    var row = link.closest('[data-testid="stHorizontalBlock"]');
+    if (row) {
+        row.classList.add('ga-row-clicked');
+    }
+});
+</script>
+""", unsafe_allow_html=True)
 
 SVG_ICONS = {
     "dashboard": '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>',
@@ -778,8 +803,10 @@ def run_crawl(crawl_sources, custom_sites_list, progress_placeholder):
                     skipped_ended += 1
                 elif result == "region_blocked":
                     skipped_region += 1
-                else:
+                elif result == "ok":
                     validated.append(g)
+                # "error" results are silently skipped — don't add
+                # unverifiable giveaways to the database
 
     validated.extend(non_gleam)
 
@@ -982,17 +1009,17 @@ def main():
         crawl_sources = config.get("crawl_sources", [])
         custom_sites = config.get("custom_sites", [])
         if crawl_sources or custom_sites:
-            with st.spinner("Auto-crawling on startup..."):
-                # Use a minimal placeholder that doesn't render a progress bar
-                class _SilentProgress:
-                    def progress(self, *a, **kw):
-                        pass
-                new_count, eligible_count, total_found = run_crawl(
-                    crawl_sources, custom_sites, _SilentProgress()
-                )
-                scan_existing_entries()
-                if new_count > 0:
-                    st.toast(f"Auto-crawl: {new_count} new giveaways found ({eligible_count} eligible)")
+            progress_bar = st.progress(0.0, text="Auto-crawling on startup...")
+            new_count, eligible_count, total_found = run_crawl(
+                crawl_sources, custom_sites, progress_bar
+            )
+            progress_bar.progress(1.0, text="Auto-crawl complete!")
+            scan_existing_entries()
+            if new_count > 0:
+                st.toast(f"Auto-crawl: {new_count} new giveaways found ({eligible_count} eligible)")
+            import time
+            time.sleep(1)
+            progress_bar.empty()
 
     if "crawl_running" not in st.session_state:
         st.session_state.crawl_running = False
@@ -1371,24 +1398,26 @@ def main():
                         countdown = "---"
                         urgency_class = "urgency-normal"
 
-                    # Row layout: Title | Status | Win Chance | Deadline | X button
-                    col_title, col_status, col_chance, col_deadline, col_remove = st.columns([5, 1.5, 1.2, 1.5, 0.5])
+                    # Row layout: X button | Title | Status | Win Chance | Deadline
+                    col_remove, col_title, col_status, col_chance, col_deadline = st.columns([0.5, 5, 1.5, 1.2, 1.5])
+                    with col_remove:
+                        if st.button("✗", key=f"{key_prefix}bl_{gid}", help="Remove & blacklist"):
+                            add_to_blacklist(url, "Manually blacklisted")
+                            _cached_giveaways_display.clear()
+                            st.rerun()
                     with col_title:
-                        st.markdown(f'<a class="ga-title" href="{html_escape(url, quote=True)}" target="_blank" rel="noopener">{html_escape(title)}</a>', unsafe_allow_html=True)
+                        st.markdown(f'<a class="ga-title ga-clickable" href="{html_escape(url, quote=True)}" target="_blank" rel="noopener">{html_escape(title)}</a>', unsafe_allow_html=True)
                     with col_status:
                         st.markdown(f'<span class="ga-badge ga-badge-{status}">{badge_label}</span>', unsafe_allow_html=True)
                     with col_chance:
                         st.markdown(f"<small>{win_chance}</small>", unsafe_allow_html=True)
                     with col_deadline:
                         st.markdown(f'<span class="{urgency_class}">{countdown}</span>', unsafe_allow_html=True)
-                    with col_remove:
-                        if st.button("✗", key=f"{key_prefix}bl_{gid}", help="Remove & blacklist"):
-                            add_to_blacklist(url, "Manually blacklisted")
-                            _cached_giveaways_display.clear()
-                            st.rerun()
 
             # Table header
-            hdr_title, hdr_status, hdr_chance, hdr_deadline, hdr_rm = st.columns([5, 1.5, 1.2, 1.5, 0.5])
+            hdr_rm, hdr_title, hdr_status, hdr_chance, hdr_deadline = st.columns([0.5, 5, 1.5, 1.2, 1.5])
+            with hdr_rm:
+                st.markdown("")
             with hdr_title:
                 st.markdown("**Title**")
             with hdr_status:
@@ -1397,8 +1426,6 @@ def main():
                 st.markdown("**Win %**")
             with hdr_deadline:
                 st.markdown("**Deadline**")
-            with hdr_rm:
-                st.markdown("")
 
             if not df_main.empty:
                 _render_giveaway_rows(df_main)

@@ -79,6 +79,8 @@ REGION_BLOCKED_KEYWORDS = [
     "not available in your region",
     "promotion is not available in your country",
     "not available in your country",
+    "!contestantstate.location_allowed",
+    "location_allowed",
 ]
 
 # Keywords indicating the giveaway/competition has ended.

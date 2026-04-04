@@ -1,7 +1,13 @@
 import requests
+import cloudscraper
 from bs4 import BeautifulSoup
 from utils.network import get_random_headers, random_delay
 from utils.country_check import is_region_blocked, is_ended
+
+# Shared cloudscraper session for bypassing Cloudflare challenges
+_scraper = cloudscraper.create_scraper(
+    browser={"browser": "chrome", "platform": "windows", "desktop": True}
+)
 
 
 class BaseCrawler:
@@ -11,9 +17,15 @@ class BaseCrawler:
 
     def get_page(self, url):
         headers = get_random_headers(referer=self.base_url)
-        resp = requests.get(url, headers=headers, timeout=30)
-        resp.raise_for_status()
-        return resp.text
+        try:
+            resp = _scraper.get(url, headers=headers, timeout=30)
+            resp.raise_for_status()
+            return resp.text
+        except Exception:
+            # Fallback to plain requests if cloudscraper fails
+            resp = requests.get(url, headers=headers, timeout=30)
+            resp.raise_for_status()
+            return resp.text
 
     def extract_giveaways(self):
         raise NotImplementedError
