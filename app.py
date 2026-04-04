@@ -730,6 +730,8 @@ def import_ndjson_links():
                     continue
                 try:
                     entry = json.loads(line)
+                    if not isinstance(entry, dict):
+                        continue
                     href = entry.get("href", "")
                     text = entry.get("text", "") or href
                     if href and "gleam.io" in href:
@@ -740,13 +742,12 @@ def import_ndjson_links():
     except OSError:
         return 0
 
-    # Clear the file after successful import so links aren't re-imported
-    if imported > 0:
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                f.truncate(0)
-        except OSError:
-            pass
+    # Clear the file after reading so links aren't re-processed on next startup
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            pass  # "w" mode truncates the file
+    except OSError:
+        pass
 
     return imported
 
