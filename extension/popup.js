@@ -1,143 +1,157 @@
-let fileHandle = null;
-let fileWriter = null;
-let writeQueue = [];
-let isWriting = false;
+// ── State ─────────────────────────────────────────────────────────────
+
+let knownCount = 0;
+
+// ── UI helpers ────────────────────────────────────────────────────────
+
+function setStatus(msg, duration) {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  if (duration) {
+    setTimeout(() => { if (el.textContent === msg) el.textContent = ''; }, duration);
+  }
+}
+
+// ── Update counter & unexported badge ─────────────────────────────────
 
 function updateCount() {
   chrome.runtime.sendMessage({ type: 'get-count' }, function(response) {
-    if (response) {
-      const count = response.count;
-      document.getElementById('count').textContent = count;
-      document.getElementById('downloadBtn').disabled = count === 0;
-      document.getElementById('clearBtn').disabled = count === 0;
-      
-      if (count === 0) {
-        document.getElementById('status').textContent = 'Browse pages with Gleam links';
-        document.getElementById('status').className = 'zero';
-      } else {
-        document.getElementById('status').textContent = count + ' link' + (count !== 1 ? 's' : '') + ' ready';
-        document.getElementById('status').className = '';
-      }
-    }
-  });
-}
+    if (chrome.runtime.lastError || !response) return;
 
-function updateFileStatus() {
-  if (fileHandle) {
-    document.getElementById('fileStatus').textContent = 'Auto-saving to: ' + fileHandle.name;
-  } else {
-    document.getElementById('fileStatus').textContent = '';
-  }
-}
+    const count = response.count;
+    const unexported = response.unexported;
+    knownCount = count;
 
-async function selectFile() {
-  if (!window.showOpenFilePicker) {
-    alert('Your Edge version does not support File System Access API.');
-    return;
-  }
-  
-  try {
-    const [handle] = await window.showOpenFilePicker({
-      types: [{ description: 'NDJSON Files', accept: { 'application/json': ['.ndjson', '.json', '.txt'] } }],
-      multiple: false
-    });
-    
-    fileHandle = handle;
-    writeQueue = [];
-    isWriting = false;
-    
-    document.getElementById('fileStatus').textContent = 'Auto-saving to: ' + handle.name;
-    document.getElementById('status').textContent = 'File selected! Links will be auto-saved.';
-    
-    // Write any existing links
-    chrome.runtime.sendMessage({ type: 'get-links' }, function(response) {
-      if (response && response.links && response.links.length > 0) {
-        writeQueue = [...response.links];
-        processWriteQueue();
-      }
-    });
-  } catch (err) {
-    if (err.name !== 'AbortError') {
-      document.getElementById('status').textContent = 'Error: ' + err;
-    }
-  }
-}
+    document.getElementById('count').textContent = count;
+    document.getElementById('downloadBtn').disabled = count === 0;
+    document.getElementById('clearBtn').disabled = count === 0;
+    document.getElementById('exportNewBtn').disabled = unexported === 0;
 
-async function processWriteQueue() {
-  if (isWriting || writeQueue.length === 0 || !fileHandle) return;
-  
-  isWriting = true;
-  
-  while (writeQueue.length > 0) {
-    const entry = writeQueue.shift();
-    try {
-      const line = JSON.stringify(entry) + '\n';
-      const writable = await fileHandle.createWritable({ keepExistingData: true });
-      const file = await fileHandle.getFile();
-      await writable.seek(file.size);
-      await writable.write(line);
-      await writable.close();
-    } catch (e) {
-      console.error('Write error:', e);
-      writeQueue.unshift(entry);
-      fileHandle = null;
-      document.getElementById('fileStatus').textContent = 'File write failed! Re-select file.';
-      break;
-    }
-  }
-  
-  isWriting = false;
-  
-  if (writeQueue.length > 0 && fileHandle) {
-    processWriteQueue();
-  }
-}
-
-function downloadLinks() {
-  chrome.runtime.sendMessage({ type: 'download' }, function(response) {
-    if (response && response.ok) {
-      document.getElementById('status').textContent = 'Downloaded!';
-      updateCount();
-    } else if (response && response.error) {
-      document.getElementById('status').textContent = 'Error: ' + response.error;
+    if (unexported > 0) {
+      document.getElementById('unexported').textContent = unexported + ' new since last export';
+    } else if (count > 0) {
+      document.getElementById('unexported').textContent = 'all exported';
     } else {
-      document.getElementById('status').textContent = 'Download failed';
+      document.getElementById('unexported').textContent = '';
     }
   });
 }
+
+// ── Render recent links ───────────────────────────────────────────────
+
+function updateRecentLinks() {
+  chrome.runtime.sendMessage({ type: 'get-links' }, function(response) {
+    if (chrome.runtime.lastError || !response || !response.links) return;
+
+    const list = document.getElementById('recentList');
+    const recent = response.links.slice(-5).reverse(); // last 5, newest first
+
+    if (recent.length === 0) {
+      list.innerHTML = '<div class="recent-empty">No links yet</div>';
+      return;
+    }
+
+    list.innerHTML = recent.map(l => {
+      const displayUrl = l.href.replace('https://', '').replace('http://', '');
+      const label = l.text || displayUrl;
+      const page = l.pageUrl ? new URL(l.pageUrl).hostname : '';
+      return '<div class="recent-item">' +
+        '<a href="' + escapeHtml(l.href) + '" target="_blank" title="' + escapeHtml(l.href) + '">' +
+          escapeHtml(label.substring(0, 60)) +
+        '</a>' +
+        (page ? ' <span class="page">from ' + escapeHtml(page) + '</span>' : '') +
+      '</div>';
+    }).join('');
+  });
+}
+
+function escapeHtml(str) {
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// ── Export new links only ─────────────────────────────────────────────
+
+function exportNew() {
+  setStatus('Exporting new links...');
+  chrome.runtime.sendMessage({ type: 'export-new' }, function(response) {
+    if (chrome.runtime.lastError) {
+      setStatus('Export failed: ' + chrome.runtime.lastError.message, 4000);
+      return;
+    }
+    if (response && response.ok) {
+      setStatus('Exported ' + response.exported + ' new links', 3000);
+      updateCount();
+    } else {
+      setStatus(response ? response.error : 'Export failed', 3000);
+    }
+  });
+}
+
+// ── Download all links ────────────────────────────────────────────────
+
+function downloadAll() {
+  setStatus('Preparing download...');
+  chrome.runtime.sendMessage({ type: 'download' }, function(response) {
+    if (chrome.runtime.lastError) {
+      setStatus('Download failed: ' + chrome.runtime.lastError.message, 4000);
+      return;
+    }
+    if (response && response.ok) {
+      setStatus('Downloaded! Links remain in collection.', 3000);
+      updateCount();
+    } else {
+      setStatus(response ? response.error : 'Download failed', 3000);
+    }
+  });
+}
+
+// ── Clear all links ───────────────────────────────────────────────────
 
 function clearLinks() {
   chrome.runtime.sendMessage({ type: 'clear' }, function(response) {
+    if (chrome.runtime.lastError) return;
     if (response && response.ok) {
-      document.getElementById('status').textContent = 'Cleared!';
+      setStatus('Cleared!', 2000);
       updateCount();
+      updateRecentLinks();
     }
   });
 }
 
+// ── Auto-export threshold setting ─────────────────────────────────────
+
+function loadSettings() {
+  chrome.runtime.sendMessage({ type: 'get-settings' }, function(response) {
+    if (chrome.runtime.lastError || !response) return;
+    document.getElementById('thresholdInput').value = response.autoExportThreshold || 0;
+  });
+}
+
+function onThresholdChange() {
+  const val = parseInt(document.getElementById('thresholdInput').value, 10) || 0;
+  chrome.runtime.sendMessage({ type: 'set-auto-threshold', value: val }, function(response) {
+    if (chrome.runtime.lastError) return;
+    if (response && response.ok) {
+      setStatus(val > 0 ? 'Auto-export every ' + val + ' links' : 'Auto-export disabled', 2000);
+    }
+  });
+}
+
+// ── Init ──────────────────────────────────────────────────────────────
+
 document.addEventListener('DOMContentLoaded', function() {
   updateCount();
-  updateFileStatus();
-  
+  updateRecentLinks();
+  loadSettings();
+
+  // Poll for updates every 3 seconds while popup is open
   setInterval(function() {
     updateCount();
-    
-    if (fileHandle) {
-      chrome.runtime.sendMessage({ type: 'get-links' }, function(response) {
-        if (response && response.links) {
-          const newLinks = response.links.filter(l => {
-            return !writeQueue.some(w => w.href === l.href);
-          });
-          if (newLinks.length > 0) {
-            writeQueue.push(...newLinks);
-            processWriteQueue();
-          }
-        }
-      });
-    }
+    updateRecentLinks();
   }, 3000);
-  
-  document.getElementById('downloadBtn').addEventListener('click', downloadLinks);
+
+  document.getElementById('exportNewBtn').addEventListener('click', exportNew);
+  document.getElementById('downloadBtn').addEventListener('click', downloadAll);
   document.getElementById('clearBtn').addEventListener('click', clearLinks);
-  document.getElementById('fileBtn').addEventListener('click', selectFile);
+  document.getElementById('thresholdInput').addEventListener('change', onThresholdChange);
 });

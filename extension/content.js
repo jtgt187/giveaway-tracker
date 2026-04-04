@@ -1,44 +1,90 @@
 (function(){
   let seenHref = new Set();
-  
-  // Visual indicator
+  let pageCount = 0;
+  let hidden = false;
+
+  // Normalize gleam URLs: strip query params and trailing slashes for better dedup
+  function normalizeGleamUrl(urlStr) {
+    try {
+      const u = new URL(urlStr);
+      if (u.hostname.includes('gleam.io')) {
+        u.search = '';
+        u.hash = '';
+        return u.toString().replace(/\/+$/, '');
+      }
+      return urlStr;
+    } catch (e) {
+      return urlStr;
+    }
+  }
+
+  // Visual indicator — bottom-right banner for THIS page only
   const indicator = document.createElement('div');
   indicator.id = 'gleam-monitor-indicator';
-  indicator.style.cssText = 'position:fixed;bottom:10px;right:10px;background:#7c3aed;color:white;padding:8px 12px;border-radius:6px;font-size:12px;z-index:999999;opacity:0.9;';
+  indicator.style.cssText =
+    'position:fixed;bottom:10px;right:10px;background:#7c3aed;color:white;' +
+    'padding:8px 14px;border-radius:6px;font-size:12px;z-index:999999;' +
+    'opacity:0.9;cursor:pointer;user-select:none;transition:opacity .3s;';
+  indicator.title = 'Click to dismiss';
   document.body.appendChild(indicator);
-  
-  function updateIndicator(msg, count) {
-    indicator.textContent = msg + (count !== undefined ? ' (' + count + ')' : '');
-    indicator.style.background = count > 0 ? '#10b981' : '#7c3aed';
+
+  // Click to hide/show the banner
+  indicator.addEventListener('click', function() {
+    if (hidden) {
+      indicator.style.opacity = '0.9';
+      indicator.style.width = '';
+      indicator.style.overflow = '';
+      indicator.textContent = pageCount > 0
+        ? 'Gleam: ' + pageCount + ' on this page'
+        : 'Gleam: No links';
+      hidden = false;
+    } else {
+      indicator.style.opacity = '0.4';
+      indicator.style.width = '24px';
+      indicator.style.overflow = 'hidden';
+      indicator.textContent = pageCount > 0 ? pageCount : '-';
+      hidden = true;
+    }
+  });
+
+  function updateIndicator(msg) {
+    if (hidden) return;
+    indicator.textContent = msg;
+    indicator.style.background = pageCount > 0 ? '#10b981' : '#7c3aed';
   }
-  
+
   updateIndicator('Gleam: Scanning...');
-  
+
   function sendLink(href, text) {
-    if (seenHref.has(href)) return;
-    seenHref.add(href);
-    
+    const normalized = normalizeGleamUrl(href);
+    if (seenHref.has(normalized)) return;
+    seenHref.add(normalized);
+    pageCount++;
+
+    // Update banner immediately with page-local count
+    updateIndicator('Gleam: ' + pageCount + ' on this page');
+
     chrome.runtime.sendMessage({
       type: 'append',
-      href: href,
+      href: normalized,
       text: text || '',
       pageUrl: location.href
     }, function(response) {
-      if (response) {
-        updateIndicator('Gleam: Collected!', response.count);
+      // Badge update is handled by background.js — nothing to do here
+      if (chrome.runtime.lastError) {
+        console.warn('Gleam Monitor: sendMessage error', chrome.runtime.lastError.message);
       }
     });
   }
-  
+
   function extractFromHTML() {
     const anchors = document.querySelectorAll('a[href*="gleam.io"]');
-    updateIndicator('Gleam: Found ' + anchors.length + ' links');
-    
+
     if (anchors.length === 0) {
-      updateIndicator('Gleam: No Gleam links');
+      updateIndicator('Gleam: No links');
       return;
     }
-    
+
     anchors.forEach(a => {
       try {
         const url = new URL(a.href, location.href).toString();
@@ -47,30 +93,31 @@
       } catch (e) {}
     });
   }
-  
+
   function scanMutations() {
     const anchors = document.querySelectorAll('a[href*="gleam.io"]');
     anchors.forEach(a => {
       try {
         const url = new URL(a.href, location.href).toString();
-        if (!seenHref.has(url)) {
+        const normalized = normalizeGleamUrl(url);
+        if (!seenHref.has(normalized)) {
           const text = (a.textContent || '').trim();
           sendLink(url, text);
         }
       } catch (e) {}
     });
   }
-  
+
   function initObserver() {
     const observer = new MutationObserver(() => {
       scanMutations();
     });
-    
+
     if (document.body) {
       observer.observe(document.body, { childList: true, subtree: true });
     }
   }
-  
+
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {
       extractFromHTML();
@@ -80,7 +127,7 @@
     extractFromHTML();
     initObserver();
   }
-  
+
   setTimeout(scanMutations, 1000);
   setTimeout(scanMutations, 3000);
   setTimeout(scanMutations, 5000);

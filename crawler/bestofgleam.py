@@ -17,15 +17,12 @@ class BestOfGleamCrawler(BaseCrawler):
         try:
             html = self.get_page("https://bestofgleam.com/")
         except Exception as e:
-            # Likely blocked (403) or network issue; return no results gracefully
             print(f"BestOfGleam: failed to fetch page: {e}")
             return giveaways
+
+        try:
             if BeautifulSoup:
                 soup = BeautifulSoup(html, "html.parser")
-            else:
-                soup = None
-
-            if BeautifulSoup:
                 articles = soup.select("article.post")
                 for article in articles:
                     title_el = article.select_one("h2.entry-title a")
@@ -59,13 +56,12 @@ class BestOfGleamCrawler(BaseCrawler):
             else:
                 # Lightweight fallback when BeautifulSoup is not available
                 import re
-                html = self.get_page("https://bestofgleam.com/")
                 gleam_links = re.findall(r'href="([^\"]*gleam.io[^"]*)"', html)
                 for url in gleam_links:
                     if url in seen_urls:
                         continue
                     seen_urls.add(url)
-                    giveaways.append(self._parse_giveaway_card("BestOfGleam (fallback)", url, "", "" ))
+                    giveaways.append(self._parse_giveaway_card("BestOfGleam (fallback)", url, "", ""))
                     random_delay(1, 2)
         except Exception as e:
             print(f"BestOfGleam crawl error: {e}")

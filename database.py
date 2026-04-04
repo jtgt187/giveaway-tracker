@@ -180,12 +180,18 @@ def get_giveaway_by_url(url):
     return dict(row) if row else None
 
 
-def update_terms_check(giveaway_id, checked, excluded_countries=""):
+def update_terms_check(giveaway_id, checked, excluded_countries="", detected_region=None):
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("""
         UPDATE giveaways SET terms_checked = ?, terms_excluded = ? WHERE id = ?
     """, (checked, excluded_countries, giveaway_id))
+    # If T&C analysis detected a specific region, update country_restriction
+    # to be more accurate than the crawl-time guess.
+    if detected_region and detected_region != "restricted":
+        cursor.execute("""
+            UPDATE giveaways SET country_restriction = ? WHERE id = ?
+        """, (detected_region, giveaway_id))
     conn.commit()
     conn.close()
 

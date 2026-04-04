@@ -716,16 +716,22 @@ def main():
 
             def sort_key(row):
                 country = row.get("country_restriction", "worldwide")
-                order = {"germany": 0, "eu": 1, "worldwide": 2, "restricted": 3}
-                base = order.get(country, 4)
+                order = {"germany": 0, "dach": 1, "eu": 2, "worldwide": 3, "restricted": 4}
+                base = order.get(country, 5)
                 
                 if row.get("terms_checked"):
                     excluded = row.get("terms_excluded", "")
                     if excluded:
                         excluded_list = [e.strip().lower() for e in excluded.split(",")]
+                        # Heavy penalty if Germany itself is excluded
+                        if "germany" in excluded_list:
+                            base += 20
+                        # Moderate penalty if only non-DACH/non-EU countries are excluded
+                        # (good sign -- means Germany is likely eligible)
                         non_eu_countries = ["us", "uk", "canada", "australia", "japan", "china", "brazil", "india"]
-                        if any(c in excluded_list for c in non_eu_countries):
-                            base += 10
+                        if not any(c in excluded_list for c in ["germany", "austria", "switzerland"]):
+                            if any(c in excluded_list for c in non_eu_countries):
+                                pass  # No penalty -- these exclusions don't affect Germany
                 
                 if not row.get("terms_checked"):
                     base += 5
@@ -787,11 +793,13 @@ def main():
                     checked_count = 0
                     for g in giveaways:
                         if not g.get("terms_checked"):
-                            excluded, _ = check_giveaway_terms(g["url"])
+                            excluded, detected_region, _ = check_giveaway_terms(g["url"])
                             excluded_str = ",".join(excluded) if excluded else ""
-                            update_terms_check(g["id"], True, excluded_str)
+                            update_terms_check(g["id"], True, excluded_str, detected_region)
                             checked_count += 1
                     st.success(f"Checked T&C for {checked_count} giveaways!")
+                    # Re-evaluate eligibility after T&C updates
+                    scan_existing_entries()
                     st.rerun()
             with action_col2:
                 if st.button("🔄 Refresh Eligibility", use_container_width=True):
@@ -990,10 +998,11 @@ def main():
         st.markdown(f'<h3>{SVG_ICONS["globe"]} Target Country</h3>', unsafe_allow_html=True)
         countries = {
             "germany": "Germany",
+            "dach": "DACH (Germany, Austria, Switzerland)",
+            "eu": "European Union",
             "worldwide": "Worldwide Only",
             "us": "United States",
             "uk": "United Kingdom",
-            "eu": "European Union",
         }
         selected_country = st.selectbox(
             "Your country for eligibility check",

@@ -1,81 +1,49 @@
 let links = [];
+let lastExportIndex = 0;       // tracks how many links have been exported
+let autoExportThreshold = 0;   // 0 = disabled
 
-// Restore links on startup
-chrome.storage.local.get(['gleam_links'], (result) => {
-  if (result.gleam_links) {
-    links = result.gleam_links;
-  }
-});
+// ── Persistence helpers ──────────────────────────────────────────────
 
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.type === 'append') {
-    const exists = links.some(l => l.href === msg.href);
-    if (!exists) {
-      const entry = {
-        href: msg.href,
-        text: msg.text || '',
-        pageUrl: msg.pageUrl || '',
-        t: new Date().toISOString()
-      };
-      links.push(entry);
-      chrome.storage.local.set({ gleam_links: links });
-      sendResponse({ count: links.length });
-    } else {
-      sendResponse({ count: links.length });
-    }
-    return true;
-  }
-  
-  if (msg.type === 'get-count') {
-    sendResponse({ count: links.length });
-    return true;
-  }
-  
-  if (msg.type === 'get-links') {
-    sendResponse({ links: links });
-    return true;
-  }
-  
-  if (msg.type === 'download') {
-    if (links.length === 0) {
-      sendResponse({ ok: false, error: 'No links' });
-      return true;
-    }
-    
-    downloadAll().then(() => {
-      sendResponse({ ok: true });
-    }).catch(e => {
-      sendResponse({ ok: false, error: String(e) });
-    });
-    return true;
-  }
-  
-  if (msg.type === 'clear') {
-    links = [];
-    chrome.storage.local.set({ gleam_links: [] });
-    sendResponse({ ok: true });
-    return true;
-  }
-  
-  return false;
-});
+function persist() {
+  chrome.storage.local.set({
+    gleam_links: links,
+    gleam_last_export: lastExportIndex,
+    gleam_auto_threshold: autoExportThreshold
+  });
+}
 
-async function downloadAll() {
-  if (links.length === 0) throw new Error('No links');
-  
-  const content = links.map(l => JSON.stringify(l)).join('\n') + '\n';
-  const blob = new Blob([content], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-  const filename = 'gleam-links-' + timestamp + '.ndjson';
-  
-  await new Promise((resolve, reject) => {
-    chrome.downloads.download({
-      url: url,
-      filename: filename,
-      saveAs: true
-    }, (downloadId) => {
+function updateBadge() {
+  const total = links.length;
+  chrome.action.setBadgeText({ text: total > 0 ? String(total) : '' });
+  chrome.action.setBadgeBackgroundColor({ color: '#10b981' });
+}
+
+// ── Restore state on startup ─────────────────────────────────────────
+
+chrome.storage.local.get(
+  ['gleam_links', 'gleam_last_export', 'gleam_auto_threshold'],
+  (result) => {
+    if (result.gleam_links) links = result.gleam_links;
+    if (typeof result.gleam_last_export === 'number') lastExportIndex = result.gleam_last_export;
+    if (typeof result.gleam_auto_threshold === 'number') autoExportThreshold = result.gleam_auto_threshold;
+    updateBadge();
+  }
+);
+
+// ── Download helper ──────────────────────────────────────────────────
+
+function downloadNdjson(entries, filenameSuffix) {
+  return new Promise((resolve, reject) => {
+    if (entries.length === 0) { reject(new Error('No links to export')); return; }
+
+    const content = entries.map(l => JSON.stringify(l)).join('\n') + '\n';
+    const blob = new Blob([content], { type: 'application/x-ndjson' });
+    const url = URL.createObjectURL(blob);
+
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const filename = 'gleam-links-' + ts + (filenameSuffix ? '-' + filenameSuffix : '') + '.ndjson';
+
+    chrome.downloads.download({ url, filename, saveAs: true }, (downloadId) => {
       if (chrome.runtime.lastError) {
         reject(chrome.runtime.lastError);
       } else {
@@ -83,7 +51,116 @@ async function downloadAll() {
       }
     });
   });
-  
-  links = [];
-  chrome.storage.local.set({ gleam_links: [] });
 }
+
+// ── Auto-export check ────────────────────────────────────────────────
+
+function checkAutoExport() {
+  if (autoExportThreshold <= 0) return;
+  const unexported = links.length - lastExportIndex;
+  if (unexported >= autoExportThreshold) {
+    const newEntries = links.slice(lastExportIndex);
+    downloadNdjson(newEntries, 'auto').then(() => {
+      lastExportIndex = links.length;
+      persist();
+    }).catch(e => {
+      console.warn('Gleam Monitor: auto-export failed', e);
+    });
+  }
+}
+
+// ── Message handler ──────────────────────────────────────────────────
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+
+  // ── Append a newly found link ──
+  if (msg.type === 'append') {
+    const exists = links.some(l => l.href === msg.href);
+    if (!exists) {
+      links.push({
+        href: msg.href,
+        text: msg.text || '',
+        pageUrl: msg.pageUrl || '',
+        t: new Date().toISOString()
+      });
+      persist();
+      updateBadge();
+      checkAutoExport();
+    }
+    sendResponse({ count: links.length });
+    return true;
+  }
+
+  // ── Get counts ──
+  if (msg.type === 'get-count') {
+    sendResponse({
+      count: links.length,
+      unexported: links.length - lastExportIndex
+    });
+    return true;
+  }
+
+  // ── Get full link list ──
+  if (msg.type === 'get-links') {
+    sendResponse({ links });
+    return true;
+  }
+
+  // ── Download ALL links ──
+  if (msg.type === 'download') {
+    if (links.length === 0) {
+      sendResponse({ ok: false, error: 'No links collected' });
+      return true;
+    }
+    downloadNdjson(links, 'all').then(() => {
+      lastExportIndex = links.length;
+      persist();
+      sendResponse({ ok: true });
+    }).catch(e => {
+      sendResponse({ ok: false, error: String(e.message || e) });
+    });
+    return true;
+  }
+
+  // ── Download only NEW (unexported) links ──
+  if (msg.type === 'export-new') {
+    const newEntries = links.slice(lastExportIndex);
+    if (newEntries.length === 0) {
+      sendResponse({ ok: false, error: 'No new links since last export' });
+      return true;
+    }
+    downloadNdjson(newEntries, 'new').then(() => {
+      lastExportIndex = links.length;
+      persist();
+      sendResponse({ ok: true, exported: newEntries.length });
+    }).catch(e => {
+      sendResponse({ ok: false, error: String(e.message || e) });
+    });
+    return true;
+  }
+
+  // ── Clear everything ──
+  if (msg.type === 'clear') {
+    links = [];
+    lastExportIndex = 0;
+    persist();
+    updateBadge();
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  // ── Get / set auto-export threshold ──
+  if (msg.type === 'get-settings') {
+    sendResponse({ autoExportThreshold });
+    return true;
+  }
+
+  if (msg.type === 'set-auto-threshold') {
+    autoExportThreshold = parseInt(msg.value, 10) || 0;
+    persist();
+    sendResponse({ ok: true, autoExportThreshold });
+    return true;
+  }
+
+  return false;
+});
