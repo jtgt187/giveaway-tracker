@@ -11,7 +11,7 @@ import json
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from database import init_db, add_giveaway, add_giveaways_batch, get_giveaways, get_giveaways_display, update_giveaway_status, get_stats, update_giveaway_entries, get_giveaway_by_url, get_known_urls, delete_not_eligible, update_terms_check, add_to_blacklist, get_blacklist, remove_from_blacklist, remove_expired_giveaways
+from database import init_db, add_giveaway, add_giveaways_batch, get_giveaways, get_giveaways_display, update_giveaway_status, get_stats, update_giveaway_entries, get_giveaway_by_url, get_known_urls, delete_not_eligible, update_terms_check, add_to_blacklist, get_blacklist, remove_from_blacklist, remove_expired_giveaways, get_connection
 from config import load_config, save_config, add_custom_site, remove_custom_site, get_custom_sites
 from crawler.gleamfinder import GleamfinderCrawler
 from crawler.gleam_official import GleamOfficialCrawler
@@ -1480,16 +1480,26 @@ def main():
                     _cached_giveaways_display.clear()
                     st.rerun()
             with action_col3:
-                if st.button("🗑️ Clear All Data", use_container_width=True):
+                if st.session_state.get("confirm_clear_all"):
                     st.warning("This will delete all giveaway data. Are you sure?")
-                    if st.button("Yes, delete everything", type="primary"):
-                        import sqlite3
-                        conn = sqlite3.connect("giveaways.db")
-                        conn.execute("DELETE FROM giveaways")
-                        conn.commit()
-                        conn.close()
-                        _cached_giveaways_display.clear()
-                        st.success("All data cleared!")
+                    confirm_col1, confirm_col2 = st.columns(2)
+                    with confirm_col1:
+                        if st.button("Yes, delete everything", type="primary", use_container_width=True):
+                            conn = get_connection()
+                            conn.execute("DELETE FROM giveaways")
+                            conn.commit()
+                            conn.close()
+                            _cached_giveaways_display.clear()
+                            st.session_state["confirm_clear_all"] = False
+                            st.success("All data cleared!")
+                            st.rerun()
+                    with confirm_col2:
+                        if st.button("Cancel", use_container_width=True):
+                            st.session_state["confirm_clear_all"] = False
+                            st.rerun()
+                else:
+                    if st.button("🗑️ Clear All Data", use_container_width=True):
+                        st.session_state["confirm_clear_all"] = True
                         st.rerun()
 
             st.markdown("---")

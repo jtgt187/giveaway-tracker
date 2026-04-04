@@ -1,11 +1,14 @@
 {
   "manifest_version": 3,
   "name": "Gleam Link Monitor",
-  "version": "0.6.0",
-  "description": "Collect Gleam.io links while browsing. Download as NDJSON file.",
+  "version": "0.7.0",
+  "description": "Collect Gleam.io links while browsing and auto-enter giveaways.",
   "permissions": [
     "storage",
-    "downloads"
+    "downloads",
+    "tabs",
+    "scripting",
+    "activeTab"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -19,7 +22,14 @@
   },
   "content_scripts": [
     {
+      "matches": ["*://gleam.io/*"],
+      "js": ["gleam-entry.js"],
+      "css": ["gleam-overlay.css"],
+      "run_at": "document_idle"
+    },
+    {
       "matches": ["<all_urls>"],
+      "exclude_matches": ["*://gleam.io/*"],
       "js": ["content.js"],
       "run_at": "document_end"
     }

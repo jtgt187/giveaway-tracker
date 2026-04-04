@@ -53,6 +53,34 @@
       }
       .settings input[type="number"]:focus { outline: none; border-color: #7c3aed; }
 
+      /* ── Auto-entry stats ── */
+      .entry-stats { margin-top: 12px; border-top: 1px solid #2a2a4a; padding-top: 10px; }
+      .entry-stats h4 { font-size: 12px; color: #888; margin-bottom: 6px; }
+      .entry-stats-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 6px;
+        margin-bottom: 8px;
+      }
+      .entry-stat-box {
+        text-align: center;
+        padding: 8px 4px;
+        background: #2a2a4a;
+        border-radius: 6px;
+      }
+      .entry-stat-box .val { font-size: 18px; font-weight: 700; }
+      .entry-stat-box .val.green { color: #10b981; }
+      .entry-stat-box .val.red { color: #ef4444; }
+      .entry-stat-box .val.purple { color: #7c3aed; }
+      .entry-stat-box .lbl { font-size: 10px; color: #666; margin-top: 2px; }
+      .entry-stats .last-entry { font-size: 10px; color: #555; margin-top: 4px; }
+      .entry-stats .last-entry a { color: #7c3aed; text-decoration: none; }
+      .entry-stats .reset-link {
+        font-size: 10px; color: #555; cursor: pointer; text-align: right;
+        margin-top: 4px;
+      }
+      .entry-stats .reset-link:hover { color: #ef4444; }
+
       /* ── Recent links ── */
       .recent { margin-top: 12px; border-top: 1px solid #2a2a4a; padding-top: 10px; }
       .recent h4 { font-size: 12px; color: #888; margin-bottom: 6px; }
@@ -89,6 +117,26 @@
     </div>
     <div class="btn-row">
       <button id="clearBtn" class="btn red" disabled>Clear All</button>
+    </div>
+
+    <div class="entry-stats" id="entryStatsSection">
+      <h4>Auto-Entry Stats</h4>
+      <div class="entry-stats-grid">
+        <div class="entry-stat-box">
+          <div class="val purple" id="statTotal">0</div>
+          <div class="lbl">Total</div>
+        </div>
+        <div class="entry-stat-box">
+          <div class="val green" id="statCompleted">0</div>
+          <div class="lbl">Completed</div>
+        </div>
+        <div class="entry-stat-box">
+          <div class="val red" id="statFailed">0</div>
+          <div class="lbl">Failed</div>
+        </div>
+      </div>
+      <div class="last-entry" id="lastEntry"></div>
+      <div class="reset-link" id="resetStats">Reset stats</div>
     </div>
 
     <div class="settings">

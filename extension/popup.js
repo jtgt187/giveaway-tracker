@@ -1,8 +1,8 @@
-// ── State ─────────────────────────────────────────────────────────────
+// -- State -------------------------------------------------------------
 
 let knownCount = 0;
 
-// ── UI helpers ────────────────────────────────────────────────────────
+// -- UI helpers --------------------------------------------------------
 
 function setStatus(msg, duration) {
   const el = document.getElementById('status');
@@ -12,7 +12,7 @@ function setStatus(msg, duration) {
   }
 }
 
-// ── Local download helper ─────────────────────────────────────────────
+// -- Local download helper ---------------------------------------------
 // Runs in the popup context which has full DOM access (Blob, URL, <a>).
 // This avoids MV3 service-worker limitations entirely.
 
@@ -30,7 +30,7 @@ function downloadNdjsonFile(entries) {
   setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
 }
 
-// ── Update counter & unexported badge ─────────────────────────────────
+// -- Update counter & unexported badge ---------------------------------
 
 function updateCount() {
   chrome.runtime.sendMessage({ type: 'get-count' }, function(response) {
@@ -55,7 +55,7 @@ function updateCount() {
   });
 }
 
-// ── Render recent links ───────────────────────────────────────────────
+// -- Render recent links -----------------------------------------------
 
 function updateRecentLinks() {
   chrome.runtime.sendMessage({ type: 'get-links' }, function(response) {
@@ -87,7 +87,7 @@ function escapeHtml(str) {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-// ── Export new links only ─────────────────────────────────────────────
+// -- Export new links only ---------------------------------------------
 // Fetches export data from background, downloads locally in popup,
 // then tells background to update the export index.
 
@@ -128,7 +128,7 @@ function exportNew() {
   });
 }
 
-// ── Download all links ────────────────────────────────────────────────
+// -- Download all links ------------------------------------------------
 
 function downloadAll() {
   setStatus('Preparing download...');
@@ -161,7 +161,7 @@ function downloadAll() {
   });
 }
 
-// ── Clear all links ───────────────────────────────────────────────────
+// -- Clear all links ---------------------------------------------------
 
 function clearLinks() {
   chrome.runtime.sendMessage({ type: 'clear' }, function(response) {
@@ -174,7 +174,52 @@ function clearLinks() {
   });
 }
 
-// ── Auto-export threshold setting ─────────────────────────────────────
+// -- Auto-entry stats -------------------------------------------------
+
+function updateEntryStats() {
+  chrome.runtime.sendMessage({ type: 'get-entry-stats' }, function(response) {
+    if (chrome.runtime.lastError || !response || !response.entryStats) return;
+
+    var stats = response.entryStats;
+    document.getElementById('statTotal').textContent = stats.total || 0;
+    document.getElementById('statCompleted').textContent = stats.completed || 0;
+    document.getElementById('statFailed').textContent = stats.failed || 0;
+
+    var lastEntryEl = document.getElementById('lastEntry');
+    if (stats.lastUrl && stats.lastTime) {
+      var timeAgo = getTimeAgo(stats.lastTime);
+      var shortUrl = stats.lastUrl.replace('https://', '').replace('http://', '');
+      if (shortUrl.length > 40) shortUrl = shortUrl.substring(0, 40) + '...';
+      lastEntryEl.innerHTML = 'Last: <a href="' + escapeHtml(stats.lastUrl) + '" target="_blank">' +
+        escapeHtml(shortUrl) + '</a> (' + timeAgo + ')';
+    } else {
+      lastEntryEl.textContent = 'No entries yet';
+    }
+  });
+}
+
+function getTimeAgo(isoString) {
+  var diff = Date.now() - new Date(isoString).getTime();
+  var mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return mins + 'm ago';
+  var hours = Math.floor(mins / 60);
+  if (hours < 24) return hours + 'h ago';
+  var days = Math.floor(hours / 24);
+  return days + 'd ago';
+}
+
+function resetEntryStats() {
+  chrome.runtime.sendMessage({ type: 'reset-entry-stats' }, function(response) {
+    if (chrome.runtime.lastError) return;
+    if (response && response.ok) {
+      setStatus('Stats reset', 2000);
+      updateEntryStats();
+    }
+  });
+}
+
+// -- Auto-export threshold setting -------------------------------------
 
 function loadSettings() {
   chrome.runtime.sendMessage({ type: 'get-settings' }, function(response) {
@@ -193,21 +238,24 @@ function onThresholdChange() {
   });
 }
 
-// ── Init ──────────────────────────────────────────────────────────────
+// -- Init --------------------------------------------------------------
 
 document.addEventListener('DOMContentLoaded', function() {
   updateCount();
   updateRecentLinks();
+  updateEntryStats();
   loadSettings();
 
   // Poll for updates every 3 seconds while popup is open
   setInterval(function() {
     updateCount();
     updateRecentLinks();
+    updateEntryStats();
   }, 3000);
 
   document.getElementById('exportNewBtn').addEventListener('click', exportNew);
   document.getElementById('downloadBtn').addEventListener('click', downloadAll);
   document.getElementById('clearBtn').addEventListener('click', clearLinks);
   document.getElementById('thresholdInput').addEventListener('change', onThresholdChange);
+  document.getElementById('resetStats').addEventListener('click', resetEntryStats);
 });
