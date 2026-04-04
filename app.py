@@ -585,6 +585,11 @@ CUSTOM_CSS = """
         border-left: 3px solid var(--accent-primary) !important;
     }
 
+    /* Vertically center columns in st.columns rows (fixes X button / link alignment) */
+    [data-testid="stHorizontalBlock"] {
+        align-items: center;
+    }
+
     /* Account status cards */
     .account-grid {
         display: grid;
@@ -1590,106 +1595,110 @@ def main():
 
         st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
 
-        eligible = get_giveaways("eligible")
-        if eligible:
-            # Sort by deadline urgency: soonest-ending first
-            from database import parse_deadline as _pd
-            _now = datetime.now()
-            def _dl_sort_key(g):
-                dt = _pd(g.get("deadline", ""))
-                if dt:
-                    return dt
-                return datetime.max  # unknown deadlines go last
-            eligible = sorted(eligible, key=_dl_sort_key)
+        @st.fragment
+        def _render_eligible_giveaways():
+            eligible = get_giveaways("eligible")
+            if eligible:
+                # Sort by deadline urgency: soonest-ending first
+                from database import parse_deadline as _pd
+                _now = datetime.now()
+                def _dl_sort_key(g):
+                    dt = _pd(g.get("deadline", ""))
+                    if dt:
+                        return dt
+                    return datetime.max  # unknown deadlines go last
+                eligible = sorted(eligible, key=_dl_sort_key)
 
-            st.markdown(f'<div class="section-title">Eligible Giveaways ({len(eligible)})</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="section-title">Eligible Giveaways ({len(eligible)})</div>', unsafe_allow_html=True)
 
-            for g in eligible:
-                # Compute countdown text
-                dl_dt = _pd(g.get("deadline", ""))
-                if dl_dt:
-                    hrs = (dl_dt - _now).total_seconds() / 3600
-                    if hrs < 24:
-                        dl_text = f"{int(hrs)}h left"
-                    elif hrs < 72:
-                        dl_text = f"{int(hrs/24)}d {int(hrs%24)}h left"
+                for g in eligible:
+                    # Compute countdown text
+                    dl_dt = _pd(g.get("deadline", ""))
+                    if dl_dt:
+                        hrs = (dl_dt - _now).total_seconds() / 3600
+                        if hrs < 24:
+                            dl_text = f"{int(hrs)}h left"
+                        elif hrs < 72:
+                            dl_text = f"{int(hrs/24)}d {int(hrs%24)}h left"
+                        else:
+                            dl_text = f"{int(hrs/24)}d left"
                     else:
-                        dl_text = f"{int(hrs/24)}d left"
-                else:
-                    dl_text = ""
+                        dl_text = ""
 
-                col1, col2, col3, col4 = st.columns([3, 2, 1, 1])
-                with col1:
-                    st.markdown(f"""
-                    <div class="giveaway-card">
-                        <div class="giveaway-title">{g['title'][:80]}</div>
-                        <div class="giveaway-meta">
-                            <span>Source: {g['source']}</span>
-                            <span>Region: {g['country_restriction']}</span>
-                            {f'<span class="urgency-soon">{dl_text}</span>' if dl_text else ''}
+                    col1, col2, col3, col4 = st.columns([3, 2, 1, 1])
+                    with col1:
+                        st.markdown(f"""
+                        <div class="giveaway-card">
+                            <div class="giveaway-title">{g['title'][:80]}</div>
+                            <div class="giveaway-meta">
+                                <span>Source: {g['source']}</span>
+                                <span>Region: {g['country_restriction']}</span>
+                                {f'<span class="urgency-soon">{dl_text}</span>' if dl_text else ''}
+                            </div>
                         </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                with col2:
-                    st.link_button("🔗 Open", g["url"])
-                with col3:
-                    if st.button("▶️ Enter", key=f"enter_{g['id']}"):
-                        if "entry_stats" not in st.session_state:
-                            st.session_state.entry_stats = {"entered": 0, "failed": 0, "skipped": 0}
-                        with st.spinner("Auto-entering..."):
+                        """, unsafe_allow_html=True)
+                    with col2:
+                        st.link_button("🔗 Open", g["url"])
+                    with col3:
+                        if st.button("▶️ Enter", key=f"enter_{g['id']}"):
+                            if "entry_stats" not in st.session_state:
+                                st.session_state.entry_stats = {"entered": 0, "failed": 0, "skipped": 0}
+                            with st.spinner("Auto-entering..."):
+                                result, log = auto_enter_giveaway(g["url"])
+                                if result == "region_restricted":
+                                    update_giveaway_status(g["id"], "not_eligible")
+                                    st.session_state.entry_stats["failed"] += 1
+                                    st.error("Region restricted! This giveaway is not available in your country.")
+                                elif result == "ended":
+                                    update_giveaway_status(g["id"], "expired")
+                                    st.session_state.entry_stats["failed"] += 1
+                                    st.error("This competition has ended!")
+                                elif result is True:
+                                    update_giveaway_status(g["id"], "participated")
+                                    st.session_state.entry_stats["entered"] += 1
+                                    st.success("Entered successfully!")
+                                else:
+                                    st.session_state.entry_stats["failed"] += 1
+                                    st.warning("Entry may have failed. Check the log.")
+                                st.session_state.crawl_log = log
+                    with col4:
+                        if st.button("⏭️ Skip", key=f"skip_{g['id']}"):
+                            if "entry_stats" not in st.session_state:
+                                st.session_state.entry_stats = {"entered": 0, "failed": 0, "skipped": 0}
+                            st.session_state.entry_stats["skipped"] += 1
+                            update_giveaway_status(g["id"], "skipped")
+                            st.rerun()
+
+                if st.button("⚡ Auto-Enter ALL Eligible", type="primary", use_container_width=True):
+                    if "entry_stats" not in st.session_state:
+                        st.session_state.entry_stats = {"entered": 0, "failed": 0, "skipped": 0}
+                    for g in eligible:
+                        with st.spinner(f"Entering: {g['title'][:60]}..."):
                             result, log = auto_enter_giveaway(g["url"])
                             if result == "region_restricted":
                                 update_giveaway_status(g["id"], "not_eligible")
                                 st.session_state.entry_stats["failed"] += 1
-                                st.error("Region restricted! This giveaway is not available in your country.")
+                                st.error(f"Region restricted: {g['title'][:60]}")
                             elif result == "ended":
                                 update_giveaway_status(g["id"], "expired")
                                 st.session_state.entry_stats["failed"] += 1
-                                st.error("This competition has ended!")
+                                st.error(f"Ended: {g['title'][:60]}")
                             elif result is True:
                                 update_giveaway_status(g["id"], "participated")
                                 st.session_state.entry_stats["entered"] += 1
-                                st.success("Entered successfully!")
+                                st.success(f"Entered: {g['title'][:60]}")
                             else:
                                 st.session_state.entry_stats["failed"] += 1
-                                st.warning("Entry may have failed. Check the log.")
-                            st.session_state.crawl_log = log
-                with col4:
-                    if st.button("⏭️ Skip", key=f"skip_{g['id']}"):
-                        if "entry_stats" not in st.session_state:
-                            st.session_state.entry_stats = {"entered": 0, "failed": 0, "skipped": 0}
-                        st.session_state.entry_stats["skipped"] += 1
-                        update_giveaway_status(g["id"], "skipped")
-                        st.rerun()
+                                st.warning(f"Failed: {g['title'][:60]}")
+                    st.rerun()
+            else:
+                st.markdown(f"""
+                <div class="empty-state">
+                    <p>No eligible giveaways found. Run a crawl first!</p>
+                </div>
+                """, unsafe_allow_html=True)
 
-            if st.button("⚡ Auto-Enter ALL Eligible", type="primary", use_container_width=True):
-                if "entry_stats" not in st.session_state:
-                    st.session_state.entry_stats = {"entered": 0, "failed": 0, "skipped": 0}
-                for g in eligible:
-                    with st.spinner(f"Entering: {g['title'][:60]}..."):
-                        result, log = auto_enter_giveaway(g["url"])
-                        if result == "region_restricted":
-                            update_giveaway_status(g["id"], "not_eligible")
-                            st.session_state.entry_stats["failed"] += 1
-                            st.error(f"Region restricted: {g['title'][:60]}")
-                        elif result == "ended":
-                            update_giveaway_status(g["id"], "expired")
-                            st.session_state.entry_stats["failed"] += 1
-                            st.error(f"Ended: {g['title'][:60]}")
-                        elif result is True:
-                            update_giveaway_status(g["id"], "participated")
-                            st.session_state.entry_stats["entered"] += 1
-                            st.success(f"Entered: {g['title'][:60]}")
-                        else:
-                            st.session_state.entry_stats["failed"] += 1
-                            st.warning(f"Failed: {g['title'][:60]}")
-                st.rerun()
-        else:
-            st.markdown(f"""
-            <div class="empty-state">
-                <p>No eligible giveaways found. Run a crawl first!</p>
-            </div>
-            """, unsafe_allow_html=True)
+        _render_eligible_giveaways()
 
         if st.session_state.crawl_log:
             st.markdown('<hr class="section-divider">', unsafe_allow_html=True)

@@ -1,3 +1,4 @@
+import asyncio
 import subprocess
 import time
 import os
@@ -13,10 +14,27 @@ def _run_in_thread(fn, *args, **kwargs):
     On Windows, Streamlit's ``ProactorEventLoop`` does not support
     ``subprocess_exec``, which Playwright needs to launch the browser
     process.  Running in a separate thread side-steps the issue because
-    the thread creates its own event loop (or none at all).
+    the thread creates its own event loop.  We also explicitly set a
+    ``SelectorEventLoop`` on Windows so that ``asyncio.create_subprocess_exec``
+    (used internally by Playwright) works correctly.
     """
+
+    def _wrapper():
+        _original_loop = None
+        try:
+            _original_loop = asyncio.get_event_loop()
+        except RuntimeError:
+            _original_loop = None
+        if sys.platform == "win32":
+            asyncio.set_event_loop(asyncio.SelectorEventLoop())
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            if sys.platform == "win32" and _original_loop is not None:
+                asyncio.set_event_loop(_original_loop)
+
     with ThreadPoolExecutor(max_workers=1) as pool:
-        future: Future = pool.submit(fn, *args, **kwargs)
+        future: Future = pool.submit(_wrapper)
         return future.result()
 
 
