@@ -193,19 +193,29 @@ def update_terms_check(giveaway_id, checked, excluded_countries=""):
 def get_stats(gleam_only=True):
     conn = get_connection()
     cursor = conn.cursor()
-    gleam_filter = "WHERE url LIKE 'https://gleam.io/%'" if gleam_only else ""
-    
-    cursor.execute(f"SELECT COUNT(*) as total FROM giveaways {gleam_filter}")
+    gleam_condition = "url LIKE 'https://gleam.io/%'" if gleam_only else "1=1"
+
+    def _where(*conditions):
+        return "WHERE " + " AND ".join(conditions)
+
+    status_participated = "status = 'participated'"
+    status_eligible = "status = 'eligible'"
+    status_not_eligible = "status = 'not_eligible'"
+    status_new = "status = 'new'"
+    entries_filter = "total_entries > 0"
+    exclude_not_eligible = "status != 'not_eligible'"
+
+    cursor.execute(f"SELECT COUNT(*) as total FROM giveaways {_where(gleam_condition)}")
     total = cursor.fetchone()["total"]
-    cursor.execute(f"SELECT COUNT(*) as count FROM giveaways {gleam_filter} AND status = 'participated'")
+    cursor.execute(f"SELECT COUNT(*) as count FROM giveaways {_where(gleam_condition, status_participated)}")
     participated = cursor.fetchone()["count"]
-    cursor.execute(f"SELECT COUNT(*) as count FROM giveaways {gleam_filter} AND status = 'eligible'")
+    cursor.execute(f"SELECT COUNT(*) as count FROM giveaways {_where(gleam_condition, status_eligible)}")
     eligible = cursor.fetchone()["count"]
-    cursor.execute(f"SELECT COUNT(*) as count FROM giveaways {gleam_filter} AND status = 'not_eligible'")
+    cursor.execute(f"SELECT COUNT(*) as count FROM giveaways {_where(gleam_condition, status_not_eligible)}")
     not_eligible = cursor.fetchone()["count"]
-    cursor.execute(f"SELECT COUNT(*) as count FROM giveaways {gleam_filter} AND status = 'new'")
+    cursor.execute(f"SELECT COUNT(*) as count FROM giveaways {_where(gleam_condition, status_new)}")
     new_count = cursor.fetchone()["count"]
-    cursor.execute(f"SELECT AVG(win_probability) as avg_prob FROM giveaways {gleam_filter} AND total_entries > 0 AND status != 'not_eligible'")
+    cursor.execute(f"SELECT AVG(win_probability) as avg_prob FROM giveaways {_where(gleam_condition, entries_filter, exclude_not_eligible)}")
     row = cursor.fetchone()
     avg_prob = row["avg_prob"] if row and row["avg_prob"] else 0
     conn.close()
