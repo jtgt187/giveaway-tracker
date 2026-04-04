@@ -235,6 +235,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   // -- Append a newly found link --
   if (msg.type === 'append') {
+    // Only store actual gleam.io URLs (defense-in-depth)
+    try {
+      const u = new URL(msg.href);
+      if (u.hostname !== 'gleam.io' && !u.hostname.endsWith('.gleam.io')) {
+        sendResponse({ count: links.length });
+        return true;
+      }
+    } catch (e) {
+      sendResponse({ count: links.length });
+      return true;
+    }
+
     const exists = links.some(l => l.href === msg.href);
     if (!exists) {
       links.push({

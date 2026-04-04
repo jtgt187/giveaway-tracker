@@ -6,6 +6,16 @@
   let pageCount = 0;
   let hidden = false;
 
+  // Only accept URLs actually hosted on gleam.io (not reddit.com/search?q=gleam.io etc.)
+  function isGleamUrl(href) {
+    try {
+      const u = new URL(href, location.href);
+      return u.hostname === 'gleam.io' || u.hostname.endsWith('.gleam.io');
+    } catch (e) {
+      return false;
+    }
+  }
+
   // Normalize gleam URLs: strip query params and trailing slashes for better dedup
   function normalizeGleamUrl(urlStr) {
     try {
@@ -91,6 +101,7 @@
     anchors.forEach(a => {
       try {
         const url = new URL(a.href, location.href).toString();
+        if (!isGleamUrl(url)) return;
         const text = (a.textContent || '').trim();
         sendLink(url, text);
       } catch (e) {}
@@ -102,6 +113,7 @@
     anchors.forEach(a => {
       try {
         const url = new URL(a.href, location.href).toString();
+        if (!isGleamUrl(url)) return;
         const normalized = normalizeGleamUrl(url);
         if (!seenHref.has(normalized)) {
           const text = (a.textContent || '').trim();
