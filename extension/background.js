@@ -12,13 +12,38 @@ let entryStats = {
 };
 
 // -- Platform action script mapping ----------------------------------
+// Keyed by `${platform}:${actionType}`, falling back to `${platform}:follow`
 const PLATFORM_SCRIPTS = {
+  'twitter:follow':     'actions/x-follow.js',
+  'twitter:retweet':    'actions/x-retweet.js',
+  'twitter:like':       'actions/x-like.js',
+  'instagram:follow':   'actions/instagram-follow.js',
+  'instagram:like':     'actions/instagram-like.js',
+  'twitch:follow':      'actions/twitch-follow.js',
+  'youtube:follow':     'actions/youtube-subscribe.js',
+  'youtube:subscribe':  'actions/youtube-subscribe.js',
+  'tiktok:follow':      'actions/tiktok-follow.js',
+  'tiktok:like':        'actions/tiktok-like.js',
+};
+
+// Legacy lookup (platform-only) for backward compat
+const PLATFORM_SCRIPTS_LEGACY = {
   twitter:   'actions/x-follow.js',
   instagram: 'actions/instagram-follow.js',
   twitch:    'actions/twitch-follow.js',
   youtube:   'actions/youtube-subscribe.js',
   tiktok:    'actions/tiktok-follow.js',
 };
+
+// Heavy SPA platforms need extra render time after tab.status === 'complete'
+const PLATFORM_RENDER_DELAY = {
+  instagram: 4000,
+  tiktok:    4000,
+  twitter:   3000,
+  youtube:   2000,
+  twitch:    2000,
+};
+const DEFAULT_RENDER_DELAY = 2000;
 
 // -- Persistence helpers ----------------------------------------------
 
@@ -102,7 +127,11 @@ function checkAutoExport() {
  * @returns {Promise<object>} - Result from the action script
  */
 async function performSocialActionInTab(platform, targetUrl, actionType) {
-  const scriptFile = PLATFORM_SCRIPTS[platform];
+  // Look up script: first try platform:actionType, then platform:follow, then legacy
+  const scriptFile = PLATFORM_SCRIPTS[platform + ':' + actionType]
+    || PLATFORM_SCRIPTS[platform + ':follow']
+    || PLATFORM_SCRIPTS_LEGACY[platform];
+
   if (!scriptFile) {
     return { success: false, error: 'Unknown platform: ' + platform };
   }
@@ -120,8 +149,9 @@ async function performSocialActionInTab(platform, targetUrl, actionType) {
     // Wait for the tab to finish loading
     await waitForTabLoad(tabId, 20000);
 
-    // Give the page a moment to render dynamic content
-    await sleep(2000);
+    // Give the page time to render dynamic content (SPA-dependent)
+    const renderDelay = PLATFORM_RENDER_DELAY[platform] || DEFAULT_RENDER_DELAY;
+    await sleep(renderDelay);
 
     // Inject the action script
     const results = await chrome.scripting.executeScript({

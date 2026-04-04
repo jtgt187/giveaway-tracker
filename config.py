@@ -10,7 +10,7 @@ DEFAULT_CONFIG = {
     "target_country": "germany",
     "auto_enter_enabled": True,
     "auto_enter_methods": ["click"],
-    "ndjson_import_path": "",
+    "ndjson_import_dir": "",
 }
 
 

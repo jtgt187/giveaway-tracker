@@ -3,68 +3,136 @@
 (async function xFollowAction() {
   'use strict';
 
-  const TIMEOUT = 12000;
+  const TIMEOUT = 15000;
   const POLL_INTERVAL = 500;
 
   function sleep(ms) {
     return new Promise(r => setTimeout(r, ms));
   }
 
-  // Wait for an element matching any of the selectors to appear
-  async function waitForElement(selectors, timeout) {
-    const start = Date.now();
-    while (Date.now() - start < timeout) {
-      for (const sel of selectors) {
-        const el = document.querySelector(sel);
-        if (el) return el;
+  /**
+   * Check if user is not logged in to X/Twitter.
+   */
+  function isNotLoggedIn() {
+    // X redirects to login or shows a login sheet
+    if (location.pathname === '/login' || location.pathname.startsWith('/i/flow/login')) return true;
+
+    // Check for the bottom login bar / "Sign up" modal
+    var loginSheet = document.querySelector('[data-testid="loginButton"]');
+    if (loginSheet) return true;
+
+    // Check for the "Log in" / "Sign up" bottom bar
+    var bottomBar = document.querySelector('[data-testid="BottomBar"]');
+    if (bottomBar) return true;
+
+    return false;
+  }
+
+  /**
+   * Find a visible button by text content.
+   */
+  function findButtonByText(text) {
+    var lower = text.toLowerCase();
+    var buttons = document.querySelectorAll('button, [role="button"]');
+    for (var i = 0; i < buttons.length; i++) {
+      var spans = buttons[i].querySelectorAll('span');
+      for (var j = 0; j < spans.length; j++) {
+        var spanText = (spans[j].textContent || '').trim().toLowerCase();
+        if (spanText === lower) {
+          var rect = buttons[i].getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) return buttons[i];
+        }
       }
-      await sleep(POLL_INTERVAL);
     }
     return null;
   }
 
   // Check if we're already following this account
   function isAlreadyFollowing() {
-    // X shows "Following" button when already following
-    const followingBtn = document.querySelector('[data-testid="placementTracking"] [role="button"][data-testid$="-unfollow"]');
-    if (followingBtn) return true;
+    // data-testid based detection (most reliable on X)
+    var unfollowBtn = document.querySelector('[data-testid$="-unfollow"]');
+    if (unfollowBtn) return true;
 
-    // Check for aria-label indicating following state
-    const btns = document.querySelectorAll('[role="button"]');
-    for (const btn of btns) {
-      const label = (btn.getAttribute('aria-label') || '').toLowerCase();
+    // Check for "Following" button via data-testid in placement tracking area
+    var placementBtns = document.querySelectorAll('[data-testid="placementTracking"] [role="button"]');
+    for (var i = 0; i < placementBtns.length; i++) {
+      var txt = (placementBtns[i].textContent || '').trim().toLowerCase();
+      if (txt === 'following') return true;
+    }
+
+    // Check aria-labels
+    var allBtns = document.querySelectorAll('[role="button"]');
+    for (var j = 0; j < allBtns.length; j++) {
+      var label = (allBtns[j].getAttribute('aria-label') || '').toLowerCase();
       if (label.includes('following') && !label.includes('followers')) return true;
     }
 
-    // Check button text
-    const spans = document.querySelectorAll('[data-testid="placementTracking"] span span');
-    for (const span of spans) {
-      const txt = (span.textContent || '').trim().toLowerCase();
-      if (txt === 'following') return true;
-    }
+    // Text-based fallback
+    if (findButtonByText('following')) return true;
 
     return false;
   }
 
   try {
-    // Wait for the page to settle
-    await sleep(2000);
+    // Wait for X SPA to render
+    await sleep(3000);
+
+    // Check login state
+    if (isNotLoggedIn()) {
+      return { success: false, error: 'Not logged in to X/Twitter', platform: 'x' };
+    }
 
     // Check if already following
     if (isAlreadyFollowing()) {
       return { success: true, alreadyFollowing: true, platform: 'x' };
     }
 
-    // Find the follow button
-    const followSelectors = [
-      '[data-testid="placementTracking"] [role="button"]',
-      'button[data-testid$="-follow"]',
-      '[role="button"][aria-label*="Follow @"]',
-    ];
+    // Poll for the follow button
+    var followBtn = null;
+    var start = Date.now();
 
-    const followBtn = await waitForElement(followSelectors, TIMEOUT);
+    while (Date.now() - start < TIMEOUT) {
+      // Strategy 1: data-testid selectors (most reliable)
+      followBtn = document.querySelector('[data-testid$="-follow"]');
+      if (followBtn) {
+        var btnText = (followBtn.textContent || '').trim().toLowerCase();
+        if (btnText === 'following' || btnText === 'unfollow') {
+          return { success: true, alreadyFollowing: true, platform: 'x' };
+        }
+        break;
+      }
+
+      // Strategy 2: Placement tracking area
+      var placementBtns = document.querySelectorAll('[data-testid="placementTracking"] [role="button"]');
+      for (var i = 0; i < placementBtns.length; i++) {
+        var ptxt = (placementBtns[i].textContent || '').trim().toLowerCase();
+        if (ptxt === 'follow') {
+          followBtn = placementBtns[i];
+          break;
+        }
+      }
+      if (followBtn) break;
+
+      // Strategy 3: aria-label based
+      var ariaButtons = document.querySelectorAll('[role="button"][aria-label*="Follow @"]');
+      if (ariaButtons.length > 0) {
+        followBtn = ariaButtons[0];
+        break;
+      }
+
+      // Strategy 4: Text-based fallback
+      followBtn = findButtonByText('follow');
+      if (followBtn) break;
+
+      // Re-check following state
+      if (isAlreadyFollowing()) {
+        return { success: true, alreadyFollowing: true, platform: 'x' };
+      }
+
+      await sleep(POLL_INTERVAL);
+    }
+
     if (!followBtn) {
-      // Maybe we're already following and didn't detect it
       if (isAlreadyFollowing()) {
         return { success: true, alreadyFollowing: true, platform: 'x' };
       }
@@ -72,14 +140,14 @@
     }
 
     // Verify it's a Follow button (not Following/Unfollow)
-    const btnText = (followBtn.textContent || '').trim().toLowerCase();
-    if (btnText === 'following' || btnText === 'unfollow') {
+    var finalText = (followBtn.textContent || '').trim().toLowerCase();
+    if (finalText === 'following' || finalText === 'unfollow') {
       return { success: true, alreadyFollowing: true, platform: 'x' };
     }
 
     // Click the follow button
     followBtn.click();
-    await sleep(1500);
+    await sleep(2000);
 
     // Verify the follow was successful
     if (isAlreadyFollowing()) {

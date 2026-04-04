@@ -41,8 +41,26 @@
     return false;
   }
 
+  function isNotLoggedIn() {
+    // Twitch shows a login modal or redirects to login
+    if (location.pathname.startsWith('/login')) return true;
+    var loginModal = document.querySelector('[data-a-target="login-modal"]');
+    if (loginModal) return true;
+    // Check for prominent "Log In" button in the top nav
+    var loginBtn = document.querySelector('[data-a-target="login-button"]');
+    if (loginBtn) {
+      var rect = loginBtn.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) return true;
+    }
+    return false;
+  }
+
   try {
     await sleep(2500);
+
+    if (isNotLoggedIn()) {
+      return { success: false, error: 'Not logged in to Twitch', platform: 'twitch' };
+    }
 
     if (isAlreadyFollowing()) {
       return { success: true, alreadyFollowing: true, platform: 'twitch' };

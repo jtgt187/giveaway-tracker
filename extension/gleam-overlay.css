@@ -159,6 +159,7 @@
 #gleam-auto-entry-overlay .gae-entry-status.running { background: #7c3aed; color: #fff; }
 #gleam-auto-entry-overlay .gae-entry-status.done { background: #10b981; color: #fff; }
 #gleam-auto-entry-overlay .gae-entry-status.failed { background: #ef4444; color: #fff; }
+#gleam-auto-entry-overlay .gae-entry-status.attempted { background: #f59e0b; color: #fff; }
 #gleam-auto-entry-overlay .gae-entry-status.skipped { background: #666; color: #fff; }
 
 /* -- Progress bar -- */

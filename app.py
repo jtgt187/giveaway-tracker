@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 from html import escape as html_escape
+import glob as _glob
 import time
 import os
 import sys
@@ -807,57 +808,90 @@ def _check_accounts_status():
 
 
 def import_ndjson_links():
-    """Import gleam links from an NDJSON file exported by the browser extension.
+    """Import gleam links from all gleam-links*.ndjson files in a directory.
 
-    Reads the configured ndjson_import_path (defaults to ./gleam-links.ndjson),
-    adds any new gleam.io URLs to the database, then clears the file so links
-    are not re-imported.
+    Scans the configured ndjson_import_dir (defaults to the project directory)
+    for files matching ``gleam-links*.ndjson``, reads them all, adds any new
+    gleam.io URLs to the database, then truncates each file so links are not
+    re-imported.
+
+    Backwards compatibility: if the old ``ndjson_import_path`` config key
+    points to a file, its parent directory is used instead.
+
     Returns (imported_count, message) tuple.
     """
     config = load_config()
-    path = config.get("ndjson_import_path", "")
-    if not path:
-        # Default to gleam-links.ndjson in the project directory
-        path = os.path.join(os.path.dirname(__file__), "gleam-links.ndjson")
-    else:
-        path = os.path.expanduser(path)
 
-    if not os.path.isfile(path):
-        return 0, f"Import file not found: {path}"
+    # Resolve the import directory
+    import_dir = config.get("ndjson_import_dir", "")
+
+    # Backwards compat: honour old ndjson_import_path if ndjson_import_dir is empty
+    if not import_dir:
+        old_path = config.get("ndjson_import_path", "")
+        if old_path:
+            old_path = os.path.expanduser(old_path)
+            if os.path.isfile(old_path):
+                import_dir = os.path.dirname(old_path)
+            elif os.path.isdir(old_path):
+                import_dir = old_path
+            else:
+                # Treat as dir even if it doesn't exist yet
+                import_dir = old_path
+
+    if not import_dir:
+        import_dir = os.path.dirname(__file__)
+    else:
+        import_dir = os.path.expanduser(import_dir)
+
+    if not os.path.isdir(import_dir):
+        return 0, f"Import directory not found: {import_dir}"
+
+    # Find all matching NDJSON files
+    pattern = os.path.join(import_dir, "gleam-links*.ndjson")
+    files = sorted(_glob.glob(pattern))
+
+    if not files:
+        return 0, f"No gleam-links*.ndjson files found in {import_dir}"
 
     batch = []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                    if not isinstance(entry, dict):
+    errors = []
+    for filepath in files:
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
                         continue
-                    href = entry.get("href", "")
-                    text = entry.get("text", "") or href
-                    if href and "gleam.io" in href:
-                        batch.append({"title": text, "url": href, "source": "extension"})
-                except json.JSONDecodeError:
-                    continue
-    except OSError as e:
-        return 0, f"Could not read import file: {e}"
+                    try:
+                        entry = json.loads(line)
+                        if not isinstance(entry, dict):
+                            continue
+                        href = entry.get("href", "")
+                        text = entry.get("text", "") or href
+                        if href and "gleam.io" in href:
+                            batch.append({"title": text, "url": href, "source": "extension"})
+                    except json.JSONDecodeError:
+                        continue
+        except OSError as e:
+            errors.append(f"{os.path.basename(filepath)}: {e}")
 
-    if not batch:
-        return 0, "Import file is empty (no gleam.io links found)"
+    if not batch and not errors:
+        return 0, f"All {len(files)} file(s) are empty (no gleam.io links found)"
 
-    imported = add_giveaways_batch(batch)
+    imported = add_giveaways_batch(batch) if batch else 0
 
-    # Clear the file after reading so links aren't re-processed on next startup
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            pass  # "w" mode truncates the file
-    except OSError:
-        pass
+    # Truncate each file after reading so links aren't re-processed
+    for filepath in files:
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                pass
+        except OSError:
+            pass
 
-    return imported, f"Imported {imported} new links ({len(batch)} total in file)"
+    parts = [f"Imported {imported} new links from {len(files)} file(s) ({len(batch)} total in files)"]
+    if errors:
+        parts.append(f"Errors: {'; '.join(errors)}")
+    return imported, ". ".join(parts)
 
 
 def main():
@@ -1486,18 +1520,20 @@ def main():
 
         st.markdown('<div class="settings-section">', unsafe_allow_html=True)
         st.markdown(f'<h3>{SVG_ICONS["link"]} Extension Import</h3>', unsafe_allow_html=True)
-        current_import_path = config.get("ndjson_import_path", "")
-        import_path = st.text_input(
-            "NDJSON import file path",
-            value=current_import_path,
-            placeholder="~/Downloads/gleam-links.ndjson",
-            help="Path to the NDJSON file exported by the Gleam Link Monitor extension. "
-                 "Links are auto-imported when the app starts. Leave empty to disable.",
+        current_import_dir = config.get("ndjson_import_dir", "")
+        import_dir = st.text_input(
+            "NDJSON import directory",
+            value=current_import_dir,
+            placeholder="~/Downloads",
+            help="Directory containing gleam-links*.ndjson files exported by the "
+                 "Gleam Link Monitor extension. All matching files (e.g. "
+                 "gleam-links.ndjson, gleam-links (1).ndjson) are imported when "
+                 "the app starts. Leave empty to use the project directory.",
         )
-        if import_path != current_import_path:
-            config["ndjson_import_path"] = os.path.expanduser(import_path) if import_path else ""
+        if import_dir != current_import_dir:
+            config["ndjson_import_dir"] = os.path.expanduser(import_dir) if import_dir else ""
             save_config(config)
-            st.success("Import path updated!")
+            st.success("Import directory updated!")
         st.markdown('</div>', unsafe_allow_html=True)
 
 

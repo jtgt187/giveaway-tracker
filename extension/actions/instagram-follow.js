@@ -3,96 +3,129 @@
 (async function instagramFollowAction() {
   'use strict';
 
-  const TIMEOUT = 12000;
+  const TIMEOUT = 15000;
   const POLL_INTERVAL = 500;
 
   function sleep(ms) {
     return new Promise(r => setTimeout(r, ms));
   }
 
-  async function waitForElement(selectors, timeout) {
-    const start = Date.now();
-    while (Date.now() - start < timeout) {
-      for (const sel of selectors) {
-        const el = document.querySelector(sel);
-        if (el) return el;
-      }
-      await sleep(POLL_INTERVAL);
-    }
-    return null;
-  }
+  /**
+   * Check if user is not logged in. Instagram redirects to login or shows
+   * a login modal when not authenticated.
+   */
+  function isNotLoggedIn() {
+    // Check if redirected to login page
+    if (location.pathname.startsWith('/accounts/login')) return true;
 
-  function isAlreadyFollowing() {
-    // Instagram shows "Following" or "Requested" button when already following
-    const buttons = document.querySelectorAll('button');
-    for (const btn of buttons) {
-      const txt = (btn.textContent || '').trim().toLowerCase();
-      if (txt === 'following' || txt === 'requested') return true;
-      // Instagram also uses aria-label
-      const label = (btn.getAttribute('aria-label') || '').toLowerCase();
-      if (label === 'following' || label === 'requested') return true;
-    }
+    // Check for login modal overlay
+    var loginModal = document.querySelector('[role="dialog"] input[name="username"]');
+    if (loginModal) return true;
 
-    // Check for the "Following" button with a specific structure (IG uses divs inside buttons)
-    const headerSection = document.querySelector('header section');
-    if (headerSection) {
-      const btns = headerSection.querySelectorAll('button');
-      for (const btn of btns) {
-        // Following button often contains a dropdown arrow/icon
-        const innerText = (btn.innerText || '').trim().toLowerCase();
-        if (innerText === 'following' || innerText === 'requested') return true;
+    // Check for "Log in" prominent button suggesting not logged in
+    var loginBtns = document.querySelectorAll('a[href="/accounts/login/"], button');
+    for (var i = 0; i < loginBtns.length; i++) {
+      var txt = (loginBtns[i].textContent || '').trim().toLowerCase();
+      if (txt === 'log in' || txt === 'sign up') {
+        // Only count as "not logged in" if it's a prominent/visible login prompt
+        var rect = loginBtns[i].getBoundingClientRect();
+        if (rect.width > 80 && rect.height > 20) return true;
       }
     }
 
     return false;
   }
 
+  /**
+   * Find a visible button by its text content (case-insensitive exact match).
+   * Searches within an optional container, or the whole document.
+   */
+  function findButtonByText(text, container) {
+    var root = container || document;
+    var buttons = root.querySelectorAll('button, [role="button"]');
+    var lower = text.toLowerCase();
+
+    for (var i = 0; i < buttons.length; i++) {
+      var btn = buttons[i];
+      // Get the direct text content (avoid matching nested buttons)
+      var btnText = (btn.textContent || '').trim().toLowerCase();
+
+      if (btnText === lower) {
+        var rect = btn.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) return btn;
+      }
+    }
+    return null;
+  }
+
+  function isAlreadyFollowing() {
+    // Look for "Following" or "Requested" button anywhere on profile page
+    if (findButtonByText('following')) return true;
+    if (findButtonByText('requested')) return true;
+
+    // Also check aria-labels (Instagram uses these)
+    var buttons = document.querySelectorAll('button, [role="button"]');
+    for (var i = 0; i < buttons.length; i++) {
+      var label = (buttons[i].getAttribute('aria-label') || '').toLowerCase();
+      if (label === 'following' || label === 'requested') return true;
+    }
+
+    return false;
+  }
+
   try {
-    await sleep(2500);
+    // Wait for Instagram SPA to render (React hydration takes time)
+    await sleep(3000);
+
+    // Check login state first
+    if (isNotLoggedIn()) {
+      return { success: false, error: 'Not logged in to Instagram', platform: 'instagram' };
+    }
 
     if (isAlreadyFollowing()) {
       return { success: true, alreadyFollowing: true, platform: 'instagram' };
     }
 
-    // Instagram follow button selectors (these change frequently)
-    const followSelectors = [
-      // Header follow button on profile page
-      'header section button:not([type="button"])',
-      'header button',
-      // Various IG class patterns
-      'button._acan',
-      'button._acap',
-      // Fallback: find button with "Follow" text in the header area
-    ];
+    // Poll for the Follow button to appear (SPA rendering can be slow)
+    var followBtn = null;
+    var start = Date.now();
 
-    let followBtn = await waitForElement(followSelectors, TIMEOUT);
-
-    // If generic selectors matched, verify it's actually a Follow button
-    if (followBtn) {
-      const txt = (followBtn.textContent || '').trim().toLowerCase();
-      if (txt !== 'follow') {
-        // Try to find the actual Follow button by text content
-        followBtn = null;
+    while (Date.now() - start < TIMEOUT) {
+      // Strategy 1: Find button with exact text "Follow" in the header/profile area
+      var header = document.querySelector('header') || document.querySelector('main');
+      if (header) {
+        followBtn = findButtonByText('follow', header);
+        if (followBtn) break;
       }
-    }
 
-    // Fallback: search all buttons for one that says "Follow"
-    if (!followBtn) {
-      const allButtons = document.querySelectorAll('button');
-      for (const btn of allButtons) {
-        const txt = (btn.textContent || '').trim().toLowerCase();
-        if (txt === 'follow') {
-          // Make sure it's visible and in the profile area
-          const rect = btn.getBoundingClientRect();
+      // Strategy 2: Search entire page for "Follow" button
+      followBtn = findButtonByText('follow');
+      if (followBtn) break;
+
+      // Strategy 3: Try aria-label based search
+      var ariaButtons = document.querySelectorAll('button[aria-label], [role="button"][aria-label]');
+      for (var i = 0; i < ariaButtons.length; i++) {
+        var ariaLabel = (ariaButtons[i].getAttribute('aria-label') || '').toLowerCase();
+        if (ariaLabel.startsWith('follow') && !ariaLabel.includes('following') && !ariaLabel.includes('followers')) {
+          var rect = ariaButtons[i].getBoundingClientRect();
           if (rect.width > 0 && rect.height > 0) {
-            followBtn = btn;
+            followBtn = ariaButtons[i];
             break;
           }
         }
       }
+      if (followBtn) break;
+
+      // Re-check if we are now following (page may have updated)
+      if (isAlreadyFollowing()) {
+        return { success: true, alreadyFollowing: true, platform: 'instagram' };
+      }
+
+      await sleep(POLL_INTERVAL);
     }
 
     if (!followBtn) {
+      // Final check - maybe we're already following
       if (isAlreadyFollowing()) {
         return { success: true, alreadyFollowing: true, platform: 'instagram' };
       }
@@ -100,9 +133,9 @@
     }
 
     followBtn.click();
-    await sleep(2000);
+    await sleep(2500);
 
-    // Check for success
+    // Verify success
     if (isAlreadyFollowing()) {
       return { success: true, alreadyFollowing: false, platform: 'instagram' };
     }

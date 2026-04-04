@@ -46,8 +46,28 @@
     return false;
   }
 
+  function isNotLoggedIn() {
+    // YouTube shows "Sign in" button when not logged in
+    var signInBtn = document.querySelector('a[href*="accounts.google.com"], ytd-button-renderer a[href*="accounts.google.com"]');
+    if (signInBtn) return true;
+    // Check for the "Sign in" text button in top bar
+    var buttons = document.querySelectorAll('ytd-button-renderer, tp-yt-paper-button');
+    for (var i = 0; i < buttons.length; i++) {
+      var txt = (buttons[i].textContent || '').trim().toLowerCase();
+      if (txt === 'sign in') {
+        var rect = buttons[i].getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0 && rect.top < 80) return true;
+      }
+    }
+    return false;
+  }
+
   try {
     await sleep(2500);
+
+    if (isNotLoggedIn()) {
+      return { success: false, error: 'Not logged in to YouTube', platform: 'youtube' };
+    }
 
     if (isAlreadySubscribed()) {
       return { success: true, alreadyFollowing: true, platform: 'youtube' };

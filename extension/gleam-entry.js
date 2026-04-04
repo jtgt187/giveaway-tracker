@@ -63,7 +63,7 @@
   };
 
   // Action types we can automate
-  const AUTOMATABLE_ACTIONS = ['follow', 'subscribe', 'visit', 'view', 'click', 'watch'];
+  const AUTOMATABLE_ACTIONS = ['follow', 'subscribe', 'visit', 'view', 'click', 'watch', 'retweet', 'like', 'share'];
 
   // -- State ------------------------------------------------------------
   let entryMethods = [];
@@ -349,7 +349,7 @@
     overlay.id = 'gleam-auto-entry-overlay';
 
     var totalEntries = entryMethods.length;
-    var completedEntries = entryMethods.filter(function (m) { return m.status === 'done'; }).length;
+    var completedEntries = entryMethods.filter(function (m) { return m.status === 'done' || m.status === 'attempted'; }).length;
     var pendingEntries = entryMethods.filter(function (m) { return m.status === 'pending'; }).length;
 
     overlay.innerHTML =
@@ -397,6 +397,7 @@
       var statusIcon = '';
       if (m.status === 'done') statusIcon = '&#10003;';
       else if (m.status === 'failed') statusIcon = '&#10007;';
+      else if (m.status === 'attempted') statusIcon = '&#63;';
       else if (m.status === 'skipped') statusIcon = '&#8211;';
       else if (m.status === 'running') statusIcon = '';
       else statusIcon = '&#8226;';
@@ -426,6 +427,7 @@
       statusEl.className = 'gae-entry-status ' + status;
       if (status === 'done') statusEl.innerHTML = '&#10003;';
       else if (status === 'failed') statusEl.innerHTML = '&#10007;';
+      else if (status === 'attempted') statusEl.innerHTML = '&#63;';
       else if (status === 'skipped') statusEl.innerHTML = '&#8211;';
       else if (status === 'running') statusEl.innerHTML = '';
       else statusEl.innerHTML = '&#8226;';
@@ -607,6 +609,26 @@
     });
   }
 
+  /**
+   * Open a URL in a managed background tab (opened + closed by the background script).
+   * Use this instead of raw element.click() to prevent orphan tabs.
+   */
+  function performVisitViaBackground(url) {
+    return new Promise(function (resolve) {
+      chrome.runtime.sendMessage({
+        type: 'perform-visit-action',
+        targetUrl: url,
+      }, function (response) {
+        if (chrome.runtime.lastError) {
+          log('Visit background error: ' + chrome.runtime.lastError.message, 'error');
+          resolve({ success: false, error: chrome.runtime.lastError.message });
+          return;
+        }
+        resolve(response || { success: true });
+      });
+    });
+  }
+
   async function executeEntry(method, index) {
     updateEntryStatus(index, 'running');
 
@@ -646,39 +668,75 @@
         log('Social action failed: ' + (result.error || 'unknown'), 'error');
         // Continue anyway - try to claim the entry
       }
-    } else if (method.actionType === 'visit' || method.actionType === 'view' || method.actionType === 'watch') {
-      // For visit/view entries, click the action button (it opens a URL)
-      var visitBtn = findActionButton(method);
-      if (visitBtn) {
-        log('Opening visit URL...', 'info');
-        // Let the background handle opening the tab
-        var visitUrl = visitBtn.href || method.targetUrl;
-        if (visitUrl) {
-          var visitResult = await new Promise(function (resolve) {
-            chrome.runtime.sendMessage({
-              type: 'perform-visit-action',
-              targetUrl: visitUrl,
-            }, function (response) {
-              if (chrome.runtime.lastError) {
-                resolve({ success: false });
-                return;
-              }
-              resolve(response || { success: true });
-            });
-          });
+    } else if (method.actionType === 'retweet' || method.actionType === 'like' || method.actionType === 'share') {
+      // For retweet/like/share entries on known platforms, use dedicated action scripts
+      var socialBtn = findActionButton(method);
+      if (socialBtn && !method.targetUrl) {
+        method.targetUrl = socialBtn.href || null;
+      }
+
+      if (method.platform !== 'generic' && PLATFORM_PATTERNS[method.platform] && method.targetUrl) {
+        log('Performing ' + method.actionType + ' on ' + (PLATFORM_PATTERNS[method.platform] || {}).label + '...', 'info');
+        var socialResult = await performSocialAction(method);
+        await sleep(SOCIAL_ACTION_DELAY_MS);
+
+        if (socialResult.success) {
+          log(method.actionType + ' completed on ' + (PLATFORM_PATTERNS[method.platform] || {}).label, 'success');
+        } else {
+          log('Social action failed: ' + (socialResult.error || 'unknown'), 'error');
+        }
+      } else if (method.targetUrl) {
+        // Known URL but unknown platform - open via managed tab
+        log('Opening ' + method.actionType + ' URL in managed tab...', 'info');
+        await performVisitViaBackground(method.targetUrl);
+        await sleep(2000);
+      } else if (socialBtn) {
+        // Last resort: click but extract href first, prevent orphan tabs
+        var fallbackUrl = socialBtn.href || socialBtn.getAttribute('data-href');
+        if (fallbackUrl && fallbackUrl.indexOf('javascript:') !== 0 && fallbackUrl.indexOf('gleam.io') === -1) {
+          await performVisitViaBackground(fallbackUrl);
           await sleep(2000);
         } else {
-          // Click the button directly
+          socialBtn.click();
+          await sleep(2000);
+        }
+      }
+    } else if (method.actionType === 'visit' || method.actionType === 'view' || method.actionType === 'watch') {
+      // For visit/view/watch entries, always route through background tab management
+      var visitBtn = findActionButton(method);
+      var visitUrl = method.targetUrl || (visitBtn ? (visitBtn.href || null) : null);
+
+      if (visitUrl && visitUrl.indexOf('javascript:') !== 0 && visitUrl.indexOf('gleam.io') === -1) {
+        log('Opening visit URL in managed tab...', 'info');
+        await performVisitViaBackground(visitUrl);
+        await sleep(2000);
+      } else if (visitBtn) {
+        // Extract any possible URL from the button before clicking
+        var btnUrl = visitBtn.href || visitBtn.getAttribute('data-href') || visitBtn.getAttribute('data-url');
+        if (btnUrl && btnUrl.indexOf('javascript:') !== 0 && btnUrl.indexOf('gleam.io') === -1) {
+          await performVisitViaBackground(btnUrl);
+          await sleep(2000);
+        } else {
+          // Absolute last resort: click directly (no URL could be extracted)
           visitBtn.click();
           await sleep(3000);
         }
       }
     } else {
-      // Simple click/enter entry - just click the action button if present
+      // Simple click/enter entry - extract URL and use managed tab if possible
       var simpleBtn = findActionButton(method);
       if (simpleBtn) {
-        simpleBtn.click();
-        await sleep(1000);
+        var simpleBtnUrl = simpleBtn.href || simpleBtn.getAttribute('data-href') || simpleBtn.getAttribute('data-url');
+        if (simpleBtnUrl && simpleBtnUrl.indexOf('javascript:') !== 0 && simpleBtnUrl.indexOf('gleam.io') === -1
+            && (simpleBtn.target === '_blank' || simpleBtnUrl.indexOf('http') === 0)) {
+          // Route through managed tab to prevent orphan tabs
+          log('Opening entry URL in managed tab...', 'info');
+          await performVisitViaBackground(simpleBtnUrl);
+          await sleep(2000);
+        } else {
+          simpleBtn.click();
+          await sleep(1000);
+        }
       }
     }
 
@@ -708,10 +766,10 @@
       return true;
     }
 
-    // Even if we can't confirm completion, mark as done if we clicked everything
-    updateEntryStatus(index, 'done');
-    log('Entry attempted: ' + method.displayText, 'info');
-    return true;
+    // Could not confirm completion - mark as attempted (not confirmed)
+    updateEntryStatus(index, 'attempted');
+    log('Entry attempted but not confirmed: ' + method.displayText, 'warn');
+    return false;
   }
 
   async function startAutoEntry() {
@@ -731,14 +789,19 @@
 
     var completed = 0;
     var failed = 0;
+    var attempted = 0;
 
     for (var i = 0; i < entryMethods.length; i++) {
       if (entryMethods[i].status !== 'pending') continue;
 
       try {
-        updateProgress(completed, total, 'Processing ' + (completed + 1) + '/' + total + '...');
-        await executeEntry(entryMethods[i], i);
-        completed++;
+        updateProgress(completed + attempted, total, 'Processing ' + (completed + attempted + 1) + '/' + total + '...');
+        var success = await executeEntry(entryMethods[i], i);
+        if (success) {
+          completed++;
+        } else {
+          attempted++;
+        }
       } catch (e) {
         log('Error on entry ' + (i + 1) + ': ' + e.message, 'error');
         updateEntryStatus(i, 'failed');
@@ -751,8 +814,11 @@
       }
     }
 
-    updateProgress(total, total, 'Done! ' + completed + ' completed, ' + failed + ' failed');
-    log('Auto-entry finished. Completed: ' + completed + ', Failed: ' + failed, completed > 0 ? 'success' : 'error');
+    var summary = completed + ' completed';
+    if (attempted > 0) summary += ', ' + attempted + ' unconfirmed';
+    if (failed > 0) summary += ', ' + failed + ' failed';
+    updateProgress(total, total, 'Done! ' + summary);
+    log('Auto-entry finished. ' + summary, completed > 0 ? 'success' : 'error');
 
     isRunning = false;
     if (enterBtn) {

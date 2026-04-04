@@ -5,7 +5,7 @@ Covers:
   - save_config + load_config round-trip (any Settings change)
   - Country selectbox persistence
   - Custom site stubs (deprecated, always return False/[])
-  - NDJSON import path text input
+  - NDJSON import directory text input
   - Malformed config.json resilience
 """
 
@@ -23,7 +23,7 @@ def test_load_config_defaults(tmp_config):
     config = load_config()
     assert config["target_country"] == DEFAULT_CONFIG["target_country"]
     assert config["auto_enter_enabled"] == DEFAULT_CONFIG["auto_enter_enabled"]
-    assert config["ndjson_import_path"] == DEFAULT_CONFIG["ndjson_import_path"]
+    assert config["ndjson_import_dir"] == DEFAULT_CONFIG["ndjson_import_dir"]
 
 
 def test_save_and_load_config(tmp_config):
@@ -126,31 +126,31 @@ def test_arbitrary_config_key_roundtrip(tmp_config):
 
 
 # ---------------------------------------------------------------------------
-# NDJSON import path text input
+# NDJSON import directory text input
 # ---------------------------------------------------------------------------
 
-def test_ndjson_path_persists(tmp_config):
+def test_ndjson_dir_persists(tmp_config):
     import config as cfg
     from config import load_config, save_config
 
     config = load_config()
-    config["ndjson_import_path"] = "/tmp/test.ndjson"
+    config["ndjson_import_dir"] = "/tmp/test-dir"
     save_config(config)
     cfg._config_cache = None
 
-    assert load_config()["ndjson_import_path"] == "/tmp/test.ndjson"
+    assert load_config()["ndjson_import_dir"] == "/tmp/test-dir"
 
 
-def test_ndjson_path_empty(tmp_config):
+def test_ndjson_dir_empty(tmp_config):
     import config as cfg
     from config import load_config, save_config
 
     config = load_config()
-    config["ndjson_import_path"] = ""
+    config["ndjson_import_dir"] = ""
     save_config(config)
     cfg._config_cache = None
 
-    assert load_config()["ndjson_import_path"] == ""
+    assert load_config()["ndjson_import_dir"] == ""
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +204,7 @@ def test_load_config_merges_partial(tmp_config):
     assert config["target_country"] == "us"
     # Other keys should come from defaults
     assert config["auto_enter_enabled"] == DEFAULT_CONFIG["auto_enter_enabled"]
-    assert config["ndjson_import_path"] == DEFAULT_CONFIG["ndjson_import_path"]
+    assert config["ndjson_import_dir"] == DEFAULT_CONFIG["ndjson_import_dir"]
 
 
 # ---------------------------------------------------------------------------
@@ -271,13 +271,13 @@ def test_load_config_backslash_recovery(tmp_config):
 
     # Write JSON with unescaped backslashes (common Windows path issue)
     with open(tmp_config, "w") as f:
-        f.write('{"ndjson_import_path": "C:\\Users\\test\\file.ndjson"}')
+        f.write('{"ndjson_import_dir": "C:\\Users\\test\\downloads"}')
 
     cfg._config_cache = None
     config = load_config()
     # Should recover and contain the path (with proper escaping)
-    assert "ndjson_import_path" in config
-    assert "Users" in config["ndjson_import_path"]
+    assert "ndjson_import_dir" in config
+    assert "Users" in config["ndjson_import_dir"]
 
 
 def test_load_config_creates_backup_on_irrecoverable(tmp_config):
@@ -307,7 +307,7 @@ def test_default_config_has_required_keys(tmp_config):
     """DEFAULT_CONFIG should contain all keys needed by the application."""
     from config import DEFAULT_CONFIG
 
-    required_keys = ["target_country", "auto_enter_enabled", "ndjson_import_path"]
+    required_keys = ["target_country", "auto_enter_enabled", "ndjson_import_dir"]
     for key in required_keys:
         assert key in DEFAULT_CONFIG, f"Missing key in DEFAULT_CONFIG: {key}"
 
