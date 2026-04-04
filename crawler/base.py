@@ -1,13 +1,21 @@
 import requests
-import cloudscraper
 from bs4 import BeautifulSoup
 from utils.network import get_random_headers, random_delay
 from utils.country_check import is_region_blocked, is_ended
 
-# Shared cloudscraper session for bypassing Cloudflare challenges
-_scraper = cloudscraper.create_scraper(
-    browser={"browser": "chrome", "platform": "windows", "desktop": True}
-)
+
+def _fetch_with_playwright(url, timeout=30):
+    """Fetch a page using a real headless browser (bypasses Cloudflare)."""
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        try:
+            page.goto(url, timeout=timeout * 1000, wait_until="domcontentloaded")
+            html = page.content()
+        finally:
+            browser.close()
+    return html
 
 
 class BaseCrawler:
@@ -18,14 +26,14 @@ class BaseCrawler:
     def get_page(self, url):
         headers = get_random_headers(referer=self.base_url)
         try:
-            resp = _scraper.get(url, headers=headers, timeout=30)
-            resp.raise_for_status()
-            return resp.text
-        except Exception:
-            # Fallback to plain requests if cloudscraper fails
             resp = requests.get(url, headers=headers, timeout=30)
             resp.raise_for_status()
             return resp.text
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 403:
+                # Site is blocking requests — fall back to headless browser
+                return _fetch_with_playwright(url)
+            raise
 
     def extract_giveaways(self):
         raise NotImplementedError
