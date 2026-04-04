@@ -11,21 +11,20 @@ import json
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from database import init_db, add_giveaway, get_giveaways, get_giveaways_display, update_giveaway_status, get_stats, update_giveaway_entries, get_giveaway_by_url, delete_not_eligible, update_terms_check, add_to_blacklist, get_blacklist, remove_from_blacklist, remove_expired_giveaways
+from database import init_db, add_giveaway, add_giveaways_batch, get_giveaways, get_giveaways_display, update_giveaway_status, get_stats, update_giveaway_entries, get_giveaway_by_url, get_known_urls, delete_not_eligible, update_terms_check, add_to_blacklist, get_blacklist, remove_from_blacklist, remove_expired_giveaways
 from config import load_config, save_config, add_custom_site, remove_custom_site, get_custom_sites
 from crawler.gleamfinder import GleamfinderCrawler
 from crawler.gleam_official import GleamOfficialCrawler
 from crawler.bestofgleam import BestOfGleamCrawler
 from crawler.gleamdb import GleamDBCrawler
 from crawler.custom_sites import CustomSitesCrawler
-from entry.auto_enter import auto_enter_giveaway, check_giveaway_terms
+from entry.auto_enter import auto_enter_giveaway, check_giveaway_terms, check_giveaway_terms_batch
 from utils.country_check import is_eligible_for_country, is_region_blocked, is_ended
 from utils.probability import format_probability
 
 init_db()
-_expired_removed = remove_expired_giveaways()
-if _expired_removed:
-    print(f"[startup] Removed {_expired_removed} expired giveaway(s) from database")
+# Note: expired giveaway cleanup moved to session-guarded startup in main()
+# to avoid running on every Streamlit rerun.
 
 
 @st.cache_data(ttl=5)
@@ -44,8 +43,9 @@ st.set_page_config(
 )
 
 CUSTOM_CSS = """
+<link rel="preload" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" as="style" onload="this.onload=null;this.rel='stylesheet'">
+<noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap"></noscript>
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
 
     :root {
         --bg-primary: #0a0a0f;
@@ -578,6 +578,86 @@ CUSTOM_CSS = """
     .ga-badge-skipped { background: rgba(234,179,8,0.15); color: #facc15; }
     .ga-badge-not_eligible { background: rgba(239,68,68,0.15); color: #f87171; }
     .ga-table .ga-muted { color: var(--text-tertiary); }
+
+    /* Account status cards */
+    .account-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+        gap: 12px;
+        margin-top: 8px;
+    }
+    .account-card {
+        background: var(--bg-glass);
+        border-radius: var(--radius-md);
+        padding: 16px;
+        border: 1px solid var(--border-subtle);
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        transition: all var(--transition-base);
+    }
+    .account-card:hover {
+        background: var(--bg-glass-hover);
+        border-color: var(--border-default);
+    }
+    .account-card .acc-icon {
+        width: 36px;
+        height: 36px;
+        border-radius: var(--radius-sm);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+        font-size: 1.2rem;
+    }
+    .account-card .acc-name {
+        color: var(--text-primary);
+        font-weight: 600;
+        font-size: 0.85rem;
+    }
+    .account-card .acc-status {
+        font-size: 0.75rem;
+        font-weight: 600;
+    }
+    .acc-status-ok { color: var(--success); }
+    .acc-status-warning { color: var(--warning); }
+    .acc-status-error { color: var(--error); }
+    .acc-status-unknown { color: var(--text-tertiary); }
+
+    /* Urgency badges for deadlines */
+    .urgency-critical { color: var(--error); font-weight: 700; }
+    .urgency-soon { color: var(--warning); font-weight: 600; }
+    .urgency-normal { color: var(--text-tertiary); }
+
+    /* Entry stats bar */
+    .entry-stats {
+        display: flex;
+        gap: 24px;
+        background: var(--bg-glass);
+        border-radius: var(--radius-md);
+        padding: 16px 24px;
+        border: 1px solid var(--border-subtle);
+        margin-bottom: 16px;
+    }
+    .entry-stat {
+        text-align: center;
+    }
+    .entry-stat .es-value {
+        font-size: 1.5rem;
+        font-weight: 800;
+        color: var(--text-primary);
+        line-height: 1;
+    }
+    .entry-stat .es-label {
+        font-size: 0.7rem;
+        color: var(--text-tertiary);
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        margin-top: 4px;
+    }
+    .es-success .es-value { color: var(--success); }
+    .es-failed .es-value { color: var(--error); }
+    .es-skipped .es-value { color: var(--warning); }
 </style>
 """
 
@@ -631,56 +711,95 @@ def run_crawl(crawl_sources, custom_sites_list, progress_placeholder):
     from crawler.base import BaseCrawler
     validator = BaseCrawler("validator", "https://gleam.io")
 
-    total_crawlers = len(crawlers)
-    for i, crawler in enumerate(crawlers):
-        progress_placeholder.progress((i / total_crawlers), text=f"Crawling {crawler.name}...")
-        source_count = 0
-        this_status = {"status": "unknown", "count": 0, "error": ""}
+    # Pre-load all known URLs in one query for bulk dedup
+    known_urls = get_known_urls()
+
+    # --- Phase 1: Crawl all sources in parallel ---
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _run_one_crawler(crawler):
+        """Run a single crawler and return (name, giveaways, status_dict)."""
+        status = {"status": "unknown", "count": 0, "error": ""}
         try:
             if crawler.name == "custom_sites":
                 giveaways = crawler.extract_giveaways(custom_sites_list)
             else:
                 giveaways = crawler.extract_giveaways()
-
-            st.info(f"{crawler.name}: Found {len(giveaways)} giveaways")
-            this_status["status"] = "ok"
-            this_status["count"] = len(giveaways)
-
-            for g in giveaways:
-                total_found += 1
-                source_count += 1
-
-                # Check if this gleam URL is already in the database
-                existing = get_giveaway_by_url(g["url"])
-                if existing:
-                    continue  # Already known, skip validation
-
-                # Validate new gleam.io URLs to filter out ended/region-blocked
-                if "gleam.io" in g["url"]:
-                    validation = validator.validate_gleam_url(g["url"])
-                    if validation == "ended":
-                        skipped_ended += 1
-                        continue
-                    elif validation == "region_blocked":
-                        skipped_region += 1
-                        continue
-
-                is_new = add_giveaway(
-                    g["title"], g["url"], g["source"],
-                    g.get("description", ""), g.get("deadline", ""),
-                    g.get("country_restriction", "worldwide")
-                )
-                if is_new:
-                    new_count += 1
-                    existing = get_giveaway_by_url(g["url"])
-                    if existing and is_eligible_for_country(existing.get("country_restriction", "worldwide"), target_country):
-                        eligible_count += 1
+            status["status"] = "ok"
+            status["count"] = len(giveaways)
+            return crawler.name, giveaways, status
         except Exception as e:
-            st.error(f"Crawler {crawler.name} failed: {e}")
-            this_status["status"] = "failed"
-            this_status["error"] = str(e)
-        finally:
-            crawl_status[crawler.name] = this_status
+            status["status"] = "failed"
+            status["error"] = str(e)
+            return crawler.name, [], status
+
+    all_giveaways = []
+    total_crawlers = len(crawlers)
+
+    if total_crawlers > 0:
+        progress_placeholder.progress(0.0, text="Crawling sources in parallel...")
+
+        with ThreadPoolExecutor(max_workers=min(total_crawlers, 4)) as pool:
+            futures = {pool.submit(_run_one_crawler, c): c for c in crawlers}
+            done_count = 0
+            for future in as_completed(futures):
+                done_count += 1
+                name, giveaways, status = future.result()
+                crawl_status[name] = status
+                all_giveaways.extend(giveaways)
+                progress_placeholder.progress(
+                    done_count / total_crawlers,
+                    text=f"Crawled {name} ({status['count']} found)",
+                )
+
+    total_found = len(all_giveaways)
+
+    # --- Phase 2: Dedup against DB and validate new URLs ---
+    new_giveaways = [g for g in all_giveaways if g["url"] not in known_urls]
+
+    # Validate new gleam.io URLs in parallel (the heaviest part)
+    gleam_to_validate = [g for g in new_giveaways if "gleam.io" in g["url"]]
+    non_gleam = [g for g in new_giveaways if "gleam.io" not in g["url"]]
+
+    validated = []  # giveaways that passed validation
+
+    if gleam_to_validate:
+        progress_placeholder.progress(0.5, text=f"Validating {len(gleam_to_validate)} new gleam URLs...")
+
+        def _validate_one(g):
+            result = validator.validate_gleam_url(g["url"])
+            return g, result
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = [pool.submit(_validate_one, g) for g in gleam_to_validate]
+            for future in as_completed(futures):
+                g, result = future.result()
+                if result == "ended":
+                    skipped_ended += 1
+                elif result == "region_blocked":
+                    skipped_region += 1
+                else:
+                    validated.append(g)
+
+    validated.extend(non_gleam)
+
+    # --- Phase 3: Insert validated giveaways in a single transaction ---
+    inserted = add_giveaways_batch([
+        {
+            "title": g["title"],
+            "url": g["url"],
+            "source": g["source"],
+            "description": g.get("description", ""),
+            "deadline": g.get("deadline", ""),
+            "country_restriction": g.get("country_restriction", "worldwide"),
+        }
+        for g in validated
+    ])
+    new_count += inserted
+    # Count how many of the newly inserted are eligible
+    for g in validated:
+        if is_eligible_for_country(g.get("country_restriction", "worldwide"), target_country):
+            eligible_count += 1
 
     if skipped_ended > 0 or skipped_region > 0:
         st.info(f"Filtered out: {skipped_ended} ended, {skipped_region} region-blocked")
@@ -694,16 +813,99 @@ def run_crawl(crawl_sources, custom_sites_list, progress_placeholder):
 
 
 def scan_existing_entries():
-    giveaways = get_giveaways()
+    giveaways = get_giveaways(status="new")
+    if not giveaways:
+        return
     target_country = load_config().get("target_country", "germany")
-
+    conn = __import__("sqlite3").connect(
+        os.path.join(os.path.dirname(__file__), "giveaways.db")
+    )
+    cursor = conn.cursor()
     for g in giveaways:
-        if g["status"] == "new":
-            country = g.get("country_restriction", "worldwide")
-            if is_eligible_for_country(country, target_country):
-                update_giveaway_status(g["id"], "eligible")
+        country = g.get("country_restriction", "worldwide")
+        new_status = "eligible" if is_eligible_for_country(country, target_country) else "not_eligible"
+        cursor.execute("UPDATE giveaways SET status = ? WHERE id = ?", (new_status, g["id"]))
+    conn.commit()
+    conn.close()
+
+
+def _check_accounts_status():
+    """Check login status for social platforms by probing known URLs.
+
+    Checks all 8 platforms in parallel using a thread pool to avoid
+    up to 64 seconds of sequential HTTP waits.
+    Results are stored in st.session_state.account_status.
+    """
+    import requests
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    checks = {
+        "gleam_io": {
+            "url": "https://gleam.io/giveaways",
+            "ok_hint": "gleam",
+        },
+        "x_twitter": {
+            "url": "https://x.com",
+            "ok_hint": "x.com",
+        },
+        "instagram": {
+            "url": "https://www.instagram.com/",
+            "ok_hint": "instagram",
+        },
+        "youtube": {
+            "url": "https://www.youtube.com/",
+            "ok_hint": "youtube",
+        },
+        "facebook": {
+            "url": "https://www.facebook.com/",
+            "ok_hint": "facebook",
+        },
+        "discord": {
+            "url": "https://discord.com/channels/@me",
+            "ok_hint": "discord",
+        },
+        "twitch": {
+            "url": "https://www.twitch.tv/",
+            "ok_hint": "twitch",
+        },
+        "tiktok": {
+            "url": "https://www.tiktok.com/",
+            "ok_hint": "tiktok",
+        },
+    }
+
+    from utils.network import get_random_headers
+
+    def _probe(key, info):
+        try:
+            resp = requests.get(info["url"], headers=get_random_headers(), timeout=8, allow_redirects=True)
+            return key, resp.status_code
+        except Exception:
+            return key, None
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_probe, k, v): k for k, v in checks.items()}
+        for future in as_completed(futures):
+            key, status_code = future.result()
+            name = st.session_state.account_status[key]["name"]
+            if status_code == 200:
+                st.session_state.account_status[key] = {
+                    "name": name,
+                    "status": "ok",
+                    "detail": f"Reachable ({status_code})",
+                }
+            elif status_code is not None:
+                st.session_state.account_status[key] = {
+                    "name": name,
+                    "status": "warning",
+                    "detail": f"HTTP {status_code}",
+                }
             else:
-                update_giveaway_status(g["id"], "not_eligible")
+                st.session_state.account_status[key] = {
+                    "name": name,
+                    "status": "error",
+                    "detail": "Unreachable",
+                }
 
 
 def import_ndjson_links():
@@ -721,7 +923,7 @@ def import_ndjson_links():
     if not os.path.isfile(path):
         return 0
 
-    imported = 0
+    batch = []
     try:
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
@@ -735,12 +937,13 @@ def import_ndjson_links():
                     href = entry.get("href", "")
                     text = entry.get("text", "") or href
                     if href and "gleam.io" in href:
-                        if add_giveaway(title=text, url=href, source="extension"):
-                            imported += 1
+                        batch.append({"title": text, "url": href, "source": "extension"})
                 except json.JSONDecodeError:
                     continue
     except OSError:
         return 0
+
+    imported = add_giveaways_batch(batch) if batch else 0
 
     # Clear the file after reading so links aren't re-processed on next startup
     try:
@@ -753,6 +956,13 @@ def import_ndjson_links():
 
 
 def main():
+    # Remove expired giveaways once per session (not on every rerun)
+    if "expired_cleaned" not in st.session_state:
+        removed = remove_expired_giveaways()
+        st.session_state.expired_cleaned = True
+        if removed:
+            print(f"[startup] Removed {removed} expired giveaway(s) from database")
+
     # Auto-import links from the browser extension NDJSON file
     if "ndjson_imported" not in st.session_state:
         imported = import_ndjson_links()
@@ -898,6 +1108,166 @@ def main():
             </div>
             """, unsafe_allow_html=True)
 
+        # --- Account Status Section ---
+        st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
+        st.markdown(f'<div class="section-title">{SVG_ICONS["globe"]} Account Status</div>', unsafe_allow_html=True)
+
+        # Load or initialize account status from session state
+        if "account_status" not in st.session_state:
+            st.session_state.account_status = {
+                "gleam_io": {"name": "Gleam.io", "status": "unknown", "detail": "Not checked"},
+                "x_twitter": {"name": "X / Twitter", "status": "unknown", "detail": "Not checked"},
+                "instagram": {"name": "Instagram", "status": "unknown", "detail": "Not checked"},
+                "youtube": {"name": "YouTube", "status": "unknown", "detail": "Not checked"},
+                "facebook": {"name": "Facebook", "status": "unknown", "detail": "Not checked"},
+                "discord": {"name": "Discord", "status": "unknown", "detail": "Not checked"},
+                "twitch": {"name": "Twitch", "status": "unknown", "detail": "Not checked"},
+                "tiktok": {"name": "TikTok", "status": "unknown", "detail": "Not checked"},
+            }
+
+        account_icons = {
+            "gleam_io": "&#x1F3B0;",
+            "x_twitter": "&#x1D54F;",
+            "instagram": "&#x1F4F7;",
+            "youtube": "&#x25B6;",
+            "facebook": "&#x1F44D;",
+            "discord": "&#x1F4AC;",
+            "twitch": "&#x1F3AE;",
+            "tiktok": "&#x1F3B5;",
+        }
+
+        status_class_map = {
+            "ok": "acc-status-ok",
+            "warning": "acc-status-warning",
+            "error": "acc-status-error",
+            "unknown": "acc-status-unknown",
+        }
+
+        status_label_map = {
+            "ok": "Connected",
+            "warning": "Check needed",
+            "error": "Not logged in",
+            "unknown": "Not checked",
+        }
+
+        cards_html = '<div class="account-grid">'
+        for key, acc in st.session_state.account_status.items():
+            icon = account_icons.get(key, "&#x2699;")
+            sc = status_class_map.get(acc["status"], "acc-status-unknown")
+            label = acc.get("detail", status_label_map.get(acc["status"], "Unknown"))
+            cards_html += f"""
+            <div class="account-card">
+                <div class="acc-icon">{icon}</div>
+                <div>
+                    <div class="acc-name">{html_escape(acc["name"])}</div>
+                    <div class="acc-status {sc}">{html_escape(label)}</div>
+                </div>
+            </div>"""
+        cards_html += '</div>'
+        st.markdown(cards_html, unsafe_allow_html=True)
+
+        if st.button("Check Account Status", key="check_accounts"):
+            with st.spinner("Checking accounts via browser profile..."):
+                _check_accounts_status()
+            st.rerun()
+
+        # --- Quick Actions ---
+        st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
+        st.markdown(f'<div class="section-title">{SVG_ICONS["zap"]} Quick Actions</div>', unsafe_allow_html=True)
+        qa_col1, qa_col2, qa_col3 = st.columns(3)
+        with qa_col1:
+            if st.button("Crawl + Enter All", type="primary", use_container_width=True, key="dash_crawl_enter"):
+                with st.spinner("Crawling..."):
+                    config = load_config()
+                    class _SP:
+                        def progress(self, *a, **kw):
+                            pass
+                    new_count, eligible_count, total_found = run_crawl(
+                        config.get("crawl_sources", []),
+                        config.get("custom_sites", []),
+                        _SP(),
+                    )
+                    scan_existing_entries()
+                eligible = get_giveaways("eligible")
+                entered = 0
+                failed = 0
+                for g in eligible:
+                    with st.spinner(f"Entering: {g['title'][:50]}..."):
+                        result, log = auto_enter_giveaway(g["url"])
+                        if result is True:
+                            update_giveaway_status(g["id"], "participated")
+                            entered += 1
+                        elif result == "region_restricted":
+                            update_giveaway_status(g["id"], "not_eligible")
+                            failed += 1
+                        elif result == "ended":
+                            update_giveaway_status(g["id"], "expired")
+                            failed += 1
+                        else:
+                            failed += 1
+                st.toast(f"Done: {entered} entered, {failed} failed, {new_count} new found")
+                _cached_giveaways_display.clear()
+                st.rerun()
+        with qa_col2:
+            eligible_count = stats.get("eligible", 0)
+            if st.button(f"Enter All Eligible ({eligible_count})", use_container_width=True, key="dash_enter_all"):
+                eligible = get_giveaways("eligible")
+                entered = 0
+                for g in eligible:
+                    with st.spinner(f"Entering: {g['title'][:50]}..."):
+                        result, log = auto_enter_giveaway(g["url"])
+                        if result is True:
+                            update_giveaway_status(g["id"], "participated")
+                            entered += 1
+                        elif result == "region_restricted":
+                            update_giveaway_status(g["id"], "not_eligible")
+                        elif result == "ended":
+                            update_giveaway_status(g["id"], "expired")
+                st.toast(f"Entered {entered} giveaways")
+                _cached_giveaways_display.clear()
+                st.rerun()
+        with qa_col3:
+            if st.button("Quick Crawl", use_container_width=True, key="dash_quick_crawl"):
+                with st.spinner("Crawling..."):
+                    config = load_config()
+                    class _SP2:
+                        def progress(self, *a, **kw):
+                            pass
+                    new_count, eligible_count, total_found = run_crawl(
+                        config.get("crawl_sources", []),
+                        config.get("custom_sites", []),
+                        _SP2(),
+                    )
+                    scan_existing_entries()
+                st.toast(f"Found {new_count} new giveaways ({eligible_count} eligible)")
+                _cached_giveaways_display.clear()
+                st.rerun()
+
+        # --- Entry Session Stats ---
+        if "entry_stats" not in st.session_state:
+            st.session_state.entry_stats = {"entered": 0, "failed": 0, "skipped": 0}
+
+        es = st.session_state.entry_stats
+        if es["entered"] + es["failed"] + es["skipped"] > 0:
+            st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
+            st.markdown(f'<div class="section-title">{SVG_ICONS["trending"]} Session Entry Stats</div>', unsafe_allow_html=True)
+            st.markdown(f"""
+            <div class="entry-stats">
+                <div class="entry-stat es-success">
+                    <div class="es-value">{es['entered']}</div>
+                    <div class="es-label">Entered</div>
+                </div>
+                <div class="entry-stat es-failed">
+                    <div class="es-value">{es['failed']}</div>
+                    <div class="es-label">Failed</div>
+                </div>
+                <div class="entry-stat es-skipped">
+                    <div class="es-value">{es['skipped']}</div>
+                    <div class="es-label">Skipped</div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
     with tab_giveaways:
         st.markdown(f'<div class="section-title">{SVG_ICONS["list"]} All Giveaways</div>', unsafe_allow_html=True)
 
@@ -929,8 +1299,27 @@ def main():
             # Penalty for unchecked T&C
             df["_unchecked_penalty"] = (~df["terms_checked"].astype(bool)).astype(int) * 5
 
-            df["_sort_order"] = df["_country_score"] + df["_terms_penalty"] + df["_unchecked_penalty"]
-            df = df.sort_values("_sort_order").drop(columns=["_sort_order", "_country_score", "_terms_penalty", "_unchecked_penalty"])
+            # Deadline urgency bonus: giveaways ending soon should be entered first
+            from database import parse_deadline
+            now = datetime.now()
+
+            def _deadline_urgency(row):
+                dl = row.get("deadline", "")
+                dt = parse_deadline(dl)
+                if not dt:
+                    return 3  # unknown deadline = neutral
+                hours_left = (dt - now).total_seconds() / 3600
+                if hours_left < 0:
+                    return 100  # expired, push to bottom
+                if hours_left < 24:
+                    return -2  # critical urgency, push to top
+                if hours_left < 72:
+                    return -1  # ending soon
+                return 3
+            df["_deadline_urgency"] = df.apply(_deadline_urgency, axis=1)
+
+            df["_sort_order"] = df["_country_score"] + df["_terms_penalty"] + df["_unchecked_penalty"] + df["_deadline_urgency"]
+            df = df.sort_values("_sort_order").drop(columns=["_sort_order", "_country_score", "_terms_penalty", "_unchecked_penalty", "_deadline_urgency"])
 
             # Status badge mapping
             badge_labels = {
@@ -938,69 +1327,121 @@ def main():
                 "not_eligible": "Not Eligible", "expired": "Expired", "skipped": "Skipped",
             }
 
-            # Build HTML table
-            html_rows = []
-            row_data = []  # keep track of (id, url, title) for the remove buttons
-            for _, row in df.iterrows():
-                title = html_escape(row.get("title", "Untitled"))
-                url = html_escape(row.get("url", "#"), quote=True)
-                status = row.get("status", "new")
-                badge_label = badge_labels.get(status, status)
-                win_chance = format_probability(row["win_probability"]) if row.get("total_entries", 0) > 0 else "---"
-                deadline = html_escape(row.get("deadline", "") or "---")
+            # Split: separate not-eligible from the rest when showing "all"
+            if status_filter == "all":
+                df_main = df[df["status"] != "not_eligible"]
+                df_not_eligible = df[df["status"] == "not_eligible"]
+            else:
+                df_main = df
+                df_not_eligible = pd.DataFrame()
 
-                html_rows.append(f"""<tr>
-                    <td style="width:40px"></td>
-                    <td><a class="ga-title" href="{url}" target="_blank" rel="noopener">{title}</a></td>
-                    <td><span class="ga-badge ga-badge-{status}">{badge_label}</span></td>
-                    <td>{win_chance}</td>
-                    <td class="ga-muted">{deadline}</td>
-                </tr>""")
-                row_data.append((row["id"], row["url"], row.get("title", "")))
+            # --- Render main giveaway table with inline X buttons ---
+            def _render_giveaway_rows(rows_df, key_prefix=""):
+                """Render giveaway rows with inline remove buttons."""
+                for _, row in rows_df.iterrows():
+                    title = row.get("title", "Untitled")
+                    url = row.get("url", "#")
+                    status = row.get("status", "new")
+                    badge_label = badge_labels.get(status, status)
+                    win_chance = format_probability(row["win_probability"]) if row.get("total_entries", 0) > 0 else "---"
+                    gid = row["id"]
 
-            table_html = f"""<table class="ga-table">
-                <thead><tr>
-                    <th style="width:40px"></th>
-                    <th>Title</th>
-                    <th>Status</th>
-                    <th>Win Chance</th>
-                    <th>Deadline</th>
-                </tr></thead>
-                <tbody>{"".join(html_rows)}</tbody>
-            </table>"""
-            st.markdown(table_html, unsafe_allow_html=True)
+                    # Deadline with countdown
+                    raw_deadline = row.get("deadline", "") or ""
+                    dl_dt = parse_deadline(raw_deadline)
+                    if dl_dt:
+                        hours_left = (dl_dt - now).total_seconds() / 3600
+                        if hours_left < 0:
+                            countdown = "EXPIRED"
+                            urgency_class = "urgency-critical"
+                        elif hours_left < 24:
+                            h = int(hours_left)
+                            countdown = f"{h}h left"
+                            urgency_class = "urgency-critical"
+                        elif hours_left < 72:
+                            d = int(hours_left / 24)
+                            h = int(hours_left % 24)
+                            countdown = f"{d}d {h}h left"
+                            urgency_class = "urgency-soon"
+                        else:
+                            d = int(hours_left / 24)
+                            countdown = f"{d}d left"
+                            urgency_class = "urgency-normal"
+                    else:
+                        countdown = "---"
+                        urgency_class = "urgency-normal"
 
-            # Render remove buttons using st.columns to keep them functional
-            # Group into a compact expander to avoid visual clutter
-            with st.expander("Remove giveaways", expanded=False):
-                for gid, gurl, gtitle in row_data:
-                    col_title, col_btn = st.columns([6, 1])
+                    # Row layout: Title | Status | Win Chance | Deadline | X button
+                    col_title, col_status, col_chance, col_deadline, col_remove = st.columns([5, 1.5, 1.2, 1.5, 0.5])
                     with col_title:
-                        st.caption(f"{gtitle[:60]}")
-                    with col_btn:
-                        if st.button("✗", key=f"bl_{gid}"):
-                            add_to_blacklist(gurl, "Manually blacklisted")
+                        st.markdown(f'<a class="ga-title" href="{html_escape(url, quote=True)}" target="_blank" rel="noopener">{html_escape(title)}</a>', unsafe_allow_html=True)
+                    with col_status:
+                        st.markdown(f'<span class="ga-badge ga-badge-{status}">{badge_label}</span>', unsafe_allow_html=True)
+                    with col_chance:
+                        st.markdown(f"<small>{win_chance}</small>", unsafe_allow_html=True)
+                    with col_deadline:
+                        st.markdown(f'<span class="{urgency_class}">{countdown}</span>', unsafe_allow_html=True)
+                    with col_remove:
+                        if st.button("✗", key=f"{key_prefix}bl_{gid}", help="Remove & blacklist"):
+                            add_to_blacklist(url, "Manually blacklisted")
                             _cached_giveaways_display.clear()
                             st.rerun()
+
+            # Table header
+            hdr_title, hdr_status, hdr_chance, hdr_deadline, hdr_rm = st.columns([5, 1.5, 1.2, 1.5, 0.5])
+            with hdr_title:
+                st.markdown("**Title**")
+            with hdr_status:
+                st.markdown("**Status**")
+            with hdr_chance:
+                st.markdown("**Win %**")
+            with hdr_deadline:
+                st.markdown("**Deadline**")
+            with hdr_rm:
+                st.markdown("")
+
+            if not df_main.empty:
+                _render_giveaway_rows(df_main)
+            elif status_filter != "all":
+                st.caption("No giveaways in this category.")
+
+            # --- Not-eligible sub-section (only when showing "all") ---
+            if not df_not_eligible.empty:
+                st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
+                ne_header_col, ne_action_col = st.columns([4, 1])
+                with ne_header_col:
+                    st.markdown(f'<div class="section-title">Not Eligible ({len(df_not_eligible)})</div>', unsafe_allow_html=True)
+                with ne_action_col:
+                    if st.button("🗑 Delete All Not Eligible", key="del_all_ne", use_container_width=True):
+                        deleted = delete_not_eligible()
+                        _cached_giveaways_display.clear()
+                        st.success(f"Deleted {deleted} not-eligible giveaways.")
+                        st.rerun()
+                with st.expander("Review not-eligible giveaways", expanded=False):
+                    _render_giveaway_rows(df_not_eligible, key_prefix="ne_")
 
             st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
             st.markdown('<div class="section-title">Actions</div>', unsafe_allow_html=True)
             action_col1, action_col2, action_col3 = st.columns(3)
             with action_col1:
                 if st.button("🔄 Check T&C", use_container_width=True):
-                    st.info("Opening browser to check Terms & Conditions... This may take a while.")
-                    checked_count = 0
-                    for g in giveaways:
-                        if not g.get("terms_checked"):
-                            excluded, detected_region, _ = check_giveaway_terms(g["url"])
-                            excluded_str = ",".join(excluded) if excluded else ""
-                            update_terms_check(g["id"], True, excluded_str, detected_region)
-                            checked_count += 1
-                    st.success(f"Checked T&C for {checked_count} giveaways!")
-                    # Re-evaluate eligibility after T&C updates
-                    scan_existing_entries()
-                    _cached_giveaways_display.clear()
-                    st.rerun()
+                    unchecked = [g for g in giveaways if not g.get("terms_checked")]
+                    if not unchecked:
+                        st.info("All giveaways already have T&C checked.")
+                    else:
+                        st.info(f"Checking T&C for {len(unchecked)} giveaways in a single browser session...")
+                        unchecked_urls = [g["url"] for g in unchecked]
+                        url_to_id = {g["url"]: g["id"] for g in unchecked}
+                        results = check_giveaway_terms_batch(unchecked_urls)
+                        for url, excluded, detected_region in results:
+                            gid = url_to_id.get(url)
+                            if gid:
+                                excluded_str = ",".join(excluded) if excluded else ""
+                                update_terms_check(gid, True, excluded_str, detected_region)
+                        st.success(f"Checked T&C for {len(results)} giveaways!")
+                        scan_existing_entries()
+                        _cached_giveaways_display.clear()
+                        st.rerun()
             with action_col2:
                 if st.button("🔄 Refresh Eligibility", use_container_width=True):
                     scan_existing_entries()
@@ -1124,9 +1565,32 @@ def main():
 
         eligible = get_giveaways("eligible")
         if eligible:
+            # Sort by deadline urgency: soonest-ending first
+            from database import parse_deadline as _pd
+            _now = datetime.now()
+            def _dl_sort_key(g):
+                dt = _pd(g.get("deadline", ""))
+                if dt:
+                    return dt
+                return datetime.max  # unknown deadlines go last
+            eligible = sorted(eligible, key=_dl_sort_key)
+
             st.markdown(f'<div class="section-title">Eligible Giveaways ({len(eligible)})</div>', unsafe_allow_html=True)
 
             for g in eligible:
+                # Compute countdown text
+                dl_dt = _pd(g.get("deadline", ""))
+                if dl_dt:
+                    hrs = (dl_dt - _now).total_seconds() / 3600
+                    if hrs < 24:
+                        dl_text = f"{int(hrs)}h left"
+                    elif hrs < 72:
+                        dl_text = f"{int(hrs/24)}d {int(hrs%24)}h left"
+                    else:
+                        dl_text = f"{int(hrs/24)}d left"
+                else:
+                    dl_text = ""
+
                 col1, col2, col3, col4 = st.columns([3, 2, 1, 1])
                 with col1:
                     st.markdown(f"""
@@ -1135,6 +1599,7 @@ def main():
                         <div class="giveaway-meta">
                             <span>Source: {g['source']}</span>
                             <span>Region: {g['country_restriction']}</span>
+                            {f'<span class="urgency-soon">{dl_text}</span>' if dl_text else ''}
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
@@ -1142,39 +1607,54 @@ def main():
                     st.link_button("🔗 Open", g["url"])
                 with col3:
                     if st.button("▶️ Enter", key=f"enter_{g['id']}"):
+                        if "entry_stats" not in st.session_state:
+                            st.session_state.entry_stats = {"entered": 0, "failed": 0, "skipped": 0}
                         with st.spinner("Auto-entering..."):
                             result, log = auto_enter_giveaway(g["url"])
                             if result == "region_restricted":
                                 update_giveaway_status(g["id"], "not_eligible")
+                                st.session_state.entry_stats["failed"] += 1
                                 st.error("Region restricted! This giveaway is not available in your country.")
                             elif result == "ended":
                                 update_giveaway_status(g["id"], "expired")
+                                st.session_state.entry_stats["failed"] += 1
                                 st.error("This competition has ended!")
                             elif result is True:
                                 update_giveaway_status(g["id"], "participated")
+                                st.session_state.entry_stats["entered"] += 1
                                 st.success("Entered successfully!")
                             else:
+                                st.session_state.entry_stats["failed"] += 1
                                 st.warning("Entry may have failed. Check the log.")
                             st.session_state.crawl_log = log
                 with col4:
                     if st.button("⏭️ Skip", key=f"skip_{g['id']}"):
+                        if "entry_stats" not in st.session_state:
+                            st.session_state.entry_stats = {"entered": 0, "failed": 0, "skipped": 0}
+                        st.session_state.entry_stats["skipped"] += 1
                         update_giveaway_status(g["id"], "skipped")
                         st.rerun()
 
             if st.button("⚡ Auto-Enter ALL Eligible", type="primary", use_container_width=True):
+                if "entry_stats" not in st.session_state:
+                    st.session_state.entry_stats = {"entered": 0, "failed": 0, "skipped": 0}
                 for g in eligible:
                     with st.spinner(f"Entering: {g['title'][:60]}..."):
                         result, log = auto_enter_giveaway(g["url"])
                         if result == "region_restricted":
                             update_giveaway_status(g["id"], "not_eligible")
+                            st.session_state.entry_stats["failed"] += 1
                             st.error(f"Region restricted: {g['title'][:60]}")
                         elif result == "ended":
                             update_giveaway_status(g["id"], "expired")
+                            st.session_state.entry_stats["failed"] += 1
                             st.error(f"Ended: {g['title'][:60]}")
                         elif result is True:
                             update_giveaway_status(g["id"], "participated")
+                            st.session_state.entry_stats["entered"] += 1
                             st.success(f"Entered: {g['title'][:60]}")
                         else:
+                            st.session_state.entry_stats["failed"] += 1
                             st.warning(f"Failed: {g['title'][:60]}")
                 st.rerun()
         else:
@@ -1238,8 +1718,9 @@ def main():
                 if source in current_sources:
                     current_sources.remove(source)
 
-        config["crawl_sources"] = current_sources
-        save_config(config)
+        if config.get("crawl_sources") != current_sources:
+            config["crawl_sources"] = current_sources
+            save_config(config)
         st.markdown('</div>', unsafe_allow_html=True)
 
         st.markdown('<div class="settings-section">', unsafe_allow_html=True)

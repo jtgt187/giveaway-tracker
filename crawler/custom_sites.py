@@ -1,6 +1,6 @@
 from crawler.base import BaseCrawler
 from bs4 import BeautifulSoup
-from utils.country_check import detect_country_restriction, is_region_blocked, is_ended
+from utils.country_check import detect_country_restriction
 from utils.network import random_delay
 
 
@@ -10,11 +10,14 @@ class CustomSitesCrawler(BaseCrawler):
 
     def extract_giveaways(self, sites):
         giveaways = []
+        seen_urls = set()
         for site_url in sites:
             try:
                 self.base_url = site_url
                 html = self.get_page(site_url)
                 soup = BeautifulSoup(html, "html.parser")
+
+                country = detect_country_restriction(html)
 
                 links = soup.select("a[href*='gleam.io']")
                 for link in links:
@@ -30,6 +33,10 @@ class CustomSitesCrawler(BaseCrawler):
                         else:
                             url = site_url.rstrip("/") + "/" + url
 
+                    if url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+
                     description = ""
                     parent = link.find_parent("div") or link.find_parent("li") or link.find_parent("article")
                     if parent:
@@ -37,27 +44,11 @@ class CustomSitesCrawler(BaseCrawler):
                         if desc_el:
                             description = desc_el.get_text(strip=True)[:200]
 
-                    country = detect_country_restriction(html)
-
-                    try:
-                        gleam_html = self.get_page(url)
-                        # Skip region-blocked or ended giveaways
-                        if is_region_blocked(gleam_html):
-                            continue
-                        if is_ended(gleam_html):
-                            continue
-                        gleam_country = detect_country_restriction(gleam_html)
-                        if gleam_country != "worldwide":
-                            country = gleam_country
-                        elif country == "worldwide" and gleam_country == "worldwide":
-                            country = "worldwide"
-                    except Exception:
-                        pass
-
+                    # Skip the redundant gleam.io fetch -- run_crawl() handles
+                    # validation centrally with parallel requests.
                     giveaways.append(self._parse_giveaway_card(title, url, description, "", country))
-                    random_delay(1, 3)
 
-                random_delay(3, 8)
+                random_delay(1, 3)
 
             except Exception as e:
                 print(f"Custom site crawl error for {site_url}: {e}")

@@ -4,6 +4,9 @@ from datetime import datetime
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "giveaways.db")
 
+# In-memory blacklist cache to avoid reading the file on every add_giveaway() call
+_blacklist_cache = None
+
 
 def get_connection():
     conn = sqlite3.connect(DB_PATH)
@@ -42,9 +45,15 @@ def init_db():
         cursor.execute("ALTER TABLE giveaways ADD COLUMN terms_excluded TEXT DEFAULT ''")
     except sqlite3.OperationalError:
         pass
+    # Indexes for common query patterns
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_giveaways_status ON giveaways(status)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_giveaways_discovered ON giveaways(discovered_at DESC)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_giveaways_deadline ON giveaways(deadline)")
     conn.commit()
     conn.close()
     _init_blacklist_file()
+    # Warm the blacklist cache at startup
+    _load_blacklist()
 
 
 def _get_blacklist_path():
@@ -59,18 +68,23 @@ def _init_blacklist_file():
 
 
 def _load_blacklist():
+    global _blacklist_cache
     path = _get_blacklist_path()
     if not os.path.exists(path):
-        return set()
+        _blacklist_cache = set()
+        return _blacklist_cache
     with open(path, "r") as f:
-        return set(line.strip() for line in f if line.strip())
+        _blacklist_cache = set(line.strip() for line in f if line.strip())
+    return _blacklist_cache
 
 
 def _save_blacklist(urls):
+    global _blacklist_cache
     path = _get_blacklist_path()
     with open(path, "w") as f:
         for url in urls:
             f.write(url + "\n")
+    _blacklist_cache = set(urls)
 
 
 def add_to_blacklist(url, reason=""):
@@ -95,7 +109,10 @@ def remove_from_blacklist(url):
 
 
 def is_blacklisted(url):
-    return url in _load_blacklist()
+    global _blacklist_cache
+    if _blacklist_cache is None:
+        _load_blacklist()
+    return url in _blacklist_cache
 
 
 def add_giveaway(title, url, source, description="", deadline="", country_restriction="worldwide", terms_checked=False, terms_excluded=""):
@@ -114,6 +131,47 @@ def add_giveaway(title, url, source, description="", deadline="", country_restri
         return False
     finally:
         conn.close()
+
+
+def add_giveaways_batch(giveaway_list):
+    """Insert multiple giveaways in a single transaction.
+
+    Each item in *giveaway_list* should be a dict with keys matching the
+    ``add_giveaway`` parameters.  Returns the number of newly inserted rows.
+    """
+    if not giveaway_list:
+        return 0
+    conn = get_connection()
+    cursor = conn.cursor()
+    now = datetime.now().isoformat()
+    new_count = 0
+    for g in giveaway_list:
+        url = g.get("url", "")
+        if not url or is_blacklisted(url):
+            continue
+        try:
+            cursor.execute("""
+                INSERT OR IGNORE INTO giveaways
+                    (title, url, source, description, deadline, country_restriction,
+                     terms_checked, terms_excluded, discovered_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                g.get("title", ""),
+                url,
+                g.get("source", ""),
+                g.get("description", ""),
+                g.get("deadline", ""),
+                g.get("country_restriction", "worldwide"),
+                g.get("terms_checked", False),
+                g.get("terms_excluded", ""),
+                now,
+            ))
+            new_count += cursor.rowcount
+        except Exception:
+            pass
+    conn.commit()
+    conn.close()
+    return new_count
 
 
 def get_giveaways(status=None, gleam_only=True, exclude_not_eligible=True):
@@ -180,18 +238,30 @@ def get_giveaway_by_url(url):
     return dict(row) if row else None
 
 
+def get_known_urls():
+    """Return the set of all giveaway URLs already in the database.
+
+    Useful for bulk dedup during crawl so we don't query one-by-one.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT url FROM giveaways")
+    urls = {row["url"] for row in cursor.fetchall()}
+    conn.close()
+    return urls
+
+
 def update_terms_check(giveaway_id, checked, excluded_countries="", detected_region=None):
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE giveaways SET terms_checked = ?, terms_excluded = ? WHERE id = ?
-    """, (checked, excluded_countries, giveaway_id))
-    # If T&C analysis detected a specific region, update country_restriction
-    # to be more accurate than the crawl-time guess.
     if detected_region and detected_region != "restricted":
         cursor.execute("""
-            UPDATE giveaways SET country_restriction = ? WHERE id = ?
-        """, (detected_region, giveaway_id))
+            UPDATE giveaways SET terms_checked = ?, terms_excluded = ?, country_restriction = ? WHERE id = ?
+        """, (checked, excluded_countries, detected_region, giveaway_id))
+    else:
+        cursor.execute("""
+            UPDATE giveaways SET terms_checked = ?, terms_excluded = ? WHERE id = ?
+        """, (checked, excluded_countries, giveaway_id))
     conn.commit()
     conn.close()
 
@@ -231,37 +301,26 @@ def get_stats(gleam_only=True):
     cursor = conn.cursor()
     gleam_condition = "url LIKE 'https://gleam.io/%'" if gleam_only else "1=1"
 
-    def _where(*conditions):
-        return "WHERE " + " AND ".join(conditions)
-
-    status_participated = "status = 'participated'"
-    status_eligible = "status = 'eligible'"
-    status_not_eligible = "status = 'not_eligible'"
-    status_new = "status = 'new'"
-    entries_filter = "total_entries > 0"
-    exclude_not_eligible = "status != 'not_eligible'"
-
-    cursor.execute(f"SELECT COUNT(*) as total FROM giveaways {_where(gleam_condition)}")
-    total = cursor.fetchone()["total"]
-    cursor.execute(f"SELECT COUNT(*) as count FROM giveaways {_where(gleam_condition, status_participated)}")
-    participated = cursor.fetchone()["count"]
-    cursor.execute(f"SELECT COUNT(*) as count FROM giveaways {_where(gleam_condition, status_eligible)}")
-    eligible = cursor.fetchone()["count"]
-    cursor.execute(f"SELECT COUNT(*) as count FROM giveaways {_where(gleam_condition, status_not_eligible)}")
-    not_eligible = cursor.fetchone()["count"]
-    cursor.execute(f"SELECT COUNT(*) as count FROM giveaways {_where(gleam_condition, status_new)}")
-    new_count = cursor.fetchone()["count"]
-    cursor.execute(f"SELECT AVG(win_probability) as avg_prob FROM giveaways {_where(gleam_condition, entries_filter, exclude_not_eligible)}")
+    cursor.execute(f"""
+        SELECT
+            COUNT(*) as total,
+            SUM(CASE WHEN status = 'participated' THEN 1 ELSE 0 END) as participated,
+            SUM(CASE WHEN status = 'eligible' THEN 1 ELSE 0 END) as eligible,
+            SUM(CASE WHEN status = 'not_eligible' THEN 1 ELSE 0 END) as not_eligible,
+            SUM(CASE WHEN status = 'new' THEN 1 ELSE 0 END) as new_count,
+            AVG(CASE WHEN total_entries > 0 AND status != 'not_eligible'
+                THEN win_probability END) as avg_prob
+        FROM giveaways WHERE {gleam_condition}
+    """)
     row = cursor.fetchone()
-    avg_prob = row["avg_prob"] if row and row["avg_prob"] else 0
     conn.close()
     return {
-        "total": total,
-        "participated": participated,
-        "eligible": eligible,
-        "not_eligible": not_eligible,
-        "new": new_count,
-        "avg_win_probability": round(avg_prob, 4) if avg_prob else 0,
+        "total": row["total"] or 0,
+        "participated": row["participated"] or 0,
+        "eligible": row["eligible"] or 0,
+        "not_eligible": row["not_eligible"] or 0,
+        "new": row["new_count"] or 0,
+        "avg_win_probability": round(row["avg_prob"], 4) if row["avg_prob"] else 0,
     }
 
 

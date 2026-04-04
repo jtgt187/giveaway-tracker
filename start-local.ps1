@@ -1,4 +1,7 @@
-"""Start the Giveaway Tracker app with Streamlit"""
+<#
+.SYNOPSIS
+  Start the Giveaway Tracker app with Streamlit
+#>
 param(
   [string]$Dir = "."
 )

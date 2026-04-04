@@ -2,7 +2,22 @@ import subprocess
 import time
 import os
 import re
+import sys
+from concurrent.futures import ThreadPoolExecutor, Future
 from playwright.sync_api import sync_playwright
+
+
+def _run_in_thread(fn, *args, **kwargs):
+    """Run *fn* in a dedicated thread so Playwright gets a clean event loop.
+
+    On Windows, Streamlit's ``ProactorEventLoop`` does not support
+    ``subprocess_exec``, which Playwright needs to launch the browser
+    process.  Running in a separate thread side-steps the issue because
+    the thread creates its own event loop (or none at all).
+    """
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future: Future = pool.submit(fn, *args, **kwargs)
+        return future.result()
 
 
 CAPTCHA_SELECTORS = [
@@ -413,100 +428,103 @@ def auto_enter_giveaway(url, callback=None):
         if callback:
             callback(msg)
 
-    emit(f"Opening giveaway: {url}")
+    def _do_enter():
+        emit(f"Opening giveaway: {url}")
 
-    with sync_playwright() as p:
-        launch_args = {
-            "headless": False,
-            "args": [
-                "--disable-blink-features=AutomationControlled",
-                "--no-first-run",
-                "--no-default-browser-check",
-            ],
-        }
+        with sync_playwright() as p:
+            launch_args = {
+                "headless": False,
+                "args": [
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ],
+            }
 
-        if profile_path:
-            launch_args["channel"] = "chrome"
-            launch_args["user_data_dir"] = profile_path
-            browser = p.chromium.launch_persistent_context(
-                user_data_dir=profile_path,
-                headless=False,
-                args=launch_args["args"],
-            )
-            page = browser.pages[0] if browser.pages else browser.new_page()
-        else:
-            browser = p.chromium.launch(headless=False, args=launch_args["args"])
-            context = browser.new_context()
-            page = context.new_page()
+            if profile_path:
+                launch_args["channel"] = "chrome"
+                launch_args["user_data_dir"] = profile_path
+                browser = p.chromium.launch_persistent_context(
+                    user_data_dir=profile_path,
+                    headless=False,
+                    args=launch_args["args"],
+                )
+                page = browser.pages[0] if browser.pages else browser.new_page()
+            else:
+                browser = p.chromium.launch(headless=False, args=launch_args["args"])
+                context = browser.new_context()
+                page = context.new_page()
 
-        try:
-            emit("Navigating to giveaway page...")
-            page.goto(url, wait_until="networkidle", timeout=30000)
-            time.sleep(3)
+            try:
+                emit("Navigating to giveaway page...")
+                page.goto(url, wait_until="networkidle", timeout=30000)
+                time.sleep(3)
 
-            if detect_region_restriction(page):
-                emit("Region restriction detected! This giveaway is not available in your country.")
-                return "region_restricted", log
+                if detect_region_restriction(page):
+                    emit("Region restriction detected! This giveaway is not available in your country.")
+                    return "region_restricted", log
 
-            if detect_ended(page):
-                emit("This competition has ended!")
-                return "ended", log
+                if detect_ended(page):
+                    emit("This competition has ended!")
+                    return "ended", log
 
-            if detect_captcha(page):
-                emit("CAPTCHA detected! Please solve it manually in the opened browser...")
-                solved = wait_for_captcha_solve(page, timeout=120)
-                if solved:
-                    emit("CAPTCHA solved, continuing...")
-                else:
-                    emit("CAPTCHA timeout, skipping this giveaway")
-                    return False, log
+                if detect_captcha(page):
+                    emit("CAPTCHA detected! Please solve it manually in the opened browser...")
+                    solved = wait_for_captcha_solve(page, timeout=120)
+                    if solved:
+                        emit("CAPTCHA solved, continuing...")
+                    else:
+                        emit("CAPTCHA timeout, skipping this giveaway")
+                        return False, log
 
-            emit("Looking for Gleam entry widget...")
+                emit("Looking for Gleam entry widget...")
 
-            entry_buttons = page.locator("button:has-text('Enter'), a:has-text('Enter'), .gleam-widget button")
-            if entry_buttons.count() > 0:
-                entry_buttons.first.click()
-                emit("Clicked entry button")
-                time.sleep(2)
-
-            if detect_captcha(page):
-                emit("CAPTCHA detected after entry! Please solve it manually...")
-                solved = wait_for_captcha_solve(page, timeout=120)
-                if not solved:
-                    emit("CAPTCHA timeout after entry")
-                    return False, log
-
-            emit("Looking for simple entry methods...")
-            simple_methods = page.locator(
-                'button:has-text("Follow"), button:has-text("Visit"), button:has-text("Click"), '
-                'a:has-text("Follow"), a:has-text("Visit"), a:has-text("Click")'
-            )
-            count = simple_methods.count()
-            for i in range(min(count, 5)):
-                try:
-                    simple_methods.nth(i).click()
-                    emit(f"Completed entry method {i + 1}")
+                entry_buttons = page.locator("button:has-text('Enter'), a:has-text('Enter'), .gleam-widget button")
+                if entry_buttons.count() > 0:
+                    entry_buttons.first.click()
+                    emit("Clicked entry button")
                     time.sleep(2)
 
-                    if detect_captcha(page):
-                        emit("CAPTCHA detected during entries! Please solve it manually...")
-                        wait_for_captcha_solve(page, timeout=120)
+                if detect_captcha(page):
+                    emit("CAPTCHA detected after entry! Please solve it manually...")
+                    solved = wait_for_captcha_solve(page, timeout=120)
+                    if not solved:
+                        emit("CAPTCHA timeout after entry")
+                        return False, log
 
-                except Exception as e:
-                    emit(f"Entry method {i + 1} failed: {str(e)}")
+                emit("Looking for simple entry methods...")
+                simple_methods = page.locator(
+                    'button:has-text("Follow"), button:has-text("Visit"), button:has-text("Click"), '
+                    'a:has-text("Follow"), a:has-text("Visit"), a:has-text("Click")'
+                )
+                count = simple_methods.count()
+                for i in range(min(count, 5)):
+                    try:
+                        simple_methods.nth(i).click()
+                        emit(f"Completed entry method {i + 1}")
+                        time.sleep(2)
 
-            emit("Entry completed successfully!")
-            return True, log
+                        if detect_captcha(page):
+                            emit("CAPTCHA detected during entries! Please solve it manually...")
+                            wait_for_captcha_solve(page, timeout=120)
 
-        except Exception as e:
-            emit(f"Error during auto-entry: {str(e)}")
-            return False, log
-        finally:
-            try:
-                if hasattr(browser, 'close'):
-                    browser.close()
-            except Exception:
-                pass
+                    except Exception as e:
+                        emit(f"Entry method {i + 1} failed: {str(e)}")
+
+                emit("Entry completed successfully!")
+                return True, log
+
+            except Exception as e:
+                emit(f"Error during auto-entry: {str(e)}")
+                return False, log
+            finally:
+                try:
+                    if hasattr(browser, 'close'):
+                        browser.close()
+                except Exception:
+                    pass
+
+    return _run_in_thread(_do_enter)
 
 
 def check_giveaway_terms(url, callback=None):
@@ -526,55 +544,131 @@ def check_giveaway_terms(url, callback=None):
         if callback:
             callback(msg)
 
-    excluded_countries = []
-    detected_region = None
+    def _do_check():
+        excluded_countries = []
+        detected_region = None
 
-    with sync_playwright() as p:
-        launch_args = {
-            "headless": False,
-            "args": [
-                "--disable-blink-features=AutomationControlled",
-                "--no-first-run",
-                "--no-default-browser-check",
-            ],
-        }
+        with sync_playwright() as p:
+            launch_args = {
+                "headless": False,
+                "args": [
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ],
+            }
 
-        if profile_path:
-            launch_args["channel"] = "chrome"
-            launch_args["user_data_dir"] = profile_path
-            browser = p.chromium.launch_persistent_context(
-                user_data_dir=profile_path,
-                headless=False,
-                args=launch_args["args"],
-            )
-            page = browser.pages[0] if browser.pages else browser.new_page()
-        else:
-            browser = p.chromium.launch(headless=False, args=launch_args["args"])
-            context = browser.new_context()
-            page = context.new_page()
+            if profile_path:
+                launch_args["channel"] = "chrome"
+                launch_args["user_data_dir"] = profile_path
+                browser = p.chromium.launch_persistent_context(
+                    user_data_dir=profile_path,
+                    headless=False,
+                    args=launch_args["args"],
+                )
+                page = browser.pages[0] if browser.pages else browser.new_page()
+            else:
+                browser = p.chromium.launch(headless=False, args=launch_args["args"])
+                context = browser.new_context()
+                page = context.new_page()
 
-        try:
-            emit(f"Checking T&C: {url}")
-            page.goto(url, wait_until="networkidle", timeout=30000)
-            time.sleep(3)
-
-            excluded_countries, detected_region = check_terms_conditions(page, url)
-
-            if excluded_countries:
-                emit(f"Excluded countries: {', '.join(excluded_countries)}")
-            if detected_region:
-                emit(f"Detected region: {detected_region}")
-            if not excluded_countries and not detected_region:
-                emit("No country restrictions found in T&C")
-
-            return excluded_countries, detected_region, log
-
-        except Exception as e:
-            emit(f"Error checking T&C: {str(e)}")
-            return [], None, log
-        finally:
             try:
-                if hasattr(browser, 'close'):
-                    browser.close()
-            except Exception:
-                pass
+                emit(f"Checking T&C: {url}")
+                page.goto(url, wait_until="networkidle", timeout=30000)
+                time.sleep(3)
+
+                excluded_countries, detected_region = check_terms_conditions(page, url)
+
+                if excluded_countries:
+                    emit(f"Excluded countries: {', '.join(excluded_countries)}")
+                if detected_region:
+                    emit(f"Detected region: {detected_region}")
+                if not excluded_countries and not detected_region:
+                    emit("No country restrictions found in T&C")
+
+                return excluded_countries, detected_region, log
+
+            except Exception as e:
+                emit(f"Error checking T&C: {str(e)}")
+                return [], None, log
+            finally:
+                try:
+                    if hasattr(browser, 'close'):
+                        browser.close()
+                except Exception:
+                    pass
+
+    return _run_in_thread(_do_check)
+
+
+def check_giveaway_terms_batch(urls, callback=None):
+    """Check T&C for multiple giveaway URLs using a single browser instance.
+
+    Returns:
+        list of (url, excluded_countries, detected_region) tuples
+    """
+    if not urls:
+        return []
+
+    profile_path = find_browser_profile()
+
+    def emit(msg):
+        if callback:
+            callback(msg)
+
+    def _do_batch():
+        results = []
+
+        with sync_playwright() as p:
+            launch_args = {
+                "headless": False,
+                "args": [
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ],
+            }
+
+            if profile_path:
+                launch_args["channel"] = "chrome"
+                browser = p.chromium.launch_persistent_context(
+                    user_data_dir=profile_path,
+                    headless=False,
+                    args=launch_args["args"],
+                )
+                page = browser.pages[0] if browser.pages else browser.new_page()
+            else:
+                browser = p.chromium.launch(headless=False, args=launch_args["args"])
+                context = browser.new_context()
+                page = context.new_page()
+
+            try:
+                for i, url in enumerate(urls, 1):
+                    emit(f"[{i}/{len(urls)}] Checking T&C: {url}")
+                    try:
+                        page.goto(url, wait_until="networkidle", timeout=30000)
+                        time.sleep(2)
+
+                        excluded, region = check_terms_conditions(page, url)
+
+                        if excluded:
+                            emit(f"  Excluded: {', '.join(excluded)}")
+                        if region:
+                            emit(f"  Region: {region}")
+                        if not excluded and not region:
+                            emit(f"  No restrictions found")
+
+                        results.append((url, excluded, region))
+                    except Exception as e:
+                        emit(f"  Error: {str(e)}")
+                        results.append((url, [], None))
+            finally:
+                try:
+                    if hasattr(browser, 'close'):
+                        browser.close()
+                except Exception:
+                    pass
+
+        return results
+
+    return _run_in_thread(_do_batch)

@@ -3,7 +3,6 @@ try:
     from bs4 import BeautifulSoup
 except Exception:
     BeautifulSoup = None
-from utils.network import random_delay
 from urllib.parse import urljoin
 
 
@@ -52,7 +51,6 @@ class BestOfGleamCrawler(BaseCrawler):
                             break
 
                     giveaways.append(self._parse_giveaway_card(title, url, description, deadline))
-                    random_delay(1, 2)
             else:
                 # Lightweight fallback when BeautifulSoup is not available
                 import re
@@ -62,7 +60,6 @@ class BestOfGleamCrawler(BaseCrawler):
                         continue
                     seen_urls.add(url)
                     giveaways.append(self._parse_giveaway_card("BestOfGleam (fallback)", url, "", ""))
-                    random_delay(1, 2)
         except Exception as e:
             print(f"BestOfGleam crawl error: {e}")
 

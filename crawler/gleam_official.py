@@ -1,7 +1,6 @@
 from crawler.base import BaseCrawler
 from bs4 import BeautifulSoup
 from utils.country_check import detect_country_restriction
-from utils.network import random_delay
 
 
 class GleamOfficialCrawler(BaseCrawler):
@@ -29,7 +28,6 @@ class GleamOfficialCrawler(BaseCrawler):
                         title = parent.get_text(strip=True)[:100]
 
                 giveaways.append(self._parse_giveaway_card(title, url))
-                random_delay(3, 8)
 
         except Exception as e:
             print(f"Gleam official crawl error: {e}")
