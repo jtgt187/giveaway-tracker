@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Gleam Link Monitor",
+  "version": "0.4.0",
+  "description": "Collect Gleam.io links while browsing. Download as NDJSON file.",
+  "permissions": [
+    "storage",
+    "downloads"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Gleam Monitor"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_end"
+    }
+  ]
+}
