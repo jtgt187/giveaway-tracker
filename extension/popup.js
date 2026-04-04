@@ -72,12 +72,10 @@ function updateRecentLinks() {
     list.innerHTML = recent.map(function(l) {
       var displayUrl = l.href.replace('https://', '').replace('http://', '');
       var label = l.text || displayUrl;
-      var page = l.pageUrl ? new URL(l.pageUrl).hostname : '';
       return '<div class="recent-item">' +
         '<a href="' + escapeHtml(l.href) + '" target="_blank" title="' + escapeHtml(l.href) + '">' +
           escapeHtml(label.substring(0, 60)) +
         '</a>' +
-        (page ? ' <span class="page">from ' + escapeHtml(page) + '</span>' : '') +
       '</div>';
     }).join('');
   });

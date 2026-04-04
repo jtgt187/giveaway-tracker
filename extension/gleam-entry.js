@@ -221,7 +221,7 @@
     }
 
     // Check for checkmark icon indicating completion
-    var checkIcons = element.querySelectorAll('.fa-check, .fa-check-circle, .icon-check, [class*="check"]');
+    var checkIcons = element.querySelectorAll('.fa-check, .fa-check-circle, .icon-check');
     if (checkIcons.length > 0) {
       // Verify the check is visible
       for (var i = 0; i < checkIcons.length; i++) {
@@ -229,10 +229,6 @@
         if (style.display !== 'none' && style.visibility !== 'hidden') return true;
       }
     }
-
-    // Check for green/success coloring on the entry
-    var style = window.getComputedStyle(element);
-    if (style.opacity === '0.5' || style.opacity === '0.4') return true;
 
     return false;
   }
@@ -353,8 +349,8 @@
     overlay.id = 'gleam-auto-entry-overlay';
 
     var totalEntries = entryMethods.length;
-    var completedEntries = entryMethods.filter(function (m) { return m.completed; }).length;
-    var pendingEntries = totalEntries - completedEntries;
+    var completedEntries = entryMethods.filter(function (m) { return m.status === 'done'; }).length;
+    var pendingEntries = entryMethods.filter(function (m) { return m.status === 'pending'; }).length;
 
     overlay.innerHTML =
       '<div class="gae-header">' +

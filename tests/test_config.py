@@ -4,9 +4,7 @@ Covers:
   - load_config defaults (app startup, no config.json)
   - save_config + load_config round-trip (any Settings change)
   - Country selectbox persistence
-  - add_custom_site / remove_custom_site (Add Site / Remove buttons)
-  - Crawl source checkbox toggles
-  - Delay slider persistence
+  - Custom site stubs (deprecated, always return False/[])
   - NDJSON import path text input
   - Malformed config.json resilience
 """
@@ -24,10 +22,8 @@ def test_load_config_defaults(tmp_config):
 
     config = load_config()
     assert config["target_country"] == DEFAULT_CONFIG["target_country"]
-    assert config["crawl_sources"] == DEFAULT_CONFIG["crawl_sources"]
     assert config["auto_enter_enabled"] == DEFAULT_CONFIG["auto_enter_enabled"]
-    assert config["min_delay"] == DEFAULT_CONFIG["min_delay"]
-    assert config["max_delay"] == DEFAULT_CONFIG["max_delay"]
+    assert config["ndjson_import_path"] == DEFAULT_CONFIG["ndjson_import_path"]
 
 
 def test_save_and_load_config(tmp_config):
@@ -74,7 +70,7 @@ def test_country_selectbox_persists(tmp_config):
 
 
 # ---------------------------------------------------------------------------
-# Add Site button + text input
+# Custom site stubs (deprecated -- always return False/[])
 # ---------------------------------------------------------------------------
 
 def test_add_custom_site(tmp_config):
@@ -82,31 +78,28 @@ def test_add_custom_site(tmp_config):
 
     load_config()  # initialise defaults
     result = add_custom_site("https://newsite.com")
-    assert result is True
-    assert "https://newsite.com" in get_custom_sites()
+    assert result is False  # deprecated, always returns False
+    assert get_custom_sites() == []
 
 
 def test_add_custom_site_duplicate(tmp_config):
     from config import add_custom_site, load_config
 
     load_config()
-    add_custom_site("https://newsite.com")
     result = add_custom_site("https://newsite.com")
     assert result is False
 
 
 # ---------------------------------------------------------------------------
-# Remove Site button
+# Remove Site stub (deprecated)
 # ---------------------------------------------------------------------------
 
 def test_remove_custom_site(tmp_config):
-    from config import add_custom_site, remove_custom_site, get_custom_sites, load_config
+    from config import remove_custom_site, load_config
 
     load_config()
-    add_custom_site("https://newsite.com")
     result = remove_custom_site("https://newsite.com")
-    assert result is True
-    assert "https://newsite.com" not in get_custom_sites()
+    assert result is False
 
 
 def test_remove_custom_site_missing(tmp_config):
@@ -118,55 +111,18 @@ def test_remove_custom_site_missing(tmp_config):
 
 
 # ---------------------------------------------------------------------------
-# Crawl source checkboxes
+# Arbitrary config key round-trip (e.g. old config keys from previous versions)
 # ---------------------------------------------------------------------------
 
-def test_crawl_source_toggle(tmp_config):
+def test_arbitrary_config_key_roundtrip(tmp_config):
     import config as cfg
     from config import load_config, save_config
 
     config = load_config()
-    config["crawl_sources"] = ["gleamfinder"]
+    config["some_custom_key"] = ["a", "b"]
     save_config(config)
     cfg._config_cache = None
-    assert load_config()["crawl_sources"] == ["gleamfinder"]
-
-    # Toggle on more sources
-    config = load_config()
-    config["crawl_sources"] = ["gleamfinder", "bestofgleam", "gleamdb"]
-    save_config(config)
-    cfg._config_cache = None
-    assert load_config()["crawl_sources"] == ["gleamfinder", "bestofgleam", "gleamdb"]
-
-
-def test_crawl_source_empty(tmp_config):
-    import config as cfg
-    from config import load_config, save_config
-
-    config = load_config()
-    config["crawl_sources"] = []
-    save_config(config)
-    cfg._config_cache = None
-    assert load_config()["crawl_sources"] == []
-
-
-# ---------------------------------------------------------------------------
-# Delay sliders
-# ---------------------------------------------------------------------------
-
-def test_delay_slider_persists(tmp_config):
-    import config as cfg
-    from config import load_config, save_config
-
-    config = load_config()
-    config["min_delay"] = 5
-    config["max_delay"] = 15
-    save_config(config)
-    cfg._config_cache = None
-
-    loaded = load_config()
-    assert loaded["min_delay"] == 5
-    assert loaded["max_delay"] == 15
+    assert load_config()["some_custom_key"] == ["a", "b"]
 
 
 # ---------------------------------------------------------------------------
@@ -247,8 +203,8 @@ def test_load_config_merges_partial(tmp_config):
     config = load_config()
     assert config["target_country"] == "us"
     # Other keys should come from defaults
-    assert config["crawl_sources"] == DEFAULT_CONFIG["crawl_sources"]
-    assert config["min_delay"] == DEFAULT_CONFIG["min_delay"]
+    assert config["auto_enter_enabled"] == DEFAULT_CONFIG["auto_enter_enabled"]
+    assert config["ndjson_import_path"] == DEFAULT_CONFIG["ndjson_import_path"]
 
 
 # ---------------------------------------------------------------------------
@@ -265,3 +221,110 @@ def test_get_target_country(tmp_config):
     cfg._config_cache = None
 
     assert get_target_country() == "dach"
+
+
+def test_get_target_country_default(tmp_config):
+    """get_target_country should return 'germany' when no config exists."""
+    from config import get_target_country
+
+    assert get_target_country() == "germany"
+
+
+# ---------------------------------------------------------------------------
+# Config cache behavior
+# ---------------------------------------------------------------------------
+
+def test_config_cache_avoids_disk_read(tmp_config):
+    """Second call to load_config should return cached data without reading disk."""
+    import config as cfg
+    from config import load_config, save_config
+
+    config = load_config()
+    config["target_country"] = "us"
+    save_config(config)
+
+    # Now delete the config file -- cached value should still work
+    os.unlink(tmp_config)
+    loaded = load_config()
+    assert loaded["target_country"] == "us"
+
+
+def test_config_cache_returns_copy(tmp_config):
+    """load_config should return a copy, not a reference to the cache."""
+    from config import load_config
+
+    a = load_config()
+    b = load_config()
+    a["target_country"] = "modified"
+    # b should not be affected
+    assert b["target_country"] != "modified"
+
+
+# ---------------------------------------------------------------------------
+# Malformed config.json with backslash recovery
+# ---------------------------------------------------------------------------
+
+def test_load_config_backslash_recovery(tmp_config):
+    """Config with unescaped backslashes (Windows paths) should be recovered."""
+    import config as cfg
+    from config import load_config
+
+    # Write JSON with unescaped backslashes (common Windows path issue)
+    with open(tmp_config, "w") as f:
+        f.write('{"ndjson_import_path": "C:\\Users\\test\\file.ndjson"}')
+
+    cfg._config_cache = None
+    config = load_config()
+    # Should recover and contain the path (with proper escaping)
+    assert "ndjson_import_path" in config
+    assert "Users" in config["ndjson_import_path"]
+
+
+def test_load_config_creates_backup_on_irrecoverable(tmp_config):
+    """Completely broken config should be backed up to .bak."""
+    import config as cfg
+    from config import load_config, DEFAULT_CONFIG
+
+    # Write something that can't be fixed even with backslash replacement
+    with open(tmp_config, "w") as f:
+        f.write("{{{totally broken json with no hope of recovery}}}")
+
+    cfg._config_cache = None
+    config = load_config()
+
+    # Should fall back to defaults
+    assert config["target_country"] == DEFAULT_CONFIG["target_country"]
+
+    # Backup file should exist
+    assert os.path.exists(tmp_config + ".bak")
+
+
+# ---------------------------------------------------------------------------
+# DEFAULT_CONFIG completeness
+# ---------------------------------------------------------------------------
+
+def test_default_config_has_required_keys(tmp_config):
+    """DEFAULT_CONFIG should contain all keys needed by the application."""
+    from config import DEFAULT_CONFIG
+
+    required_keys = ["target_country", "auto_enter_enabled", "ndjson_import_path"]
+    for key in required_keys:
+        assert key in DEFAULT_CONFIG, f"Missing key in DEFAULT_CONFIG: {key}"
+
+
+# ---------------------------------------------------------------------------
+# save_config updates cache
+# ---------------------------------------------------------------------------
+
+def test_save_config_updates_cache_immediately(tmp_config):
+    """save_config should update the in-memory cache so next load_config
+    returns the new value without resetting _config_cache."""
+    from config import load_config, save_config
+
+    config = load_config()
+    config["target_country"] = "uk"
+    save_config(config)
+
+    # Do NOT reset _config_cache -- the save should have updated it
+    loaded = load_config()
+    assert loaded["target_country"] == "uk"

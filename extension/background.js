@@ -252,7 +252,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       links.push({
         href: msg.href,
         text: msg.text || '',
-        pageUrl: msg.pageUrl || '',
         t: new Date().toISOString()
       });
       persist();

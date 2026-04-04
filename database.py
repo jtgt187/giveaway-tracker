@@ -241,7 +241,7 @@ def get_giveaway_by_url(url):
 def get_known_urls():
     """Return the set of all giveaway URLs already in the database.
 
-    Useful for bulk dedup during crawl so we don't query one-by-one.
+    Useful for bulk dedup during import so we don't query one-by-one.
     """
     conn = get_connection()
     cursor = conn.cursor()
@@ -344,7 +344,7 @@ def delete_not_eligible():
 def parse_deadline(deadline_text):
     """Parse a deadline string into a datetime object.
 
-    Handles the gleamfinder/bestofgleam format:
+    Handles common deadline formats:
         "Friday 03 April 2026 at 22:59:59"
 
     Returns None for empty strings or unparseable text.
@@ -352,7 +352,7 @@ def parse_deadline(deadline_text):
     if not deadline_text or not deadline_text.strip():
         return None
     text = deadline_text.strip()
-    # Primary format from gleamfinder/bestofgleam: "Friday 03 April 2026 at 22:59:59"
+    # Primary format: "Friday 03 April 2026 at 22:59:59"
     try:
         return datetime.strptime(text, "%A %d %B %Y at %H:%M:%S")
     except ValueError:

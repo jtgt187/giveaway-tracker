@@ -2,17 +2,20 @@
 
 Covers:
   - init_db (app startup)
-  - add_giveaway / add_giveaways_batch (Crawl, Import)
+  - add_giveaway / add_giveaways_batch (Import)
   - get_giveaways / get_giveaways_display (Giveaway table, Status filter selectbox)
   - update_giveaway_status (Enter, Skip buttons)
   - update_giveaway_entries (Auto-enter result)
-  - get_giveaway_by_url / get_known_urls (Crawl dedup)
+  - get_giveaway_by_url / get_known_urls (Import dedup)
   - update_terms_check (Check T&C button)
   - get_stats (Dashboard stat cards)
   - delete_not_eligible (Delete All Not Eligible button)
-  - add_to_blacklist / remove_from_blacklist (Blacklist X button)
+  - add_to_blacklist / remove_from_blacklist / get_blacklist (Blacklist X button)
   - parse_deadline (Deadline display, countdown)
   - remove_expired_giveaways (Startup cleanup)
+  - get_connection (row_factory verification)
+  - mark_duplicate_or_skip (wrapper)
+  - gleam_only / exclude_not_eligible filter edge cases
 """
 
 import sqlite3
@@ -221,7 +224,7 @@ def test_update_giveaway_entries(tmp_db, sample_giveaway):
 
 
 # ---------------------------------------------------------------------------
-# get_giveaway_by_url / get_known_urls  (Crawl dedup)
+# get_giveaway_by_url / get_known_urls  (Import dedup)
 # ---------------------------------------------------------------------------
 
 def test_get_giveaway_by_url(tmp_db, sample_giveaway):
@@ -442,3 +445,254 @@ def test_remove_expired_giveaways_none_expired(tmp_db, sample_giveaway):
     add_giveaway(**sample_giveaway)
     removed = remove_expired_giveaways()
     assert removed == 0
+
+
+def test_remove_expired_giveaways_no_deadline_kept(tmp_db):
+    """Giveaways with empty deadline should never be removed."""
+    from database import add_giveaway, remove_expired_giveaways, get_giveaways
+
+    add_giveaway("No Deadline", "https://gleam.io/nd/test", "test", deadline="")
+    removed = remove_expired_giveaways()
+    assert removed == 0
+    assert len(get_giveaways()) == 1
+
+
+# ---------------------------------------------------------------------------
+# get_connection  (row_factory verification)
+# ---------------------------------------------------------------------------
+
+def test_get_connection_row_factory(tmp_db):
+    import sqlite3
+    from database import get_connection
+
+    conn = get_connection()
+    assert conn.row_factory is sqlite3.Row
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# get_blacklist
+# ---------------------------------------------------------------------------
+
+def test_get_blacklist(tmp_db):
+    from database import add_to_blacklist, get_blacklist
+
+    add_to_blacklist("https://gleam.io/bl1/test")
+    add_to_blacklist("https://gleam.io/bl2/test")
+
+    bl = get_blacklist()
+    assert isinstance(bl, list)
+    assert len(bl) == 2
+    assert "https://gleam.io/bl1/test" in bl
+    assert "https://gleam.io/bl2/test" in bl
+
+
+def test_get_blacklist_empty(tmp_db):
+    from database import get_blacklist
+
+    bl = get_blacklist()
+    assert bl == []
+
+
+# ---------------------------------------------------------------------------
+# mark_duplicate_or_skip
+# ---------------------------------------------------------------------------
+
+def test_mark_duplicate_or_skip(tmp_db, sample_giveaway):
+    from database import add_giveaway, get_giveaways, mark_duplicate_or_skip
+
+    add_giveaway(**sample_giveaway)
+    gid = get_giveaways()[0]["id"]
+    mark_duplicate_or_skip(gid, "duplicate found")
+
+    row = get_giveaways(status="skipped")[0]
+    assert row["status"] == "skipped"
+    assert row["notes"] == "duplicate found"
+
+
+def test_mark_duplicate_or_skip_no_reason(tmp_db, sample_giveaway):
+    from database import add_giveaway, get_giveaways, mark_duplicate_or_skip
+
+    add_giveaway(**sample_giveaway)
+    gid = get_giveaways()[0]["id"]
+    mark_duplicate_or_skip(gid)
+
+    row = get_giveaways(status="skipped")[0]
+    assert row["status"] == "skipped"
+    assert row["notes"] == ""
+
+
+# ---------------------------------------------------------------------------
+# add_giveaways_batch -- edge cases
+# ---------------------------------------------------------------------------
+
+def test_add_giveaways_batch_empty_url_skipped(tmp_db):
+    """A giveaway dict with url='' should be silently skipped."""
+    from database import add_giveaways_batch, get_giveaways
+
+    batch = [
+        {"title": "No URL", "url": "", "source": "test"},
+        {"title": "Has URL", "url": "https://gleam.io/has/url", "source": "test"},
+    ]
+    count = add_giveaways_batch(batch)
+    assert count == 1
+    rows = get_giveaways(gleam_only=False, exclude_not_eligible=False)
+    assert len(rows) == 1
+    assert rows[0]["title"] == "Has URL"
+
+
+def test_add_giveaways_batch_missing_url_key_skipped(tmp_db):
+    """A giveaway dict without a 'url' key should be skipped."""
+    from database import add_giveaways_batch, get_giveaways
+
+    batch = [
+        {"title": "Missing URL key", "source": "test"},
+    ]
+    count = add_giveaways_batch(batch)
+    assert count == 0
+
+
+def test_add_giveaways_batch_defaults(tmp_db):
+    """Batch insert should apply defaults for missing optional fields."""
+    from database import add_giveaways_batch, get_giveaways
+
+    batch = [{"url": "https://gleam.io/min/test"}]  # minimal dict
+    count = add_giveaways_batch(batch)
+    assert count == 1
+    row = get_giveaways(gleam_only=False, exclude_not_eligible=False)[0]
+    assert row["title"] == ""
+    assert row["source"] == ""
+    assert row["country_restriction"] == "worldwide"
+
+
+# ---------------------------------------------------------------------------
+# add_giveaway -- optional params at insert time
+# ---------------------------------------------------------------------------
+
+def test_add_giveaway_with_terms_fields(tmp_db):
+    """terms_checked and terms_excluded should be settable at insert time."""
+    from database import add_giveaway, get_giveaways
+
+    add_giveaway(
+        "Terms Test", "https://gleam.io/terms/test", "test",
+        terms_checked=True, terms_excluded="us,uk",
+    )
+    row = get_giveaways()[0]
+    assert row["terms_checked"] == 1
+    assert row["terms_excluded"] == "us,uk"
+
+
+# ---------------------------------------------------------------------------
+# get_giveaways -- gleam_only and exclude_not_eligible edge cases
+# ---------------------------------------------------------------------------
+
+def test_get_giveaways_gleam_only_default(tmp_db):
+    """Default gleam_only=True should filter out non-gleam URLs."""
+    from database import add_giveaway, get_giveaways
+
+    add_giveaway("Gleam", "https://gleam.io/g1/test", "test")
+    add_giveaway("Other", "https://example.com/giveaway", "test")
+
+    gleam_rows = get_giveaways(gleam_only=True)
+    assert len(gleam_rows) == 1
+    assert "gleam.io" in gleam_rows[0]["url"]
+
+    all_rows = get_giveaways(gleam_only=False)
+    assert len(all_rows) == 2
+
+
+def test_get_giveaways_exclude_not_eligible_bypassed_with_status(tmp_db, sample_giveaway):
+    """When status= is set, exclude_not_eligible should be bypassed."""
+    from database import add_giveaway, get_giveaways, update_giveaway_status
+
+    add_giveaway(**sample_giveaway)
+    gid = get_giveaways()[0]["id"]
+    update_giveaway_status(gid, "not_eligible")
+
+    # With status='not_eligible', exclude_not_eligible is bypassed
+    rows = get_giveaways(status="not_eligible")
+    assert len(rows) == 1
+    assert rows[0]["status"] == "not_eligible"
+
+
+def test_get_giveaways_exclude_not_eligible_default(tmp_db, sample_giveaway):
+    """Default exclude_not_eligible=True should hide not_eligible rows."""
+    from database import add_giveaway, get_giveaways, update_giveaway_status
+
+    add_giveaway(**sample_giveaway)
+    gid = get_giveaways()[0]["id"]
+    update_giveaway_status(gid, "not_eligible")
+
+    # Default: not_eligible excluded
+    rows = get_giveaways()
+    assert len(rows) == 0
+
+    # Explicit: not_eligible included
+    rows = get_giveaways(exclude_not_eligible=False)
+    assert len(rows) == 1
+
+
+# ---------------------------------------------------------------------------
+# update_giveaway_entries -- edge cases
+# ---------------------------------------------------------------------------
+
+def test_update_giveaway_entries_zero_total(tmp_db, sample_giveaway):
+    """Zero total_entries should result in 0.0 probability."""
+    from database import add_giveaway, get_giveaways, update_giveaway_entries
+
+    add_giveaway(**sample_giveaway)
+    gid = get_giveaways()[0]["id"]
+    update_giveaway_entries(gid, total_entries=0, your_entries=0)
+
+    row = get_giveaways()[0]
+    assert row["win_probability"] == 0.0
+
+
+def test_update_giveaway_entries_zero_your_entries(tmp_db, sample_giveaway):
+    """Zero your_entries should result in 0.0 probability."""
+    from database import add_giveaway, get_giveaways, update_giveaway_entries
+
+    add_giveaway(**sample_giveaway)
+    gid = get_giveaways()[0]["id"]
+    update_giveaway_entries(gid, total_entries=1000, your_entries=0)
+
+    row = get_giveaways()[0]
+    assert row["win_probability"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# update_terms_check -- edge cases
+# ---------------------------------------------------------------------------
+
+def test_update_terms_check_no_region(tmp_db, sample_giveaway):
+    """When detected_region is None, country_restriction should not change."""
+    from database import add_giveaway, get_giveaways, update_terms_check
+
+    add_giveaway(**sample_giveaway)
+    gid = get_giveaways()[0]["id"]
+    original_country = get_giveaways()[0]["country_restriction"]
+
+    update_terms_check(gid, True, "us", detected_region=None)
+
+    row = get_giveaways()[0]
+    assert row["terms_checked"] == 1
+    assert row["terms_excluded"] == "us"
+    assert row["country_restriction"] == original_country
+
+
+# ---------------------------------------------------------------------------
+# get_stats -- gleam_only parameter
+# ---------------------------------------------------------------------------
+
+def test_get_stats_gleam_only_filters(tmp_db):
+    """get_stats with gleam_only should only count gleam URLs."""
+    from database import add_giveaway, get_stats
+
+    add_giveaway("Gleam", "https://gleam.io/s1/test", "test")
+    add_giveaway("Other", "https://example.com/giveaway", "test")
+
+    gleam_stats = get_stats(gleam_only=True)
+    assert gleam_stats["total"] == 1
+
+    all_stats = get_stats(gleam_only=False)
+    assert all_stats["total"] == 2

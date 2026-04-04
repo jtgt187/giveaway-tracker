@@ -1,0 +1,257 @@
+"""Tests for app.py import_ndjson_links and scan_existing_entries.
+
+Covers:
+  - import_ndjson_links: file not found, empty file, valid NDJSON,
+    malformed lines, non-gleam URLs filtered, file cleared after import,
+    custom path from config
+  - scan_existing_entries: eligibility transitions for new giveaways
+"""
+
+import json
+import os
+import sqlite3
+
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# Helpers -- import app functions without triggering Streamlit init
+# ---------------------------------------------------------------------------
+# app.py calls init_db() and st.set_page_config() at module level, which
+# requires a running Streamlit context.  We mock streamlit before importing.
+
+@pytest.fixture()
+def app_module(monkeypatch, tmp_db, tmp_config):
+    """Import app.py with Streamlit mocked out, using temp DB and config."""
+    import unittest.mock as mock
+    import sys
+
+    # Create a comprehensive Streamlit mock
+    st_mock = mock.MagicMock()
+    st_mock.cache_data = lambda **kwargs: lambda fn: fn
+    monkeypatch.setitem(sys.modules, "streamlit", st_mock)
+    monkeypatch.setitem(sys.modules, "pandas", mock.MagicMock())
+
+    # Force re-import of app module with mocks in place
+    if "app" in sys.modules:
+        del sys.modules["app"]
+
+    import app
+    return app
+
+
+# ===========================================================================
+# import_ndjson_links
+# ===========================================================================
+
+class TestImportNdjsonLinks:
+    def test_file_not_found(self, app_module, tmp_config, tmp_path):
+        """Returns 0 and error message when import file doesn't exist."""
+        import config as cfg
+        from config import load_config, save_config
+
+        config = load_config()
+        config["ndjson_import_path"] = str(tmp_path / "nonexistent.ndjson")
+        save_config(config)
+        cfg._config_cache = None
+
+        count, msg = app_module.import_ndjson_links()
+        assert count == 0
+        assert "not found" in msg
+
+    def test_empty_file(self, app_module, tmp_config, tmp_path):
+        """Returns 0 when file exists but is empty."""
+        import config as cfg
+        from config import load_config, save_config
+
+        ndjson_path = tmp_path / "empty.ndjson"
+        ndjson_path.write_text("")
+
+        config = load_config()
+        config["ndjson_import_path"] = str(ndjson_path)
+        save_config(config)
+        cfg._config_cache = None
+
+        count, msg = app_module.import_ndjson_links()
+        assert count == 0
+        assert "empty" in msg.lower()
+
+    def test_valid_gleam_links(self, app_module, tmp_config, tmp_db, tmp_path):
+        """Valid gleam.io links are imported into the database."""
+        import config as cfg
+        from config import load_config, save_config
+        from database import get_giveaways
+
+        ndjson_path = tmp_path / "links.ndjson"
+        lines = [
+            json.dumps({"href": "https://gleam.io/abc/win-stuff", "text": "Win Stuff"}),
+            json.dumps({"href": "https://gleam.io/def/win-more", "text": "Win More"}),
+        ]
+        ndjson_path.write_text("\n".join(lines) + "\n")
+
+        config = load_config()
+        config["ndjson_import_path"] = str(ndjson_path)
+        save_config(config)
+        cfg._config_cache = None
+
+        count, msg = app_module.import_ndjson_links()
+        assert count == 2
+        assert "2" in msg
+
+        rows = get_giveaways(gleam_only=False, exclude_not_eligible=False)
+        urls = {r["url"] for r in rows}
+        assert "https://gleam.io/abc/win-stuff" in urls
+        assert "https://gleam.io/def/win-more" in urls
+
+    def test_non_gleam_urls_filtered(self, app_module, tmp_config, tmp_db, tmp_path):
+        """Non-gleam.io URLs should be ignored."""
+        import config as cfg
+        from config import load_config, save_config
+        from database import get_giveaways
+
+        ndjson_path = tmp_path / "links.ndjson"
+        lines = [
+            json.dumps({"href": "https://gleam.io/abc/win", "text": "Gleam"}),
+            json.dumps({"href": "https://example.com/giveaway", "text": "Other"}),
+            json.dumps({"href": "https://rafflecopter.com/123", "text": "Raffle"}),
+        ]
+        ndjson_path.write_text("\n".join(lines) + "\n")
+
+        config = load_config()
+        config["ndjson_import_path"] = str(ndjson_path)
+        save_config(config)
+        cfg._config_cache = None
+
+        count, msg = app_module.import_ndjson_links()
+        assert count == 1  # only the gleam.io link
+
+        rows = get_giveaways(gleam_only=False, exclude_not_eligible=False)
+        assert len(rows) == 1
+        assert rows[0]["url"] == "https://gleam.io/abc/win"
+
+    def test_malformed_lines_skipped(self, app_module, tmp_config, tmp_db, tmp_path):
+        """Malformed JSON lines should be skipped without error."""
+        import config as cfg
+        from config import load_config, save_config
+
+        ndjson_path = tmp_path / "links.ndjson"
+        content = (
+            '{"href": "https://gleam.io/good/link", "text": "Good"}\n'
+            "not valid json at all\n"
+            '{"href": "https://gleam.io/also/good", "text": "Also Good"}\n'
+        )
+        ndjson_path.write_text(content)
+
+        config = load_config()
+        config["ndjson_import_path"] = str(ndjson_path)
+        save_config(config)
+        cfg._config_cache = None
+
+        count, msg = app_module.import_ndjson_links()
+        assert count == 2
+
+    def test_non_dict_entries_skipped(self, app_module, tmp_config, tmp_db, tmp_path):
+        """JSON lines that are not dicts (e.g. arrays, strings) should be skipped."""
+        import config as cfg
+        from config import load_config, save_config
+
+        ndjson_path = tmp_path / "links.ndjson"
+        content = (
+            '["this", "is", "an", "array"]\n'
+            '"just a string"\n'
+            '42\n'
+            '{"href": "https://gleam.io/ok/link", "text": "OK"}\n'
+        )
+        ndjson_path.write_text(content)
+
+        config = load_config()
+        config["ndjson_import_path"] = str(ndjson_path)
+        save_config(config)
+        cfg._config_cache = None
+
+        count, msg = app_module.import_ndjson_links()
+        assert count == 1
+
+    def test_file_cleared_after_import(self, app_module, tmp_config, tmp_db, tmp_path):
+        """The NDJSON file should be truncated after successful import."""
+        import config as cfg
+        from config import load_config, save_config
+
+        ndjson_path = tmp_path / "links.ndjson"
+        ndjson_path.write_text(
+            json.dumps({"href": "https://gleam.io/x/y", "text": "T"}) + "\n"
+        )
+
+        config = load_config()
+        config["ndjson_import_path"] = str(ndjson_path)
+        save_config(config)
+        cfg._config_cache = None
+
+        app_module.import_ndjson_links()
+
+        # File should be empty after import
+        assert ndjson_path.read_text() == ""
+
+    def test_text_fallback_when_missing(self, app_module, tmp_config, tmp_db, tmp_path):
+        """When 'text' key is missing, href should be used as title."""
+        import config as cfg
+        from config import load_config, save_config
+        from database import get_giveaways
+
+        ndjson_path = tmp_path / "links.ndjson"
+        ndjson_path.write_text(
+            json.dumps({"href": "https://gleam.io/notitle/test"}) + "\n"
+        )
+
+        config = load_config()
+        config["ndjson_import_path"] = str(ndjson_path)
+        save_config(config)
+        cfg._config_cache = None
+
+        app_module.import_ndjson_links()
+
+        rows = get_giveaways(gleam_only=False, exclude_not_eligible=False)
+        assert rows[0]["title"] == "https://gleam.io/notitle/test"
+
+    def test_blank_lines_ignored(self, app_module, tmp_config, tmp_db, tmp_path):
+        """Blank lines in the NDJSON file should be silently skipped."""
+        import config as cfg
+        from config import load_config, save_config
+
+        ndjson_path = tmp_path / "links.ndjson"
+        content = (
+            "\n"
+            '{"href": "https://gleam.io/a/b", "text": "A"}\n'
+            "\n"
+            "\n"
+        )
+        ndjson_path.write_text(content)
+
+        config = load_config()
+        config["ndjson_import_path"] = str(ndjson_path)
+        save_config(config)
+        cfg._config_cache = None
+
+        count, msg = app_module.import_ndjson_links()
+        assert count == 1
+
+    def test_source_is_extension(self, app_module, tmp_config, tmp_db, tmp_path):
+        """Imported links should have source='extension'."""
+        import config as cfg
+        from config import load_config, save_config
+        from database import get_giveaways
+
+        ndjson_path = tmp_path / "links.ndjson"
+        ndjson_path.write_text(
+            json.dumps({"href": "https://gleam.io/src/test", "text": "T"}) + "\n"
+        )
+
+        config = load_config()
+        config["ndjson_import_path"] = str(ndjson_path)
+        save_config(config)
+        cfg._config_cache = None
+
+        app_module.import_ndjson_links()
+
+        rows = get_giveaways(gleam_only=False, exclude_not_eligible=False)
+        assert rows[0]["source"] == "extension"

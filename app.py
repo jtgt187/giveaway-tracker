@@ -2,8 +2,6 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 from html import escape as html_escape
-import threading
-import queue
 import time
 import os
 import sys
@@ -11,13 +9,8 @@ import json
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from database import init_db, add_giveaway, add_giveaways_batch, get_giveaways, get_giveaways_display, update_giveaway_status, get_stats, update_giveaway_entries, get_giveaway_by_url, get_known_urls, delete_not_eligible, update_terms_check, add_to_blacklist, get_blacklist, remove_from_blacklist, remove_expired_giveaways, get_connection
-from config import load_config, save_config, add_custom_site, remove_custom_site, get_custom_sites
-from crawler.gleamfinder import GleamfinderCrawler
-from crawler.gleam_official import GleamOfficialCrawler
-from crawler.bestofgleam import BestOfGleamCrawler
-from crawler.gleamdb import GleamDBCrawler
-from crawler.custom_sites import CustomSitesCrawler
+from database import init_db, add_giveaway, add_giveaways_batch, get_giveaways, get_giveaways_display, update_giveaway_status, get_stats, update_giveaway_entries, get_giveaway_by_url, delete_not_eligible, update_terms_check, add_to_blacklist, get_blacklist, remove_from_blacklist, remove_expired_giveaways, get_connection
+from config import load_config, save_config
 from entry.auto_enter import auto_enter_giveaway, check_giveaway_terms, check_giveaway_terms_batch
 from utils.country_check import is_eligible_for_country, is_region_blocked, is_ended
 from utils.probability import format_probability
@@ -716,133 +709,6 @@ SVG_ICONS = {
 }
 
 
-def run_crawl(crawl_sources, custom_sites_list, progress_placeholder):
-    new_count = 0
-    eligible_count = 0
-    total_found = 0
-    skipped_ended = 0
-    skipped_region = 0
-    target_country = load_config().get("target_country", "germany")
-    crawl_status = {}
-
-    crawlers = []
-    if "gleamfinder" in crawl_sources:
-        crawlers.append(GleamfinderCrawler())
-    if "gleam_official" in crawl_sources:
-        crawlers.append(GleamOfficialCrawler())
-    if "bestofgleam" in crawl_sources:
-        crawlers.append(BestOfGleamCrawler())
-    if "gleamdb" in crawl_sources:
-        crawlers.append(GleamDBCrawler())
-    if custom_sites_list:
-        crawlers.append(CustomSitesCrawler())
-
-    # Use a shared validator crawler for checking gleam.io URLs
-    from crawler.base import BaseCrawler
-    validator = BaseCrawler("validator", "https://gleam.io")
-
-    # Pre-load all known URLs in one query for bulk dedup
-    known_urls = get_known_urls()
-
-    # --- Phase 1: Crawl all sources in parallel ---
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    def _run_one_crawler(crawler):
-        """Run a single crawler and return (name, giveaways, status_dict)."""
-        status = {"status": "unknown", "count": 0, "error": ""}
-        try:
-            if crawler.name == "custom_sites":
-                giveaways = crawler.extract_giveaways(custom_sites_list)
-            else:
-                giveaways = crawler.extract_giveaways()
-            status["status"] = "ok"
-            status["count"] = len(giveaways)
-            return crawler.name, giveaways, status
-        except Exception as e:
-            status["status"] = "failed"
-            status["error"] = str(e)
-            return crawler.name, [], status
-
-    all_giveaways = []
-    total_crawlers = len(crawlers)
-
-    if total_crawlers > 0:
-        progress_placeholder.progress(0.0, text="Crawling sources in parallel...")
-
-        with ThreadPoolExecutor(max_workers=min(total_crawlers, 4)) as pool:
-            futures = {pool.submit(_run_one_crawler, c): c for c in crawlers}
-            done_count = 0
-            for future in as_completed(futures):
-                done_count += 1
-                name, giveaways, status = future.result()
-                crawl_status[name] = status
-                all_giveaways.extend(giveaways)
-                progress_placeholder.progress(
-                    done_count / total_crawlers,
-                    text=f"Crawled {name} ({status['count']} found)",
-                )
-
-    total_found = len(all_giveaways)
-
-    # --- Phase 2: Dedup against DB and validate new URLs ---
-    new_giveaways = [g for g in all_giveaways if g["url"] not in known_urls]
-
-    # Validate new gleam.io URLs in parallel (the heaviest part)
-    gleam_to_validate = [g for g in new_giveaways if "gleam.io" in g["url"]]
-    non_gleam = [g for g in new_giveaways if "gleam.io" not in g["url"]]
-
-    validated = []  # giveaways that passed validation
-
-    if gleam_to_validate:
-        progress_placeholder.progress(0.5, text=f"Validating {len(gleam_to_validate)} new gleam URLs...")
-
-        def _validate_one(g):
-            result = validator.validate_gleam_url(g["url"])
-            return g, result
-
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            futures = [pool.submit(_validate_one, g) for g in gleam_to_validate]
-            for future in as_completed(futures):
-                g, result = future.result()
-                if result == "ended":
-                    skipped_ended += 1
-                elif result == "region_blocked":
-                    skipped_region += 1
-                elif result == "ok":
-                    validated.append(g)
-                # "error" results are silently skipped — don't add
-                # unverifiable giveaways to the database
-
-    validated.extend(non_gleam)
-
-    # --- Phase 3: Insert validated giveaways in a single transaction ---
-    inserted = add_giveaways_batch([
-        {
-            "title": g["title"],
-            "url": g["url"],
-            "source": g["source"],
-            "description": g.get("description", ""),
-            "deadline": g.get("deadline", ""),
-            "country_restriction": g.get("country_restriction", "worldwide"),
-        }
-        for g in validated
-    ])
-    new_count += inserted
-    # Count how many of the newly inserted are eligible
-    for g in validated:
-        if is_eligible_for_country(g.get("country_restriction", "worldwide"), target_country):
-            eligible_count += 1
-
-    if skipped_ended > 0 or skipped_region > 0:
-        st.info(f"Filtered out: {skipped_ended} ended, {skipped_region} region-blocked")
-
-    try:
-        if hasattr(st, "session_state"):
-            st.session_state["crawl_status"] = crawl_status
-    except Exception:
-        pass
-    return new_count, eligible_count, total_found
-
 
 def scan_existing_entries():
     giveaways = get_giveaways(status="new")
@@ -943,17 +809,21 @@ def _check_accounts_status():
 def import_ndjson_links():
     """Import gleam links from an NDJSON file exported by the browser extension.
 
-    Reads the configured ndjson_import_path, adds any new gleam.io URLs to the
-    database, then clears the file so links are not re-imported.
-    Returns the number of newly imported links.
+    Reads the configured ndjson_import_path (defaults to ./gleam-links.ndjson),
+    adds any new gleam.io URLs to the database, then clears the file so links
+    are not re-imported.
+    Returns (imported_count, message) tuple.
     """
     config = load_config()
     path = config.get("ndjson_import_path", "")
     if not path:
-        return 0
-    path = os.path.expanduser(path)
+        # Default to gleam-links.ndjson in the project directory
+        path = os.path.join(os.path.dirname(__file__), "gleam-links.ndjson")
+    else:
+        path = os.path.expanduser(path)
+
     if not os.path.isfile(path):
-        return 0
+        return 0, f"Import file not found: {path}"
 
     batch = []
     try:
@@ -972,10 +842,13 @@ def import_ndjson_links():
                         batch.append({"title": text, "url": href, "source": "extension"})
                 except json.JSONDecodeError:
                     continue
-    except OSError:
-        return 0
+    except OSError as e:
+        return 0, f"Could not read import file: {e}"
 
-    imported = add_giveaways_batch(batch) if batch else 0
+    if not batch:
+        return 0, "Import file is empty (no gleam.io links found)"
+
+    imported = add_giveaways_batch(batch)
 
     # Clear the file after reading so links aren't re-processed on next startup
     try:
@@ -984,7 +857,7 @@ def import_ndjson_links():
     except OSError:
         pass
 
-    return imported
+    return imported, f"Imported {imported} new links ({len(batch)} total in file)"
 
 
 def main():
@@ -997,41 +870,12 @@ def main():
 
     # Auto-import links from the browser extension NDJSON file
     if "ndjson_imported" not in st.session_state:
-        imported = import_ndjson_links()
+        imported, msg = import_ndjson_links()
         st.session_state.ndjson_imported = imported
         if imported > 0:
             # Run eligibility check on newly imported links
             scan_existing_entries()
             st.toast(f"Imported {imported} new links from extension")
-
-    # Auto-crawl on startup (once per session)
-    if "auto_crawl_done" not in st.session_state:
-        st.session_state.auto_crawl_done = False
-
-    if not st.session_state.auto_crawl_done:
-        st.session_state.auto_crawl_done = True
-        config = load_config()
-        crawl_sources = config.get("crawl_sources", [])
-        custom_sites = config.get("custom_sites", [])
-        if crawl_sources or custom_sites:
-            progress_bar = st.progress(0.0, text="Auto-crawling on startup...")
-            new_count, eligible_count, total_found = run_crawl(
-                crawl_sources, custom_sites, progress_bar
-            )
-            progress_bar.progress(1.0, text="Auto-crawl complete!")
-            scan_existing_entries()
-            if new_count > 0:
-                st.toast(f"Auto-crawl: {new_count} new giveaways found ({eligible_count} eligible)")
-            import time
-            time.sleep(1)
-            progress_bar.empty()
-
-    if "crawl_running" not in st.session_state:
-        st.session_state.crawl_running = False
-    if "crawl_log" not in st.session_state:
-        st.session_state.crawl_log = []
-    if "crawl_new_count" not in st.session_state:
-        st.session_state.crawl_new_count = 0
 
     st.markdown(f"""
     <div class="main-header">
@@ -1040,10 +884,9 @@ def main():
     </div>
     """, unsafe_allow_html=True)
 
-    tab_dashboard, tab_giveaways, tab_crawl, tab_autoenter, tab_settings = st.tabs([
+    tab_dashboard, tab_giveaways, tab_autoenter, tab_settings = st.tabs([
         " 🎁 Dashboard",
         " 📋 Giveaways",
-        " 🔎 Crawl",
         " 🤖 Auto-Enter",
         " ⚙️ Settings",
     ])
@@ -1136,7 +979,7 @@ def main():
         else:
             st.markdown(f"""
             <div class="empty-state">
-                <p>No giveaways found yet. Run a crawl to get started!</p>
+                <p>No giveaways found yet. Import links from the browser extension to get started!</p>
             </div>
             """, unsafe_allow_html=True)
 
@@ -1206,40 +1049,17 @@ def main():
         # --- Quick Actions ---
         st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
         st.markdown(f'<div class="section-title">{SVG_ICONS["zap"]} Quick Actions</div>', unsafe_allow_html=True)
-        qa_col1, qa_col2, qa_col3 = st.columns(3)
+        qa_col1, qa_col2 = st.columns(2)
         with qa_col1:
-            if st.button("Crawl + Enter All", type="primary", use_container_width=True, key="dash_crawl_enter"):
-                with st.spinner("Crawling..."):
-                    config = load_config()
-                    class _SP:
-                        def progress(self, *a, **kw):
-                            pass
-                    new_count, eligible_count, total_found = run_crawl(
-                        config.get("crawl_sources", []),
-                        config.get("custom_sites", []),
-                        _SP(),
-                    )
+            if st.button("Import from Extension", type="primary", use_container_width=True, key="dash_import"):
+                imported, msg = import_ndjson_links()
+                if imported > 0:
                     scan_existing_entries()
-                eligible = get_giveaways("eligible")
-                entered = 0
-                failed = 0
-                for g in eligible:
-                    with st.spinner(f"Entering: {g['title'][:50]}..."):
-                        result, log = auto_enter_giveaway(g["url"])
-                        if result is True:
-                            update_giveaway_status(g["id"], "participated")
-                            entered += 1
-                        elif result == "region_restricted":
-                            update_giveaway_status(g["id"], "not_eligible")
-                            failed += 1
-                        elif result == "ended":
-                            update_giveaway_status(g["id"], "expired")
-                            failed += 1
-                        else:
-                            failed += 1
-                st.toast(f"Done: {entered} entered, {failed} failed, {new_count} new found")
-                _cached_giveaways_display.clear()
-                st.rerun()
+                    st.toast(msg)
+                    _cached_giveaways_display.clear()
+                    st.rerun()
+                else:
+                    st.info(msg)
         with qa_col2:
             eligible_count = stats.get("eligible", 0)
             if st.button(f"Enter All Eligible ({eligible_count})", use_container_width=True, key="dash_enter_all"):
@@ -1256,22 +1076,6 @@ def main():
                         elif result == "ended":
                             update_giveaway_status(g["id"], "expired")
                 st.toast(f"Entered {entered} giveaways")
-                _cached_giveaways_display.clear()
-                st.rerun()
-        with qa_col3:
-            if st.button("Quick Crawl", use_container_width=True, key="dash_quick_crawl"):
-                with st.spinner("Crawling..."):
-                    config = load_config()
-                    class _SP2:
-                        def progress(self, *a, **kw):
-                            pass
-                    new_count, eligible_count, total_found = run_crawl(
-                        config.get("crawl_sources", []),
-                        config.get("custom_sites", []),
-                        _SP2(),
-                    )
-                    scan_existing_entries()
-                st.toast(f"Found {new_count} new giveaways ({eligible_count} eligible)")
                 _cached_giveaways_display.clear()
                 st.rerun()
 
@@ -1511,87 +1315,6 @@ def main():
             </div>
             """, unsafe_allow_html=True)
 
-    with tab_crawl:
-        st.markdown(f'<div class="section-title">{SVG_ICONS["search"]} Crawl for Giveaways</div>', unsafe_allow_html=True)
-
-        config = load_config()
-        crawl_sources = config.get("crawl_sources", [])
-        custom_sites = config.get("custom_sites", [])
-
-        st.markdown('<div class="settings-section">', unsafe_allow_html=True)
-        st.markdown(f'<h3>{SVG_ICONS["link"]} Active Sources</h3>', unsafe_allow_html=True)
-        for source in crawl_sources:
-            st.markdown(f"""
-            <div class="source-card">
-                <div class="source-icon">{SVG_ICONS['globe']}</div>
-                <div>
-                    <div class="source-name">{source.replace('_', ' ').title()}</div>
-                    <div class="source-status">Configured and ready</div>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-        if custom_sites:
-            st.markdown(f"""
-            <div class="source-card">
-                <div class="source-icon">{SVG_ICONS['link']}</div>
-                <div>
-                    <div class="source-name">Custom Sites</div>
-                    <div class="source-status">{len(custom_sites)} site(s) configured</div>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-        if not crawl_sources and not custom_sites:
-            st.markdown('<p style="color: var(--text-tertiary); font-size: 0.875rem;">No sources configured. Add sources in Settings.</p>', unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        if st.button("Start Crawl", type="primary", use_container_width=True, disabled=st.session_state.crawl_running):
-            st.session_state.crawl_running = True
-            st.session_state.crawl_new_count = 0
-            progress_placeholder = st.empty()
-            status_placeholder = st.empty()
-
-            new_count, eligible_count, total_found = run_crawl(
-                crawl_sources, custom_sites, progress_placeholder
-            )
-
-            st.session_state.crawl_new_count = new_count
-            st.session_state.crawl_running = False
-
-            progress_placeholder.progress(1.0, text="Crawl complete!")
-            statuses = getattr(st.session_state, 'crawl_status', None)
-            if statuses:
-                st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
-                st.markdown('<div class="section-title">Crawl Summary</div>', unsafe_allow_html=True)
-                for name, s in statuses.items():
-                    badge_color = '#10b981' if s.get('status') == 'ok' else '#ef4444'
-                    st.markdown(
-                        f"<div style='display:flex;align-items:center;gap:12px;margin:8px 0;'>"
-                        f"<span style='font-weight:600;color:var(--text-primary);'>{name}</span>"
-                        f"<span style='background:{badge_color};color:white;padding:4px 10px;border-radius:999px;font-size:0.75rem;font-weight:600;'>"
-                        f"{s.get('status', 'unknown').upper()}"
-                        f"</span>"
-                        f"<span style='color:var(--text-tertiary);font-size:0.8rem;'>{s.get('count', 0)} found</span>"
-                        f"<span style='color:var(--text-tertiary);font-size:0.8rem;'>{s.get('error','')}</span>"
-                        f"</div>",
-                        unsafe_allow_html=True,
-                    )
-            status_placeholder.markdown(f"""
-            <div class="results-summary">
-                <div class="results-title">{SVG_ICONS['check']} Crawl Finished</div>
-                <div class="results-detail">
-                    Found <strong>{total_found}</strong> giveaways total,
-                    <strong>{new_count}</strong> new added,
-                    <strong>{eligible_count}</strong> eligible for your region
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
-
-            scan_existing_entries()
-            st.rerun()
-
-        if st.session_state.crawl_running:
-            st.info("Crawl in progress... Please wait.")
-
     with tab_autoenter:
         st.markdown(f'<div class="section-title">{SVG_ICONS["bot"]} Auto-Enter Giveaways</div>', unsafe_allow_html=True)
 
@@ -1670,7 +1393,7 @@ def main():
                                 else:
                                     st.session_state.entry_stats["failed"] += 1
                                     st.warning("Entry may have failed. Check the log.")
-                                st.session_state.crawl_log = log
+                                st.session_state.entry_log = log
                     with col4:
                         if st.button("⏭️ Skip", key=f"skip_{g['id']}"):
                             if "entry_stats" not in st.session_state:
@@ -1704,16 +1427,16 @@ def main():
             else:
                 st.markdown(f"""
                 <div class="empty-state">
-                    <p>No eligible giveaways found. Run a crawl first!</p>
+                    <p>No eligible giveaways found. Import links from the extension first!</p>
                 </div>
                 """, unsafe_allow_html=True)
 
         _render_eligible_giveaways()
 
-        if st.session_state.crawl_log:
+        if st.session_state.get("entry_log"):
             st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
             st.markdown(f'<div class="section-title">{SVG_ICONS["list"]} Entry Log</div>', unsafe_allow_html=True)
-            for entry in st.session_state.crawl_log[-20:]:
+            for entry in st.session_state.entry_log[-20:]:
                 log_class = "log-entry"
                 if "success" in entry.lower() or "completed" in entry.lower():
                     log_class += " log-success"
@@ -1748,68 +1471,6 @@ def main():
             config["target_country"] = selected_country
             save_config(config)
             st.success("Country updated!")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        st.markdown('<div class="settings-section">', unsafe_allow_html=True)
-        st.markdown(f'<h3>{SVG_ICONS["search"]} Crawl Sources</h3>', unsafe_allow_html=True)
-        available_sources = ["gleamfinder", "gleam_official", "bestofgleam", "gleamdb"]
-        current_sources = config.get("crawl_sources", [])
-
-        for source in available_sources:
-            is_active = source in current_sources
-            if st.checkbox(source.replace('_', ' ').title(), value=is_active):
-                if source not in current_sources:
-                    current_sources.append(source)
-            else:
-                if source in current_sources:
-                    current_sources.remove(source)
-
-        if config.get("crawl_sources") != current_sources:
-            config["crawl_sources"] = current_sources
-            save_config(config)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        st.markdown('<div class="settings-section">', unsafe_allow_html=True)
-        st.markdown(f'<h3>{SVG_ICONS["link"]} Custom Sites</h3>', unsafe_allow_html=True)
-        custom_sites = config.get("custom_sites", [])
-
-        new_site = st.text_input("Add custom site URL", placeholder="https://example.com/giveaways")
-        if st.button("Add Site"):
-            if new_site and new_site.startswith("http"):
-                if add_custom_site(new_site):
-                    st.success("Site added!")
-                    config = load_config()
-                    custom_sites = config.get("custom_sites", [])
-                else:
-                    st.warning("Site already exists")
-            else:
-                st.error("Please enter a valid URL")
-
-        if custom_sites:
-            for i, site in enumerate(custom_sites):
-                st.markdown(f"""
-                <div class="site-item">
-                    <code>{site}</code>
-                </div>
-                """, unsafe_allow_html=True)
-                if st.button("Remove", key=f"remove_site_{i}"):
-                    remove_custom_site(site)
-                    st.rerun()
-        st.markdown('</div>', unsafe_allow_html=True)
-
-        st.markdown('<div class="settings-section">', unsafe_allow_html=True)
-        st.markdown(f'<h3>{SVG_ICONS["zap"]} Network Settings</h3>', unsafe_allow_html=True)
-        col1, col2 = st.columns(2)
-        with col1:
-            min_delay = st.slider("Min delay (seconds)", 1, 15, config.get("min_delay", 3))
-        with col2:
-            max_delay = st.slider("Max delay (seconds)", 2, 20, config.get("max_delay", 10))
-
-        if min_delay != config.get("min_delay") or max_delay != config.get("max_delay"):
-            config["min_delay"] = min_delay
-            config["max_delay"] = max_delay
-            save_config(config)
-            st.success("Delay settings updated!")
         st.markdown('</div>', unsafe_allow_html=True)
 
         st.markdown('<div class="settings-section">', unsafe_allow_html=True)

@@ -2,8 +2,7 @@
 
 These tests validate the *logic* behind each button/widget by calling the
 functions they invoke with mocked external dependencies (Playwright, HTTP
-requests, crawlers).  Each test maps to a specific UI element documented
-in the plan.
+requests).  Each test maps to a specific UI element documented in the plan.
 
 Covers:
   - Blacklist "X" button (per-row)
@@ -13,12 +12,10 @@ Covers:
   - "Enter" button (success / region_restricted / ended)
   - "Skip" button
   - "Auto-Enter ALL Eligible" button
-  - "Start Crawl" / "Crawl + Enter All" / "Quick Crawl" buttons
+  - "Import from Extension" / batch insert buttons
   - "Enable Auto-Enter" toggle
   - Country selectbox
-  - "Add Site" button + text input
-  - "Remove" site button
-  - Min/max delay sliders
+  - Custom site stubs (deprecated)
   - "Clear All Data" button (tests the fixed handler)
   - Status filter selectbox
   - "Check T&C" button handler
@@ -48,7 +45,7 @@ def test_blacklist_button_removes_and_blacklists(tmp_db, sample_giveaway):
 
 
 def test_blacklist_prevents_reimport(tmp_db, sample_giveaway):
-    """After blacklisting, re-crawling the same URL should not re-add it."""
+    """After blacklisting, re-importing the same URL should not re-add it."""
     from database import add_giveaway, add_to_blacklist
 
     add_giveaway(**sample_giveaway)
@@ -248,52 +245,52 @@ def test_auto_enter_mixed_results(tmp_db, sample_giveaways):
 
 
 # ===========================================================================
-# "Start Crawl" / "Crawl + Enter All" / "Quick Crawl" buttons
+# "Import from Extension" / batch insert buttons
 # ===========================================================================
 
-def test_start_crawl_inserts_giveaways(tmp_db):
-    """run_crawl logic: crawled giveaways should be batch-inserted."""
+def test_import_inserts_giveaways(tmp_db):
+    """Batch-insert giveaways via NDJSON import."""
     from database import add_giveaways_batch, get_giveaways
 
-    mock_crawled = [
+    mock_imported = [
         {
-            "title": "Crawled 1", "url": "https://gleam.io/cr1/test",
-            "source": "gleamfinder", "country_restriction": "worldwide",
+            "title": "Imported 1", "url": "https://gleam.io/cr1/test",
+            "source": "extension", "country_restriction": "worldwide",
         },
         {
-            "title": "Crawled 2", "url": "https://gleam.io/cr2/test",
-            "source": "bestofgleam", "country_restriction": "germany",
+            "title": "Imported 2", "url": "https://gleam.io/cr2/test",
+            "source": "extension", "country_restriction": "germany",
         },
     ]
-    count = add_giveaways_batch(mock_crawled)
+    count = add_giveaways_batch(mock_imported)
     assert count == 2
     rows = get_giveaways()
     assert len(rows) == 2
 
 
-def test_crawl_dedup_skips_known_urls(tmp_db, sample_giveaway):
-    """Crawl should skip URLs already in the database."""
+def test_import_dedup_skips_known_urls(tmp_db, sample_giveaway):
+    """Import should skip URLs already in the database (INSERT OR IGNORE)."""
     from database import add_giveaway, get_known_urls, add_giveaways_batch, get_giveaways
 
     add_giveaway(**sample_giveaway)
     known = get_known_urls()
 
     # Simulate dedup: filter out known URLs before batch insert
-    new_crawled = [
+    new_imported = [
         sample_giveaway,  # already exists
         {
             "title": "Brand New", "url": "https://gleam.io/new1/test",
-            "source": "test", "country_restriction": "worldwide",
+            "source": "extension", "country_restriction": "worldwide",
         },
     ]
-    to_insert = [g for g in new_crawled if g["url"] not in known]
+    to_insert = [g for g in new_imported if g["url"] not in known]
     count = add_giveaways_batch(to_insert)
     assert count == 1
     assert len(get_giveaways()) == 2
 
 
-def test_crawl_enter_all_flow(tmp_db, sample_giveaways, tmp_config):
-    """Crawl + Enter All: insert giveaways, scan eligibility, enter eligible."""
+def test_import_enter_all_flow(tmp_db, sample_giveaways, tmp_config):
+    """Import + Enter All: insert giveaways, scan eligibility, enter eligible."""
     from database import add_giveaways_batch, get_giveaways, update_giveaway_status
     from config import load_config, save_config
     from utils.country_check import is_eligible_for_country
@@ -302,7 +299,7 @@ def test_crawl_enter_all_flow(tmp_db, sample_giveaways, tmp_config):
     config["target_country"] = "germany"
     save_config(config)
 
-    # Phase 1: crawl
+    # Phase 1: import
     add_giveaways_batch(sample_giveaways)
 
     # Phase 2: scan eligibility
@@ -364,17 +361,17 @@ def test_country_selectbox_updates_config(tmp_config):
 
 
 # ===========================================================================
-# "Add Site" button + text input
+# Custom site stubs (deprecated)
 # ===========================================================================
 
 def test_add_site_button_valid_url(tmp_config):
-    """Adding a valid URL should succeed and persist."""
+    """Custom sites are deprecated -- add_custom_site always returns False."""
     from config import add_custom_site, get_custom_sites, load_config
 
     load_config()
     result = add_custom_site("https://newgiveaways.com")
-    assert result is True
-    assert "https://newgiveaways.com" in get_custom_sites()
+    assert result is False
+    assert get_custom_sites() == []
 
 
 def test_add_site_button_url_validation():
@@ -390,18 +387,16 @@ def test_add_site_button_url_validation():
 
 
 # ===========================================================================
-# "Remove" site button
+# Custom site remove stub (deprecated)
 # ===========================================================================
 
 def test_remove_site_button(tmp_config):
-    """Removing a custom site should persist."""
-    from config import add_custom_site, remove_custom_site, get_custom_sites, load_config
+    """Custom sites are deprecated -- remove_custom_site always returns False."""
+    from config import remove_custom_site, load_config
 
     load_config()
-    add_custom_site("https://removeme.com")
     result = remove_custom_site("https://removeme.com")
-    assert result is True
-    assert "https://removeme.com" not in get_custom_sites()
+    assert result is False
 
 
 # ===========================================================================

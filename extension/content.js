@@ -80,8 +80,7 @@
     chrome.runtime.sendMessage({
       type: 'append',
       href: normalized,
-      text: text || '',
-      pageUrl: location.href
+      text: text || ''
     }, function(response) {
       // Badge update is handled by background.js — nothing to do here
       if (chrome.runtime.lastError) {

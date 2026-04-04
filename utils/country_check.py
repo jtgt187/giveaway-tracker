@@ -10,7 +10,7 @@ EU_MEMBERS = [
 # --- DACH member states ---
 DACH_MEMBERS = ["germany", "austria", "switzerland"]
 
-# --- Country keywords for crawl-time detection ---
+# --- Country keywords for eligibility detection ---
 # Order matters: check specific regions BEFORE broad ones to avoid
 # "worldwide" matching on a page that also says "Germany only".
 # Dict is iterated in insertion order (Python 3.7+).

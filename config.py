@@ -8,19 +8,8 @@ _config_cache = None
 
 DEFAULT_CONFIG = {
     "target_country": "germany",
-    "crawl_sources": [
-        "gleamfinder",
-        "gleam_official",
-        "bestofgleam",
-        "gleamdb",
-    ],
-    "custom_sites": [
-        "https://giveawaydrop.com/",
-    ],
     "auto_enter_enabled": True,
     "auto_enter_methods": ["click"],
-    "min_delay": 3,
-    "max_delay": 10,
     "ndjson_import_path": "",
 }
 
@@ -72,25 +61,17 @@ def save_config(config):
 
 
 def get_custom_sites():
-    config = load_config()
-    return config.get("custom_sites", [])
+    """Deprecated — custom sites removed. Kept for backwards compat."""
+    return []
 
 
 def add_custom_site(url):
-    config = load_config()
-    if url not in config["custom_sites"]:
-        config["custom_sites"].append(url)
-        save_config(config)
-        return True
+    """Deprecated — custom sites removed. Kept for backwards compat."""
     return False
 
 
 def remove_custom_site(url):
-    config = load_config()
-    if url in config["custom_sites"]:
-        config["custom_sites"].remove(url)
-        save_config(config)
-        return True
+    """Deprecated — custom sites removed. Kept for backwards compat."""
     return False
 
 

@@ -214,3 +214,122 @@ class TestDetectCountryRestriction:
         from utils.country_check import detect_country_restriction
         assert detect_country_restriction("GERMANY ONLY") == "germany"
         assert detect_country_restriction("WORLDWIDE") == "worldwide"
+
+    def test_german_language_nur_deutschland(self):
+        from utils.country_check import detect_country_restriction
+        assert detect_country_restriction("nur deutschland") == "germany"
+
+    def test_german_language_teilnahmeberechtigt(self):
+        from utils.country_check import detect_country_restriction
+        assert detect_country_restriction(
+            "teilnahmeberechtigt sind personen mit wohnsitz in deutschland"
+        ) == "germany"
+
+    def test_german_language_dach_region(self):
+        from utils.country_check import detect_country_restriction
+        assert detect_country_restriction(
+            "deutschland, österreich und schweiz"
+        ) == "dach"
+
+    def test_german_language_eu(self):
+        from utils.country_check import detect_country_restriction
+        assert detect_country_restriction("innerhalb der eu") == "eu"
+
+    def test_priority_germany_over_worldwide(self):
+        """When text contains both 'germany only' and 'worldwide', germany should win."""
+        from utils.country_check import detect_country_restriction
+        text = "Germany only. This giveaway is open worldwide."
+        assert detect_country_restriction(text) == "germany"
+
+    def test_priority_dach_over_eu(self):
+        """DACH should be detected before EU when both are present."""
+        from utils.country_check import detect_country_restriction
+        text = "Open to DACH region and EU residents"
+        assert detect_country_restriction(text) == "dach"
+
+
+# ===========================================================================
+# Additional is_region_blocked tests (more keyword coverage)
+# ===========================================================================
+
+class TestIsRegionBlockedExtended:
+    def test_angular_template_keyword(self):
+        from utils.country_check import is_region_blocked
+        assert is_region_blocked("!contestantstate.location_allowed") is True
+
+    def test_not_available_in_country(self):
+        from utils.country_check import is_region_blocked
+        assert is_region_blocked(
+            "promotion is not available in your country"
+        ) is True
+
+    def test_partial_match_in_html(self):
+        from utils.country_check import is_region_blocked
+        html = '<div>This page says: not available in your region</div>'
+        assert is_region_blocked(html) is True
+
+
+# ===========================================================================
+# Additional is_ended tests (more keyword coverage)
+# ===========================================================================
+
+class TestIsEndedExtended:
+    def test_sweepstakes_ended(self):
+        from utils.country_check import is_ended
+        assert is_ended("This sweepstakes has ended") is True
+
+    def test_contest_ended(self):
+        from utils.country_check import is_ended
+        assert is_ended("This contest has ended") is True
+
+    def test_campaign_ended(self):
+        from utils.country_check import is_ended
+        assert is_ended("This campaign has ended") is True
+
+    def test_entry_period_ended(self):
+        from utils.country_check import is_ended
+        assert is_ended("Entry period has ended") is True
+
+    def test_giveaway_is_over(self):
+        from utils.country_check import is_ended
+        assert is_ended("This giveaway is over") is True
+
+    def test_contest_is_over(self):
+        from utils.country_check import is_ended
+        assert is_ended("This contest is over") is True
+
+    def test_case_insensitive(self):
+        from utils.country_check import is_ended
+        assert is_ended("THIS COMPETITION HAS ENDED") is True
+        assert is_ended("This Giveaway Has Ended") is True
+
+
+# ===========================================================================
+# Additional is_eligible_for_country edge cases
+# ===========================================================================
+
+class TestIsEligibleExtended:
+    def test_austria_eligible_for_dach(self):
+        from utils.country_check import is_eligible_for_country
+        assert is_eligible_for_country("dach", "austria") is True
+
+    def test_switzerland_eligible_for_dach(self):
+        from utils.country_check import is_eligible_for_country
+        assert is_eligible_for_country("dach", "switzerland") is True
+
+    def test_france_eligible_for_eu(self):
+        from utils.country_check import is_eligible_for_country
+        assert is_eligible_for_country("eu", "france") is True
+
+    def test_poland_eligible_for_eu(self):
+        from utils.country_check import is_eligible_for_country
+        assert is_eligible_for_country("eu", "poland") is True
+
+    def test_unknown_country_not_eligible(self):
+        from utils.country_check import is_eligible_for_country
+        assert is_eligible_for_country("brazil", "germany") is False
+
+    def test_restricted_eligible_for_nobody_exhaustive(self):
+        from utils.country_check import is_eligible_for_country
+        for country in ["germany", "austria", "france", "us", "uk", "switzerland"]:
+            assert is_eligible_for_country("restricted", country) is False
