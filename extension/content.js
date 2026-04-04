@@ -1,4 +1,7 @@
 (function(){
+  // Don't collect links from local development pages (e.g. Streamlit dashboard)
+  if (['localhost', '127.0.0.1', '[::1]'].includes(location.hostname)) return;
+
   let seenHref = new Set();
   let pageCount = 0;
   let hidden = false;

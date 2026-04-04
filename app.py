@@ -1,15 +1,17 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
+from html import escape as html_escape
 import threading
 import queue
 import time
 import os
 import sys
+import json
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from database import init_db, add_giveaway, get_giveaways, update_giveaway_status, get_stats, update_giveaway_entries, get_giveaway_by_url, delete_not_eligible, update_terms_check, add_to_blacklist, get_blacklist, remove_from_blacklist
+from database import init_db, add_giveaway, get_giveaways, get_giveaways_display, update_giveaway_status, get_stats, update_giveaway_entries, get_giveaway_by_url, delete_not_eligible, update_terms_check, add_to_blacklist, get_blacklist, remove_from_blacklist, remove_expired_giveaways
 from config import load_config, save_config, add_custom_site, remove_custom_site, get_custom_sites
 from crawler.gleamfinder import GleamfinderCrawler
 from crawler.gleam_official import GleamOfficialCrawler
@@ -17,10 +19,22 @@ from crawler.bestofgleam import BestOfGleamCrawler
 from crawler.gleamdb import GleamDBCrawler
 from crawler.custom_sites import CustomSitesCrawler
 from entry.auto_enter import auto_enter_giveaway, check_giveaway_terms
-from utils.country_check import is_eligible_for_country
+from utils.country_check import is_eligible_for_country, is_region_blocked, is_ended
 from utils.probability import format_probability
 
 init_db()
+_expired_removed = remove_expired_giveaways()
+if _expired_removed:
+    print(f"[startup] Removed {_expired_removed} expired giveaway(s) from database")
+
+
+@st.cache_data(ttl=5)
+def _cached_giveaways_display(status=None):
+    """Cached wrapper for get_giveaways_display to avoid re-querying SQLite on every Streamlit rerun."""
+    if status:
+        return get_giveaways_display(status=status)
+    return get_giveaways_display()
+
 
 st.set_page_config(
     page_title="Giveaway Tracker",
@@ -506,6 +520,64 @@ CUSTOM_CSS = """
         animation: shimmer 1.5s infinite;
         border-radius: var(--radius-sm);
     }
+
+    /* Custom giveaway table */
+    .ga-table {
+        width: 100%;
+        border-collapse: separate;
+        border-spacing: 0;
+        border-radius: var(--radius-lg);
+        overflow: hidden;
+        border: 1px solid var(--border-subtle);
+    }
+    .ga-table th {
+        background: var(--bg-tertiary);
+        color: var(--text-secondary);
+        font-size: 0.75rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        padding: 10px 14px;
+        text-align: left;
+        border-bottom: 1px solid var(--border-default);
+    }
+    .ga-table td {
+        padding: 10px 14px;
+        border-bottom: 1px solid var(--border-subtle);
+        font-size: 0.875rem;
+        color: var(--text-primary);
+        vertical-align: middle;
+    }
+    .ga-table tr:last-child td {
+        border-bottom: none;
+    }
+    .ga-table tr:hover td {
+        background: var(--bg-glass-hover);
+    }
+    .ga-table a.ga-title {
+        color: var(--accent-primary);
+        text-decoration: none;
+        font-weight: 500;
+        transition: color var(--transition-base);
+    }
+    .ga-table a.ga-title:hover {
+        color: var(--accent-hover);
+        text-decoration: underline;
+    }
+    .ga-table .ga-badge {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: var(--radius-sm);
+        font-size: 0.75rem;
+        font-weight: 600;
+    }
+    .ga-badge-new { background: rgba(99,102,241,0.15); color: #818cf8; }
+    .ga-badge-eligible { background: rgba(34,197,94,0.15); color: #4ade80; }
+    .ga-badge-participated { background: rgba(14,165,233,0.15); color: #38bdf8; }
+    .ga-badge-expired { background: rgba(107,114,128,0.15); color: #9ca3af; }
+    .ga-badge-skipped { background: rgba(234,179,8,0.15); color: #facc15; }
+    .ga-badge-not_eligible { background: rgba(239,68,68,0.15); color: #f87171; }
+    .ga-table .ga-muted { color: var(--text-tertiary); }
 </style>
 """
 
@@ -538,6 +610,8 @@ def run_crawl(crawl_sources, custom_sites_list, progress_placeholder):
     new_count = 0
     eligible_count = 0
     total_found = 0
+    skipped_ended = 0
+    skipped_region = 0
     target_country = load_config().get("target_country", "germany")
     crawl_status = {}
 
@@ -552,6 +626,10 @@ def run_crawl(crawl_sources, custom_sites_list, progress_placeholder):
         crawlers.append(GleamDBCrawler())
     if custom_sites_list:
         crawlers.append(CustomSitesCrawler())
+
+    # Use a shared validator crawler for checking gleam.io URLs
+    from crawler.base import BaseCrawler
+    validator = BaseCrawler("validator", "https://gleam.io")
 
     total_crawlers = len(crawlers)
     for i, crawler in enumerate(crawlers):
@@ -571,6 +649,22 @@ def run_crawl(crawl_sources, custom_sites_list, progress_placeholder):
             for g in giveaways:
                 total_found += 1
                 source_count += 1
+
+                # Check if this gleam URL is already in the database
+                existing = get_giveaway_by_url(g["url"])
+                if existing:
+                    continue  # Already known, skip validation
+
+                # Validate new gleam.io URLs to filter out ended/region-blocked
+                if "gleam.io" in g["url"]:
+                    validation = validator.validate_gleam_url(g["url"])
+                    if validation == "ended":
+                        skipped_ended += 1
+                        continue
+                    elif validation == "region_blocked":
+                        skipped_region += 1
+                        continue
+
                 is_new = add_giveaway(
                     g["title"], g["url"], g["source"],
                     g.get("description", ""), g.get("deadline", ""),
@@ -587,6 +681,9 @@ def run_crawl(crawl_sources, custom_sites_list, progress_placeholder):
             this_status["error"] = str(e)
         finally:
             crawl_status[crawler.name] = this_status
+
+    if skipped_ended > 0 or skipped_region > 0:
+        st.info(f"Filtered out: {skipped_ended} ended, {skipped_region} region-blocked")
 
     try:
         if hasattr(st, "session_state"):
@@ -609,7 +706,83 @@ def scan_existing_entries():
                 update_giveaway_status(g["id"], "not_eligible")
 
 
+def import_ndjson_links():
+    """Import gleam links from an NDJSON file exported by the browser extension.
+
+    Reads the configured ndjson_import_path, adds any new gleam.io URLs to the
+    database, then clears the file so links are not re-imported.
+    Returns the number of newly imported links.
+    """
+    config = load_config()
+    path = config.get("ndjson_import_path", "")
+    if not path:
+        return 0
+    path = os.path.expanduser(path)
+    if not os.path.isfile(path):
+        return 0
+
+    imported = 0
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    href = entry.get("href", "")
+                    text = entry.get("text", "") or href
+                    if href and "gleam.io" in href:
+                        if add_giveaway(title=text, url=href, source="extension"):
+                            imported += 1
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return 0
+
+    # Clear the file after successful import so links aren't re-imported
+    if imported > 0:
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.truncate(0)
+        except OSError:
+            pass
+
+    return imported
+
+
 def main():
+    # Auto-import links from the browser extension NDJSON file
+    if "ndjson_imported" not in st.session_state:
+        imported = import_ndjson_links()
+        st.session_state.ndjson_imported = imported
+        if imported > 0:
+            # Run eligibility check on newly imported links
+            scan_existing_entries()
+            st.toast(f"Imported {imported} new links from extension")
+
+    # Auto-crawl on startup (once per session)
+    if "auto_crawl_done" not in st.session_state:
+        st.session_state.auto_crawl_done = False
+
+    if not st.session_state.auto_crawl_done:
+        st.session_state.auto_crawl_done = True
+        config = load_config()
+        crawl_sources = config.get("crawl_sources", [])
+        custom_sites = config.get("custom_sites", [])
+        if crawl_sources or custom_sites:
+            with st.spinner("Auto-crawling on startup..."):
+                # Use a minimal placeholder that doesn't render a progress bar
+                class _SilentProgress:
+                    def progress(self, *a, **kw):
+                        pass
+                new_count, eligible_count, total_found = run_crawl(
+                    crawl_sources, custom_sites, _SilentProgress()
+                )
+                scan_existing_entries()
+                if new_count > 0:
+                    st.toast(f"Auto-crawl: {new_count} new giveaways found ({eligible_count} eligible)")
+
     if "crawl_running" not in st.session_state:
         st.session_state.crawl_running = False
     if "crawl_log" not in st.session_state:
@@ -685,13 +858,38 @@ def main():
 
         st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
         st.markdown(f'<div class="section-title">{SVG_ICONS["clock"]} Recent Giveaways</div>', unsafe_allow_html=True)
-        recent = get_giveaways()[:10]
+        recent = _cached_giveaways_display()[:10]
         if recent:
-            df = pd.DataFrame(recent)
-            df_display = df[["title", "source", "country_restriction", "status", "discovered_at"]].copy()
-            df_display["discovered_at"] = pd.to_datetime(df_display["discovered_at"]).dt.strftime("%Y-%m-%d %H:%M")
-            df_display.columns = ["Title", "Source", "Region", "Status", "Discovered"]
-            st.dataframe(df_display, use_container_width=True, hide_index=True)
+            badge_labels = {
+                "new": "New", "eligible": "Eligible", "participated": "Participated",
+                "not_eligible": "Not Eligible", "expired": "Expired", "skipped": "Skipped",
+            }
+            html_rows = []
+            for r in recent:
+                title = html_escape(r.get("title", "Untitled"))
+                url = html_escape(r.get("url", "#"), quote=True)
+                status = r.get("status", "new")
+                badge_label = badge_labels.get(status, status)
+                discovered = ""
+                if r.get("discovered_at"):
+                    try:
+                        discovered = datetime.fromisoformat(r["discovered_at"]).strftime("%Y-%m-%d %H:%M")
+                    except (ValueError, TypeError):
+                        discovered = str(r.get("discovered_at", ""))
+                html_rows.append(f"""<tr>
+                    <td><a class="ga-title" href="{url}" target="_blank" rel="noopener">{title}</a></td>
+                    <td><span class="ga-badge ga-badge-{status}">{badge_label}</span></td>
+                    <td class="ga-muted">{discovered}</td>
+                </tr>""")
+            table_html = f"""<table class="ga-table">
+                <thead><tr>
+                    <th>Title</th>
+                    <th>Status</th>
+                    <th>Discovered</th>
+                </tr></thead>
+                <tbody>{"".join(html_rows)}</tbody>
+            </table>"""
+            st.markdown(table_html, unsafe_allow_html=True)
         else:
             st.markdown(f"""
             <div class="empty-state">
@@ -709,80 +907,80 @@ def main():
                 ["all", "new", "eligible", "participated", "not_eligible", "expired", "skipped"]
             )
 
-        giveaways = get_giveaways() if status_filter == "all" else get_giveaways(status=status_filter)
+        giveaways = _cached_giveaways_display() if status_filter == "all" else _cached_giveaways_display(status=status_filter)
 
         if giveaways:
             df = pd.DataFrame(giveaways)
 
-            def sort_key(row):
-                country = row.get("country_restriction", "worldwide")
-                order = {"germany": 0, "dach": 1, "eu": 2, "worldwide": 3, "restricted": 4}
-                base = order.get(country, 5)
-                
-                if row.get("terms_checked"):
-                    excluded = row.get("terms_excluded", "")
-                    if excluded:
-                        excluded_list = [e.strip().lower() for e in excluded.split(",")]
-                        # Heavy penalty if Germany itself is excluded
-                        if "germany" in excluded_list:
-                            base += 20
-                        # Moderate penalty if only non-DACH/non-EU countries are excluded
-                        # (good sign -- means Germany is likely eligible)
-                        non_eu_countries = ["us", "uk", "canada", "australia", "japan", "china", "brazil", "india"]
-                        if not any(c in excluded_list for c in ["germany", "austria", "switzerland"]):
-                            if any(c in excluded_list for c in non_eu_countries):
-                                pass  # No penalty -- these exclusions don't affect Germany
-                
-                if not row.get("terms_checked"):
-                    base += 5
-                
-                return base
+            # Vectorized sorting: map country_restriction to numeric order
+            country_order = {"germany": 0, "dach": 1, "eu": 2, "worldwide": 3, "restricted": 4}
+            df["_country_score"] = df["country_restriction"].map(country_order).fillna(5)
 
-            df["_sort_order"] = df.apply(sort_key, axis=1)
-            df = df.sort_values("_sort_order").drop(columns=["_sort_order"])
+            # Penalty for Germany-excluded T&C
+            def _terms_penalty(row):
+                if row.get("terms_checked") and row.get("terms_excluded"):
+                    excluded_list = [e.strip().lower() for e in row["terms_excluded"].split(",")]
+                    if "germany" in excluded_list:
+                        return 20
+                return 0
+            df["_terms_penalty"] = df.apply(_terms_penalty, axis=1)
 
-            def status_badge(status):
-                badges = {
-                    "new": "New",
-                    "eligible": "Eligible",
-                    "participated": "Participated",
-                    "not_eligible": "Not Eligible",
-                    "expired": "Expired",
-                    "skipped": "Skipped",
-                }
-                return badges.get(status, status)
+            # Penalty for unchecked T&C
+            df["_unchecked_penalty"] = (~df["terms_checked"].astype(bool)).astype(int) * 5
 
-            def terms_status(row):
-                if row.get("terms_checked"):
-                    excluded = row.get("terms_excluded", "")
-                    if excluded:
-                        return f"Excluded: {excluded}"
-                    return "✓ Checked"
-                return "✗ Not Checked"
+            df["_sort_order"] = df["_country_score"] + df["_terms_penalty"] + df["_unchecked_penalty"]
+            df = df.sort_values("_sort_order").drop(columns=["_sort_order", "_country_score", "_terms_penalty", "_unchecked_penalty"])
 
-            df["Status"] = df["status"].apply(status_badge)
-            df["T&C"] = df.apply(terms_status, axis=1)
-            df["Win Chance"] = df.apply(
-                lambda r: format_probability(r["win_probability"]) if r["total_entries"] > 0 else "—",
-                axis=1
-            )
+            # Status badge mapping
+            badge_labels = {
+                "new": "New", "eligible": "Eligible", "participated": "Participated",
+                "not_eligible": "Not Eligible", "expired": "Expired", "skipped": "Skipped",
+            }
 
-            display_cols = ["title", "source", "T&C", "Status", "Win Chance", "deadline", "url"]
-            available_cols = [c for c in display_cols if c in df.columns]
-            df_display = df[available_cols].copy()
-            df_display.columns = ["Title", "Source", "T&C", "Status", "Win Chance", "Deadline", "URL"]
+            # Build HTML table
+            html_rows = []
+            row_data = []  # keep track of (id, url, title) for the remove buttons
+            for _, row in df.iterrows():
+                title = html_escape(row.get("title", "Untitled"))
+                url = html_escape(row.get("url", "#"), quote=True)
+                status = row.get("status", "new")
+                badge_label = badge_labels.get(status, status)
+                win_chance = format_probability(row["win_probability"]) if row.get("total_entries", 0) > 0 else "---"
+                deadline = html_escape(row.get("deadline", "") or "---")
 
-            st.dataframe(df_display, use_container_width=True, hide_index=True)
+                html_rows.append(f"""<tr>
+                    <td style="width:40px"></td>
+                    <td><a class="ga-title" href="{url}" target="_blank" rel="noopener">{title}</a></td>
+                    <td><span class="ga-badge ga-badge-{status}">{badge_label}</span></td>
+                    <td>{win_chance}</td>
+                    <td class="ga-muted">{deadline}</td>
+                </tr>""")
+                row_data.append((row["id"], row["url"], row.get("title", "")))
 
-            st.markdown("---")
-            for idx, row in df.iterrows():
-                col_title, col_btn = st.columns([6, 1])
-                with col_title:
-                    st.caption(f"**{row.get('title', '')[:50]}** - {row.get('url', '')[:60]}")
-                with col_btn:
-                    if st.button("✗", key=f"bl_{row['id']}"):
-                        add_to_blacklist(row["url"], "Manually blacklisted")
-                        st.rerun()
+            table_html = f"""<table class="ga-table">
+                <thead><tr>
+                    <th style="width:40px"></th>
+                    <th>Title</th>
+                    <th>Status</th>
+                    <th>Win Chance</th>
+                    <th>Deadline</th>
+                </tr></thead>
+                <tbody>{"".join(html_rows)}</tbody>
+            </table>"""
+            st.markdown(table_html, unsafe_allow_html=True)
+
+            # Render remove buttons using st.columns to keep them functional
+            # Group into a compact expander to avoid visual clutter
+            with st.expander("Remove giveaways", expanded=False):
+                for gid, gurl, gtitle in row_data:
+                    col_title, col_btn = st.columns([6, 1])
+                    with col_title:
+                        st.caption(f"{gtitle[:60]}")
+                    with col_btn:
+                        if st.button("✗", key=f"bl_{gid}"):
+                            add_to_blacklist(gurl, "Manually blacklisted")
+                            _cached_giveaways_display.clear()
+                            st.rerun()
 
             st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
             st.markdown('<div class="section-title">Actions</div>', unsafe_allow_html=True)
@@ -800,10 +998,12 @@ def main():
                     st.success(f"Checked T&C for {checked_count} giveaways!")
                     # Re-evaluate eligibility after T&C updates
                     scan_existing_entries()
+                    _cached_giveaways_display.clear()
                     st.rerun()
             with action_col2:
                 if st.button("🔄 Refresh Eligibility", use_container_width=True):
                     scan_existing_entries()
+                    _cached_giveaways_display.clear()
                     st.rerun()
             with action_col3:
                 if st.button("🗑️ Clear All Data", use_container_width=True):
@@ -814,6 +1014,7 @@ def main():
                         conn.execute("DELETE FROM giveaways")
                         conn.commit()
                         conn.close()
+                        _cached_giveaways_display.clear()
                         st.success("All data cleared!")
                         st.rerun()
 
@@ -945,6 +1146,9 @@ def main():
                             if result == "region_restricted":
                                 update_giveaway_status(g["id"], "not_eligible")
                                 st.error("Region restricted! This giveaway is not available in your country.")
+                            elif result == "ended":
+                                update_giveaway_status(g["id"], "expired")
+                                st.error("This competition has ended!")
                             elif result is True:
                                 update_giveaway_status(g["id"], "participated")
                                 st.success("Entered successfully!")
@@ -963,6 +1167,9 @@ def main():
                         if result == "region_restricted":
                             update_giveaway_status(g["id"], "not_eligible")
                             st.error(f"Region restricted: {g['title'][:60]}")
+                        elif result == "ended":
+                            update_giveaway_status(g["id"], "expired")
+                            st.error(f"Ended: {g['title'][:60]}")
                         elif result is True:
                             update_giveaway_status(g["id"], "participated")
                             st.success(f"Entered: {g['title'][:60]}")
@@ -1086,6 +1293,22 @@ def main():
             <p>Database file: <code>{os.path.join(os.path.dirname(__file__), 'giveaways.db')}</code></p>
         </div>
         """, unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        st.markdown('<div class="settings-section">', unsafe_allow_html=True)
+        st.markdown(f'<h3>{SVG_ICONS["link"]} Extension Import</h3>', unsafe_allow_html=True)
+        current_import_path = config.get("ndjson_import_path", "")
+        import_path = st.text_input(
+            "NDJSON import file path",
+            value=current_import_path,
+            placeholder="~/Downloads/gleam-links.ndjson",
+            help="Path to the NDJSON file exported by the Gleam Link Monitor extension. "
+                 "Links are auto-imported when the app starts. Leave empty to disable.",
+        )
+        if import_path != current_import_path:
+            config["ndjson_import_path"] = os.path.expanduser(import_path) if import_path else ""
+            save_config(config)
+            st.success("Import path updated!")
         st.markdown('</div>', unsafe_allow_html=True)
 
 

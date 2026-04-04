@@ -22,6 +22,16 @@ REGION_RESTRICTED_KEYWORDS = [
     "sorry, this promotion",
     "promotion is not available",
     "not available to you",
+    "sorry, this promotion is not available in your region",
+]
+
+ENDED_KEYWORDS = [
+    "this competition has ended",
+    "this giveaway has ended",
+    "this promotion has ended",
+    "competition has ended",
+    "giveaway has ended",
+    "entries are now closed",
 ]
 
 # ---------------------------------------------------------------------------
@@ -92,6 +102,13 @@ INCLUSION_KEYWORDS = [
     "limited to residents of",
     "eligible to residents of",
     "open only to individuals who are residents of",
+    # Common "open worldwide" / "open to" phrasing
+    "is open worldwide",
+    "open worldwide",
+    "sweepstakes is open to",
+    "giveaway is open to",
+    "contest is open to",
+    "promotion is open to",
     # German
     "nur offen für bewohner von",
     "nur offen für einwohner von",
@@ -173,6 +190,15 @@ TERMS_CONTAINER_SELECTORS = [
 def detect_region_restriction(page):
     page_text = page.inner_text("body")
     for keyword in REGION_RESTRICTED_KEYWORDS:
+        if keyword in page_text.lower():
+            return True
+    return False
+
+
+def detect_ended(page):
+    """Check if the giveaway page shows a 'competition ended' message."""
+    page_text = page.inner_text("body")
+    for keyword in ENDED_KEYWORDS:
         if keyword in page_text.lower():
             return True
     return False
@@ -421,6 +447,10 @@ def auto_enter_giveaway(url, callback=None):
             if detect_region_restriction(page):
                 emit("Region restriction detected! This giveaway is not available in your country.")
                 return "region_restricted", log
+
+            if detect_ended(page):
+                emit("This competition has ended!")
+                return "ended", log
 
             if detect_captcha(page):
                 emit("CAPTCHA detected! Please solve it manually in the opened browser...")

@@ -196,6 +196,36 @@ def update_terms_check(giveaway_id, checked, excluded_countries="", detected_reg
     conn.close()
 
 
+def get_giveaways_display(status=None, gleam_only=True, exclude_not_eligible=True):
+    """Optimized query that selects only the columns needed for table display."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cols = "id, title, url, status, win_probability, total_entries, deadline, country_restriction, terms_checked, terms_excluded, discovered_at"
+    base_query = f"SELECT {cols} FROM giveaways"
+    conditions = []
+    params = []
+
+    if gleam_only:
+        conditions.append("url LIKE 'https://gleam.io/%'")
+
+    if exclude_not_eligible and not status:
+        conditions.append("status != 'not_eligible'")
+
+    if status:
+        conditions.append("status = ?")
+        params.append(status)
+
+    if conditions:
+        base_query += " WHERE " + " AND ".join(conditions)
+
+    base_query += " ORDER BY discovered_at DESC"
+
+    cursor.execute(base_query, params)
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def get_stats(gleam_only=True):
     conn = get_connection()
     cursor = conn.cursor()
@@ -247,3 +277,52 @@ def delete_not_eligible():
     conn.commit()
     conn.close()
     return deleted
+
+
+def parse_deadline(deadline_text):
+    """Parse a deadline string into a datetime object.
+
+    Handles the gleamfinder/bestofgleam format:
+        "Friday 03 April 2026 at 22:59:59"
+
+    Returns None for empty strings or unparseable text.
+    """
+    if not deadline_text or not deadline_text.strip():
+        return None
+    text = deadline_text.strip()
+    # Primary format from gleamfinder/bestofgleam: "Friday 03 April 2026 at 22:59:59"
+    try:
+        return datetime.strptime(text, "%A %d %B %Y at %H:%M:%S")
+    except ValueError:
+        pass
+    # Fallback: try without day name in case format varies
+    try:
+        return datetime.strptime(text, "%d %B %Y at %H:%M:%S")
+    except ValueError:
+        pass
+    # Fallback: date only
+    try:
+        return datetime.strptime(text, "%d %B %Y")
+    except ValueError:
+        pass
+    return None
+
+
+def remove_expired_giveaways():
+    """Delete giveaways whose deadline has passed. Returns the count of removed rows."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, deadline FROM giveaways WHERE deadline != ''")
+    rows = cursor.fetchall()
+    now = datetime.now()
+    expired_ids = []
+    for row in rows:
+        dt = parse_deadline(row["deadline"])
+        if dt and dt < now:
+            expired_ids.append(row["id"])
+    if expired_ids:
+        placeholders = ",".join("?" for _ in expired_ids)
+        cursor.execute(f"DELETE FROM giveaways WHERE id IN ({placeholders})", expired_ids)
+    conn.commit()
+    conn.close()
+    return len(expired_ids)

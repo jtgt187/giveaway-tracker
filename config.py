@@ -18,6 +18,7 @@ DEFAULT_CONFIG = {
     "auto_enter_methods": ["click"],
     "min_delay": 3,
     "max_delay": 10,
+    "ndjson_import_path": "",
 }
 
 

@@ -12,5 +12,6 @@
     "click"
   ],
   "min_delay": 1,
-  "max_delay": 3
+  "max_delay": 3,
+  "ndjson_import_path": ""
 }

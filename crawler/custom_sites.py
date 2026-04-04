@@ -1,6 +1,6 @@
 from crawler.base import BaseCrawler
 from bs4 import BeautifulSoup
-from utils.country_check import detect_country_restriction
+from utils.country_check import detect_country_restriction, is_region_blocked, is_ended
 from utils.network import random_delay
 
 
@@ -41,6 +41,11 @@ class CustomSitesCrawler(BaseCrawler):
 
                     try:
                         gleam_html = self.get_page(url)
+                        # Skip region-blocked or ended giveaways
+                        if is_region_blocked(gleam_html):
+                            continue
+                        if is_ended(gleam_html):
+                            continue
                         gleam_country = detect_country_restriction(gleam_html)
                         if gleam_country != "worldwide":
                             country = gleam_country

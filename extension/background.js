@@ -32,18 +32,21 @@ chrome.storage.local.get(
 
 // ── Download helper ──────────────────────────────────────────────────
 
-function downloadNdjson(entries, filenameSuffix) {
+function downloadNdjson(entries) {
   return new Promise((resolve, reject) => {
     if (entries.length === 0) { reject(new Error('No links to export')); return; }
 
     const content = entries.map(l => JSON.stringify(l)).join('\n') + '\n';
-    const blob = new Blob([content], { type: 'application/x-ndjson' });
-    const url = URL.createObjectURL(blob);
+    // Service Workers (MV3) don't support URL.createObjectURL — use a data URI instead
+    const dataUrl = 'data:application/x-ndjson;base64,' + btoa(unescape(encodeURIComponent(content)));
+    const filename = 'gleam-links.ndjson';
 
-    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-    const filename = 'gleam-links-' + ts + (filenameSuffix ? '-' + filenameSuffix : '') + '.ndjson';
-
-    chrome.downloads.download({ url, filename, saveAs: true }, (downloadId) => {
+    chrome.downloads.download({
+      url: dataUrl,
+      filename,
+      saveAs: false,
+      conflictAction: 'overwrite'
+    }, (downloadId) => {
       if (chrome.runtime.lastError) {
         reject(chrome.runtime.lastError);
       } else {
@@ -60,7 +63,7 @@ function checkAutoExport() {
   const unexported = links.length - lastExportIndex;
   if (unexported >= autoExportThreshold) {
     const newEntries = links.slice(lastExportIndex);
-    downloadNdjson(newEntries, 'auto').then(() => {
+    downloadNdjson(newEntries).then(() => {
       lastExportIndex = links.length;
       persist();
     }).catch(e => {
@@ -112,7 +115,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ ok: false, error: 'No links collected' });
       return true;
     }
-    downloadNdjson(links, 'all').then(() => {
+    downloadNdjson(links).then(() => {
       lastExportIndex = links.length;
       persist();
       sendResponse({ ok: true });
@@ -129,7 +132,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ ok: false, error: 'No new links since last export' });
       return true;
     }
-    downloadNdjson(newEntries, 'new').then(() => {
+    downloadNdjson(newEntries).then(() => {
       lastExportIndex = links.length;
       persist();
       sendResponse({ ok: true, exported: newEntries.length });

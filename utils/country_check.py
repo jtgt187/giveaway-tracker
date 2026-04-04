@@ -71,6 +71,62 @@ RESTRICTED_KEYWORDS = [
     "restricted to",
 ]
 
+# Keywords indicating the giveaway page is region-blocked (gleam.io shows
+# a full-page message when your IP is not in an allowed region).
+REGION_BLOCKED_KEYWORDS = [
+    "sorry, this promotion is not available in your region",
+    "this promotion is not available in your region",
+    "not available in your region",
+    "promotion is not available in your country",
+    "not available in your country",
+]
+
+# Keywords indicating the giveaway/competition has ended.
+ENDED_KEYWORDS = [
+    "this competition has ended",
+    "this giveaway has ended",
+    "this promotion has ended",
+    "this sweepstakes has ended",
+    "competition has ended",
+    "giveaway has ended",
+    "promotion has ended",
+    "sweepstakes has ended",
+    "this competition is over",
+    "this giveaway is over",
+    "this promotion is over",
+    "contest has ended",
+    "this contest has ended",
+    "this contest is over",
+    "entries are now closed",
+    "entry period has ended",
+    "this campaign has ended",
+]
+
+
+def is_region_blocked(html_text):
+    """Check if a gleam.io page is region-blocked.
+
+    Gleam shows a ``massive-message`` div with text like
+    "Sorry, this promotion is not available in your region"
+    when the visitor's IP is outside the allowed countries.
+
+    Returns True if the page is region-blocked.
+    """
+    text = html_text.lower()
+    return any(kw in text for kw in REGION_BLOCKED_KEYWORDS)
+
+
+def is_ended(html_text):
+    """Check if a gleam.io giveaway has ended.
+
+    Gleam shows a ``massive-message`` div with text like
+    "This Competition has ended" when the giveaway is over.
+
+    Returns True if the giveaway has ended.
+    """
+    text = html_text.lower()
+    return any(kw in text for kw in ENDED_KEYWORDS)
+
 
 def detect_country_restriction(html_text):
     """Detect country/region restriction from page text.
