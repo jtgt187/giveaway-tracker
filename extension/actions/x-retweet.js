@@ -81,8 +81,8 @@
     retweetBtn.click();
     await sleep(1500);
 
-    // Click "Repost" in the dropdown menu
-    var menuItems = document.querySelectorAll('[role="menuitem"], [data-testid="retweetConfirm"]');
+    // Click "Repost" in the dropdown menu or confirmation sheet
+    var menuItems = document.querySelectorAll('[role="menuitem"], [data-testid="retweetConfirm"], [data-testid="confirmationSheetConfirm"]');
     var repostMenuItem = null;
     for (var j = 0; j < menuItems.length; j++) {
       var txt = (menuItems[j].textContent || '').trim().toLowerCase();
@@ -96,8 +96,19 @@
       repostMenuItem.click();
       await sleep(2000);
     } else {
-      // Menu might not have appeared; the button click alone might have toggled repost
-      await sleep(1000);
+      // Check for confirmation sheet as a separate step (sometimes appears after a delay)
+      await sleep(500);
+      var confirmBtn = document.querySelector('[data-testid="confirmationSheetConfirm"]');
+      if (confirmBtn) {
+        var confirmRect = confirmBtn.getBoundingClientRect();
+        if (confirmRect.width > 0 && confirmRect.height > 0) {
+          confirmBtn.click();
+          await sleep(2000);
+        }
+      } else {
+        // Menu might not have appeared; the button click alone might have toggled repost
+        await sleep(1000);
+      }
     }
 
     if (isAlreadyReposted()) {

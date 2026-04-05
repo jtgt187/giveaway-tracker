@@ -52,6 +52,13 @@
         text-align: center;
       }
       .settings input[type="number"]:focus { outline: none; border-color: #7c3aed; }
+      .settings .setting-row { margin-bottom: 6px; }
+      .settings input[type="checkbox"] {
+        accent-color: #7c3aed;
+        width: 14px;
+        height: 14px;
+        cursor: pointer;
+      }
 
       /* ── Auto-entry stats ── */
       .entry-stats { margin-top: 12px; border-top: 1px solid #2a2a4a; padding-top: 10px; }
@@ -140,11 +147,19 @@
     </div>
 
     <div class="settings">
-      <label>
-        Auto-export every
-        <input type="number" id="thresholdInput" min="0" max="9999" value="0" />
-        links (0 = off)
-      </label>
+      <div class="setting-row">
+        <label>
+          <input type="checkbox" id="prefetchToggle" checked />
+          Auto-fetch deadlines in background
+        </label>
+      </div>
+      <div class="setting-row">
+        <label>
+          Auto-export every
+          <input type="number" id="thresholdInput" min="0" max="9999" value="0" />
+          links (0 = off)
+        </label>
+      </div>
     </div>
 
     <div class="recent">

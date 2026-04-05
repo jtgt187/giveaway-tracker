@@ -217,9 +217,21 @@ class TestFindBrowserProfile:
         assert find_browser_profile() is None
 
     def test_chrome_profile_found_unix(self, monkeypatch):
+        import platform
         from entry.auto_enter import find_browser_profile
         monkeypatch.setattr(os, "name", "posix")
+        monkeypatch.setattr(platform, "system", lambda: "Linux")
         chrome_path = os.path.expanduser("~/.config/google-chrome")
+        monkeypatch.setattr(os.path, "exists", lambda p: p == chrome_path)
+        result = find_browser_profile()
+        assert result == chrome_path
+
+    def test_chrome_profile_found_macos(self, monkeypatch):
+        import platform
+        from entry.auto_enter import find_browser_profile
+        monkeypatch.setattr(os, "name", "posix")
+        monkeypatch.setattr(platform, "system", lambda: "Darwin")
+        chrome_path = os.path.expanduser("~/Library/Application Support/Google/Chrome")
         monkeypatch.setattr(os.path, "exists", lambda p: p == chrome_path)
         result = find_browser_profile()
         assert result == chrome_path

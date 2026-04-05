@@ -99,10 +99,12 @@ def add_to_blacklist(url, reason=""):
         with open(path, "a") as f:
             f.write(url + "\n")
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM giveaways WHERE url = ?", (url,))
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM giveaways WHERE url = ?", (url,))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_blacklist():
@@ -174,7 +176,7 @@ def add_giveaways_batch(giveaway_list):
                 now,
             ))
             new_count += cursor.rowcount
-        except Exception:
+        except sqlite3.IntegrityError:
             pass
     conn.commit()
     conn.close()
@@ -212,14 +214,18 @@ def get_giveaways(status=None, gleam_only=True, exclude_not_eligible=True):
 def update_giveaway_status(giveaway_id, status, notes=""):
     conn = get_connection()
     cursor = conn.cursor()
-    update_data = {
-        "status": status,
-        "entered_at": datetime.now().isoformat() if status == "participated" else "",
-        "notes": notes,
-    }
-    cursor.execute("""
-        UPDATE giveaways SET status = :status, entered_at = :entered_at, notes = :notes WHERE id = :id
-    """, {**update_data, "id": giveaway_id})
+    if status == "participated":
+        cursor.execute("""
+            UPDATE giveaways SET status = :status, entered_at = :entered_at, notes = :notes WHERE id = :id
+        """, {"status": status, "entered_at": datetime.now().isoformat(), "notes": notes, "id": giveaway_id})
+    elif notes:
+        cursor.execute("""
+            UPDATE giveaways SET status = :status, notes = :notes WHERE id = :id
+        """, {"status": status, "notes": notes, "id": giveaway_id})
+    else:
+        cursor.execute("""
+            UPDATE giveaways SET status = :status WHERE id = :id
+        """, {"status": status, "id": giveaway_id})
     conn.commit()
     conn.close()
 
@@ -355,6 +361,35 @@ def delete_not_eligible():
     conn.commit()
     conn.close()
     return deleted
+
+
+def get_unenriched_giveaways():
+    """Return giveaways that still need enrichment (missing deadline or unchecked T&C).
+
+    Returns a dict with two lists:
+      - 'missing_deadline': dicts with id/url for entries with empty deadline
+      - 'unchecked_terms':  dicts with id/url for entries with terms_checked = 0
+    Only includes giveaways that haven't been marked as not_eligible or expired.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    active_filter = "status NOT IN ('not_eligible', 'expired', 'skipped')"
+
+    cursor.execute(
+        f"SELECT id, url FROM giveaways WHERE (deadline = '' OR deadline IS NULL) AND {active_filter}"
+    )
+    missing_deadline = [dict(r) for r in cursor.fetchall()]
+
+    cursor.execute(
+        f"SELECT id, url FROM giveaways WHERE terms_checked = 0 AND {active_filter}"
+    )
+    unchecked_terms = [dict(r) for r in cursor.fetchall()]
+
+    conn.close()
+    return {
+        "missing_deadline": missing_deadline,
+        "unchecked_terms": unchecked_terms,
+    }
 
 
 def parse_deadline(deadline_text):

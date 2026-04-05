@@ -10,23 +10,21 @@ import json
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from database import init_db, add_giveaway, add_giveaways_batch, get_giveaways, get_giveaways_display, update_giveaway_status, get_stats, update_giveaway_entries, get_giveaway_by_url, delete_not_eligible, update_terms_check, add_to_blacklist, get_blacklist, remove_from_blacklist, remove_expired_giveaways, get_connection, update_giveaway_deadline
+from database import init_db, add_giveaway, add_giveaways_batch, get_giveaways, get_giveaways_display, update_giveaway_status, get_stats, update_giveaway_entries, get_giveaway_by_url, delete_not_eligible, update_terms_check, add_to_blacklist, get_blacklist, remove_from_blacklist, remove_expired_giveaways, get_connection, update_giveaway_deadline, get_unenriched_giveaways
 from config import load_config, save_config
 from entry.auto_enter import auto_enter_giveaway, check_giveaway_terms, check_giveaway_terms_batch, fetch_giveaway_deadlines_batch
 from utils.country_check import is_eligible_for_country, is_region_blocked, is_ended
 from utils.probability import format_probability
 
 init_db()
-# Note: expired giveaway cleanup moved to session-guarded startup in main()
-# to avoid running on every Streamlit rerun.
+# Expired giveaway cleanup runs on every page load in main() — it's a fast
+# indexed SQL DELETE so the overhead is negligible.
 
 
 @st.cache_data(ttl=5)
-def _cached_giveaways_display(status=None):
+def _cached_giveaways_display(status=None, exclude_not_eligible=True):
     """Cached wrapper for get_giveaways_display to avoid re-querying SQLite on every Streamlit rerun."""
-    if status:
-        return get_giveaways_display(status=status)
-    return get_giveaways_display()
+    return get_giveaways_display(status=status, exclude_not_eligible=exclude_not_eligible)
 
 
 st.set_page_config(
@@ -716,16 +714,83 @@ def scan_existing_entries():
     if not giveaways:
         return
     target_country = load_config().get("target_country", "germany")
-    conn = __import__("sqlite3").connect(
-        os.path.join(os.path.dirname(__file__), "giveaways.db")
-    )
-    cursor = conn.cursor()
-    for g in giveaways:
-        country = g.get("country_restriction", "worldwide")
-        new_status = "eligible" if is_eligible_for_country(country, target_country) else "not_eligible"
-        cursor.execute("UPDATE giveaways SET status = ? WHERE id = ?", (new_status, g["id"]))
-    conn.commit()
-    conn.close()
+    from database import get_connection
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        for g in giveaways:
+            country = g.get("country_restriction", "worldwide")
+            new_status = "eligible" if is_eligible_for_country(country, target_country) else "not_eligible"
+            cursor.execute("UPDATE giveaways SET status = ? WHERE id = ?", (new_status, g["id"]))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def run_enrichment_pipeline():
+    """Run the full enrichment pipeline: fetch deadlines, check T&C, scan eligibility.
+
+    This is called after import to ensure all giveaways have deadline and
+    eligibility data.  The browser extension may have already prefetched some
+    deadlines, so only entries still missing data are processed here.
+    """
+    unenriched = get_unenriched_giveaways()
+    missing_dl = unenriched["missing_deadline"]
+    unchecked_tc = unenriched["unchecked_terms"]
+
+    if not missing_dl and not unchecked_tc:
+        return
+
+    with st.status("Enriching giveaway data...", expanded=True) as status:
+        # Step 1: Fetch missing deadlines via Playwright
+        if missing_dl:
+            st.write(f"Fetching deadlines for {len(missing_dl)} giveaways...")
+            urls = [g["url"] for g in missing_dl]
+            url_to_id = {g["url"]: g["id"] for g in missing_dl}
+            try:
+                results = fetch_giveaway_deadlines_batch(urls)
+                updated = 0
+                for url, deadline_text in results:
+                    gid = url_to_id.get(url)
+                    if gid and deadline_text:
+                        update_giveaway_deadline(gid, deadline_text)
+                        updated += 1
+                st.write(f"Fetched {updated} deadline(s).")
+            except Exception as e:
+                st.write(f"Deadline fetch error: {e}")
+        else:
+            st.write("All deadlines already populated (extension prefetch).")
+
+        # Step 2: Check T&C for unchecked entries
+        if unchecked_tc:
+            st.write(f"Checking T&C for {len(unchecked_tc)} giveaways...")
+            urls = [g["url"] for g in unchecked_tc]
+            url_to_id = {g["url"]: g["id"] for g in unchecked_tc}
+            try:
+                results = check_giveaway_terms_batch(urls)
+                for url, excluded, detected_region in results:
+                    gid = url_to_id.get(url)
+                    if gid:
+                        excluded_str = ",".join(excluded) if excluded else ""
+                        update_terms_check(gid, True, excluded_str, detected_region)
+                st.write(f"Checked T&C for {len(results)} giveaways.")
+            except Exception as e:
+                st.write(f"T&C check error: {e}")
+        else:
+            st.write("All T&C already checked.")
+
+        # Step 3: Re-scan eligibility with updated data
+        st.write("Scanning eligibility...")
+        scan_existing_entries()
+
+        # Step 4: Remove any newly expired entries
+        removed = remove_expired_giveaways()
+        if removed:
+            st.write(f"Removed {removed} expired giveaway(s).")
+
+        status.update(label="Enrichment complete", state="complete", expanded=False)
+
+    _cached_giveaways_display.clear()
 
 
 def _check_accounts_status():
@@ -855,6 +920,7 @@ def import_ndjson_links():
 
     batch = []
     errors = []
+    successfully_read = []
     for filepath in files:
         try:
             with open(filepath, "r", encoding="utf-8") as f:
@@ -878,6 +944,7 @@ def import_ndjson_links():
                             })
                     except json.JSONDecodeError:
                         continue
+            successfully_read.append(filepath)
         except OSError as e:
             errors.append(f"{os.path.basename(filepath)}: {e}")
 
@@ -886,8 +953,8 @@ def import_ndjson_links():
 
     imported = add_giveaways_batch(batch) if batch else 0
 
-    # Truncate each file after reading so links aren't re-processed
-    for filepath in files:
+    # Truncate only files that were fully and successfully read
+    for filepath in successfully_read:
         try:
             with open(filepath, "w", encoding="utf-8") as f:
                 pass
@@ -901,20 +968,21 @@ def import_ndjson_links():
 
 
 def main():
-    # Remove expired giveaways once per session (not on every rerun)
-    if "expired_cleaned" not in st.session_state:
-        removed = remove_expired_giveaways()
-        st.session_state.expired_cleaned = True
-        if removed:
-            print(f"[startup] Removed {removed} expired giveaway(s) from database")
+    # Optimistic removal: track IDs removed this session so they vanish
+    # instantly without waiting for the DB cache to refresh.
+    if "removed_giveaway_ids" not in st.session_state:
+        st.session_state.removed_giveaway_ids = set()
+
+    # Remove expired giveaways on every page load (fast indexed SQL query)
+    remove_expired_giveaways()
 
     # Auto-import links from the browser extension NDJSON file
     if "ndjson_imported" not in st.session_state:
         imported, msg = import_ndjson_links()
         st.session_state.ndjson_imported = imported
         if imported > 0:
-            # Run eligibility check on newly imported links
-            scan_existing_entries()
+            # Run full enrichment: deadlines, T&C, eligibility
+            run_enrichment_pipeline()
             st.toast(f"Imported {imported} new links from extension")
 
     st.markdown(f"""
@@ -1094,7 +1162,7 @@ def main():
             if st.button("Import from Extension", type="primary", use_container_width=True, key="dash_import"):
                 imported, msg = import_ndjson_links()
                 if imported > 0:
-                    scan_existing_entries()
+                    run_enrichment_pipeline()
                     st.toast(msg)
                     _cached_giveaways_display.clear()
                     st.rerun()
@@ -1157,13 +1225,22 @@ def main():
         @st.fragment
         def _render_giveaway_table():
             """Fragment-wrapped giveaway table — only this section reruns on X click."""
-            giveaways = _cached_giveaways_display() if status_filter == "all" else _cached_giveaways_display(status=status_filter)
+            giveaways = _cached_giveaways_display(exclude_not_eligible=False) if status_filter == "all" else _cached_giveaways_display(status=status_filter)
 
             if not giveaways:
                 st.caption("No giveaways found.")
                 return
 
             df = pd.DataFrame(giveaways)
+
+            # Optimistic removal: hide rows the user already clicked X on,
+            # even if the cached query still contains them.
+            removed = st.session_state.removed_giveaway_ids
+            if removed:
+                df = df[~df["id"].isin(removed)]
+            if df.empty:
+                st.caption("No giveaways found.")
+                return
 
             # Vectorized sorting: map country_restriction to numeric order
             country_order = {"germany": 0, "dach": 1, "eu": 2, "worldwide": 3, "restricted": 4}
@@ -1257,8 +1334,8 @@ def main():
                     col_remove, col_title, col_status, col_chance, col_deadline = st.columns([0.5, 5, 1.5, 1.2, 1.5])
                     with col_remove:
                         if st.button("✗", key=f"{key_prefix}bl_{gid}", help="Remove & blacklist"):
+                            st.session_state.removed_giveaway_ids.add(gid)
                             add_to_blacklist(url, "Manually blacklisted")
-                            _cached_giveaways_display.clear()
                             st.rerun(scope="fragment")
                     with col_title:
                         st.markdown(f'<a class="ga-title ga-clickable" href="{html_escape(url, quote=True)}" target="_blank" rel="noopener">{html_escape(title)}</a>', unsafe_allow_html=True)
@@ -1295,6 +1372,8 @@ def main():
                     st.markdown(f'<div class="section-title">Not Eligible ({len(df_not_eligible)})</div>', unsafe_allow_html=True)
                 with ne_action_col:
                     if st.button("🗑 Delete All Not Eligible", key="del_all_ne", use_container_width=True):
+                        ne_ids = set(df_not_eligible["id"].tolist())
+                        st.session_state.removed_giveaway_ids.update(ne_ids)
                         deleted = delete_not_eligible()
                         _cached_giveaways_display.clear()
                         st.success(f"Deleted {deleted} not-eligible giveaways.")
@@ -1304,7 +1383,7 @@ def main():
 
         _render_giveaway_table()
 
-        giveaways = _cached_giveaways_display() if status_filter == "all" else _cached_giveaways_display(status=status_filter)
+        giveaways = _cached_giveaways_display(exclude_not_eligible=False) if status_filter == "all" else _cached_giveaways_display(status=status_filter)
         if giveaways:
             st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
             st.markdown('<div class="section-title">Actions</div>', unsafe_allow_html=True)
@@ -1431,11 +1510,11 @@ def main():
                     with col1:
                         st.markdown(f"""
                         <div class="giveaway-card">
-                            <div class="giveaway-title">{g['title'][:80]}</div>
+                            <div class="giveaway-title">{html_escape(g['title'][:80])}</div>
                             <div class="giveaway-meta">
-                                <span>Source: {g['source']}</span>
-                                <span>Region: {g['country_restriction']}</span>
-                                {f'<span class="urgency-soon">{dl_text}</span>' if dl_text else ''}
+                                <span>Source: {html_escape(g['source'])}</span>
+                                <span>Region: {html_escape(g['country_restriction'])}</span>
+                                {f'<span class="urgency-soon">{html_escape(dl_text)}</span>' if dl_text else ''}
                             </div>
                         </div>
                         """, unsafe_allow_html=True)
@@ -1513,7 +1592,7 @@ def main():
                     log_class += " log-error"
                 elif "captcha" in entry.lower() or "timeout" in entry.lower():
                     log_class += " log-warning"
-                st.markdown(f'<div class="{log_class}">{entry}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="{log_class}">{html_escape(entry)}</div>', unsafe_allow_html=True)
 
     with tab_settings:
         st.markdown(f'<div class="section-title">{SVG_ICONS["settings"]} Settings</div>', unsafe_allow_html=True)
@@ -1530,11 +1609,13 @@ def main():
             "us": "United States",
             "uk": "United Kingdom",
         }
+        tc = config.get("target_country", "germany")
+        country_keys = list(countries.keys())
         selected_country = st.selectbox(
             "Your country for eligibility check",
-            options=list(countries.keys()),
+            options=country_keys,
             format_func=lambda x: countries[x],
-            index=list(countries.keys()).index(config.get("target_country", "germany"))
+            index=country_keys.index(tc) if tc in countries else 0
         )
         if selected_country != config.get("target_country"):
             config["target_country"] = selected_country

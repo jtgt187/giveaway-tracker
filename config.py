@@ -1,5 +1,6 @@
 import json
 import os
+import tempfile
 
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
 
@@ -27,28 +28,16 @@ def load_config():
             _config_cache = config
             return config.copy()
         except (json.JSONDecodeError, ValueError) as e:
-            # Config file is malformed (e.g. unescaped backslashes in Windows paths).
-            # Try to salvage by reading as raw text and fixing common issues.
+            # Config file is malformed — back up and start fresh.
+            # Previous "backslash fix" logic was removed because blindly doubling
+            # backslashes corrupts already-valid JSON escape sequences.
+            backup = CONFIG_PATH + ".bak"
             try:
-                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                    raw = f.read()
-                # Fix unescaped backslashes (common with Windows paths pasted manually)
-                fixed = raw.replace("\\", "\\\\")
-                saved = json.loads(fixed)
-                config = DEFAULT_CONFIG.copy()
-                config.update(saved)
-                # Re-save with proper escaping so this doesn't happen again
-                save_config(config)
-                return config.copy()
-            except (json.JSONDecodeError, ValueError, OSError):
-                # Completely broken -- back up and start fresh
-                backup = CONFIG_PATH + ".bak"
-                try:
-                    os.replace(CONFIG_PATH, backup)
-                except OSError:
-                    pass
-                _config_cache = DEFAULT_CONFIG.copy()
-                return DEFAULT_CONFIG.copy()
+                os.replace(CONFIG_PATH, backup)
+            except OSError:
+                pass
+            _config_cache = DEFAULT_CONFIG.copy()
+            return DEFAULT_CONFIG.copy()
     _config_cache = DEFAULT_CONFIG.copy()
     return DEFAULT_CONFIG.copy()
 
@@ -56,8 +45,20 @@ def load_config():
 def save_config(config):
     global _config_cache
     _config_cache = config.copy()
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
+    # Atomic write: write to temp file then rename, so a crash during
+    # json.dump can't leave a truncated/corrupt config.json.
+    config_dir = os.path.dirname(CONFIG_PATH) or "."
+    fd, tmp = tempfile.mkstemp(dir=config_dir, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, CONFIG_PATH)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def get_custom_sites():

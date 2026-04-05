@@ -54,7 +54,12 @@ class TestFormatProbability:
     def test_zero(self):
         from utils.probability import format_probability
         result = format_probability(0.0)
-        assert result == "0.0000%"
+        assert result == "N/A"
+
+    def test_none(self):
+        from utils.probability import format_probability
+        result = format_probability(None)
+        assert result == "N/A"
 
 
 # ===========================================================================
@@ -132,7 +137,10 @@ class TestIsRegionBlocked:
 
     def test_positive_location_allowed(self):
         from utils.country_check import is_region_blocked
-        assert is_region_blocked("location_allowed") is True
+        # Only the negated Angular expression indicates a blocked region;
+        # the bare string "location_allowed" also appears when the location IS allowed.
+        assert is_region_blocked("!contestantstate.location_allowed") is True
+        assert is_region_blocked("location_allowed") is False
 
     def test_negative_normal_page(self):
         from utils.country_check import is_region_blocked

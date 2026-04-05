@@ -265,19 +265,19 @@ def test_config_cache_returns_copy(tmp_config):
 # ---------------------------------------------------------------------------
 
 def test_load_config_backslash_recovery(tmp_config):
-    """Config with unescaped backslashes (Windows paths) should be recovered."""
+    """Config with unescaped backslashes (invalid JSON) should be backed up and reset to defaults."""
     import config as cfg
-    from config import load_config
+    from config import load_config, DEFAULT_CONFIG
 
-    # Write JSON with unescaped backslashes (common Windows path issue)
+    # Write JSON with unescaped backslashes (common Windows path issue) — invalid JSON
     with open(tmp_config, "w") as f:
         f.write('{"ndjson_import_dir": "C:\\Users\\test\\downloads"}')
 
     cfg._config_cache = None
     config = load_config()
-    # Should recover and contain the path (with proper escaping)
-    assert "ndjson_import_dir" in config
-    assert "Users" in config["ndjson_import_dir"]
+    # Malformed config is backed up and defaults are returned
+    assert config == DEFAULT_CONFIG
+    assert os.path.exists(tmp_config + ".bak")
 
 
 def test_load_config_creates_backup_on_irrecoverable(tmp_config):

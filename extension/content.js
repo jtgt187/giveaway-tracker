@@ -58,7 +58,13 @@
     'padding:8px 14px;border-radius:6px;font-size:12px;z-index:999999;' +
     'opacity:0.9;cursor:pointer;user-select:none;transition:opacity .3s;';
   indicator.title = 'Click to dismiss';
-  document.body.appendChild(indicator);
+
+  function appendIndicator() {
+    if (document.body && !indicator.parentNode) {
+      document.body.appendChild(indicator);
+    }
+  }
+  appendIndicator();
 
   // Click to hide/show the banner
   indicator.addEventListener('click', function() {
@@ -96,16 +102,21 @@
     // Update banner immediately with page-local count
     updateIndicator('Gleam: ' + pageCount + ' on this page');
 
-    chrome.runtime.sendMessage({
-      type: 'append',
-      href: normalized,
-      text: text || ''
-    }, function(response) {
-      // Badge update is handled by background.js — nothing to do here
-      if (chrome.runtime.lastError) {
-        console.warn('Gleam Monitor: sendMessage error', chrome.runtime.lastError.message);
-      }
-    });
+    try {
+      chrome.runtime.sendMessage({
+        type: 'append',
+        href: normalized,
+        text: text || ''
+      }, function(response) {
+        // Badge update is handled by background.js — nothing to do here
+        if (chrome.runtime.lastError) {
+          console.warn('Gleam Monitor: sendMessage error', chrome.runtime.lastError.message);
+        }
+      });
+    } catch (e) {
+      // Extension context invalidated (e.g. extension updated while tab is open)
+      console.warn('Gleam Monitor: extension context invalidated', e.message);
+    }
   }
 
   function extractFromHTML() {
@@ -146,6 +157,75 @@
     scanTextForGleamUrls();
   }
 
+  // Detect whether a URL string has been truncated by the search engine
+  // (e.g. "https://gleam.io/U90vi…" or "https://gleam.io/U90vi...")
+  function isTruncatedUrl(url) {
+    return url.includes('\u2026') || /\.{2,}$/.test(url);
+  }
+
+  // Given a DOM element that contains a truncated gleam.io URL, walk up the
+  // tree to find a parent or nearby <a> whose href contains the same gleam.io
+  // path prefix.  Returns the full href string or null.
+  //
+  // Typical Google DOM:
+  //   <a href="https://gleam.io/U90vi/full-slug">
+  //     <cite>gleam.io/U90vi…</cite>
+  //   </a>
+  function resolveFullUrl(el, partialUrl) {
+    // Extract the short path prefix (e.g. "/U90vi") from the truncated URL
+    // so we can match it against candidate <a> hrefs.
+    let pathPrefix;
+    try {
+      const u = new URL(partialUrl);
+      // Take the first path segment (the giveaway ID)
+      const seg = u.pathname.split('/').filter(Boolean)[0];
+      if (seg) pathPrefix = '/' + seg;
+    } catch (e) {
+      // partialUrl may not even parse — try a simple regex fallback
+      const m = partialUrl.match(/gleam\.io\/([A-Za-z0-9]{4,6})/);
+      if (m) pathPrefix = '/' + m[1];
+    }
+    if (!pathPrefix) return null;
+
+    // 1) Check if this element itself is inside an <a> with the full URL
+    const parentAnchor = el.closest('a[href*="gleam.io"]');
+    if (parentAnchor) {
+      try {
+        const href = new URL(parentAnchor.href).toString();
+        if (href.includes(pathPrefix) && isGleamUrl(href) && isGiveawayPath(href)) {
+          return normalizeGleamUrl(href);
+        }
+      } catch (e) {}
+    }
+
+    // 2) Walk up to the search-result container and look for any <a> with
+    //    a matching gleam.io href.  Search engines wrap each result in a
+    //    container element — we check common selectors then fall back to
+    //    walking up a few levels.
+    const resultContainer = el.closest(
+      '.g, .b_algo, .result, .dd, .Sr, [data-hveid], [data-sokoban-container]'
+    );
+    // Fallback: walk up a few levels, but avoid matching <body>/<html>
+    // which would scan the entire page and resolve to the wrong giveaway.
+    const fallback = el.parentElement?.parentElement?.parentElement;
+    const container = resultContainer ||
+      (fallback && fallback !== document.body && fallback !== document.documentElement ? fallback : null);
+
+    if (container) {
+      const anchors = container.querySelectorAll('a[href*="gleam.io"]');
+      for (const a of anchors) {
+        try {
+          const href = new URL(a.href).toString();
+          if (href.includes(pathPrefix) && isGleamUrl(href) && isGiveawayPath(href)) {
+            return normalizeGleamUrl(href);
+          }
+        } catch (e) {}
+      }
+    }
+
+    return null;
+  }
+
   // Scan plain text content for gleam.io URLs (search snippets, cite elements, etc.)
   // This catches URLs displayed as text in Google/Bing/DuckDuckGo search results
   // where the URL appears in the preview snippet but is not a clickable link.
@@ -179,6 +259,18 @@
       while ((match = GLEAM_TEXT_RE.exec(text)) !== null) {
         // Strip trailing punctuation that may have been captured
         let url = match[0].replace(/[.,;:!?)]+$/, '');
+
+        // Handle truncated URLs (e.g. "gleam.io/U90vi…" from Google previews)
+        if (isTruncatedUrl(url)) {
+          const resolved = resolveFullUrl(el, url);
+          if (resolved) {
+            const snippet = text.substring(0, 140).trim();
+            sendLink(resolved, snippet);
+          }
+          // Skip truncated URLs we can't resolve — they'd fail isGiveawayPath anyway
+          continue;
+        }
+
         if (isGleamUrl(url) && isGiveawayPath(url)) {
           const snippet = text.substring(0, 140).trim();
           sendLink(url, snippet);
@@ -200,6 +292,17 @@
     while ((match = BREADCRUMB_RE.exec(text)) !== null) {
       const pathPart = match[1].replace(/\s*›\s*/g, '/').replace(/[.,;:!?)]+$/, '');
       const url = 'https://gleam.io/' + pathPart;
+
+      // Handle truncated breadcrumbs (e.g. "gleam.io › U90vi…")
+      if (isTruncatedUrl(url)) {
+        const resolved = resolveFullUrl(contextEl, url);
+        if (resolved) {
+          const snippet = (contextEl ? contextEl.textContent || '' : text).substring(0, 140).trim();
+          sendLink(resolved, snippet);
+        }
+        continue;
+      }
+
       if (isGiveawayPath(url)) {
         const snippet = (contextEl ? contextEl.textContent || '' : text).substring(0, 140).trim();
         sendLink(url, snippet);
@@ -223,6 +326,7 @@
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {
+      appendIndicator();
       extractFromHTML();
       initObserver();
     });

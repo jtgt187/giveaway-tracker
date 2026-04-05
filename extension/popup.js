@@ -198,6 +198,7 @@ function updateEntryStats() {
 
 function getTimeAgo(isoString) {
   var diff = Date.now() - new Date(isoString).getTime();
+  if (isNaN(diff) || diff < 0) return 'unknown';
   var mins = Math.floor(diff / 60000);
   if (mins < 1) return 'just now';
   if (mins < 60) return mins + 'm ago';
@@ -224,6 +225,10 @@ function loadSettings() {
     if (chrome.runtime.lastError || !response) return;
     document.getElementById('thresholdInput').value = response.autoExportThreshold || 0;
   });
+  chrome.runtime.sendMessage({ type: 'get-prefetch-setting' }, function(response) {
+    if (chrome.runtime.lastError || !response) return;
+    document.getElementById('prefetchToggle').checked = response.prefetchDeadlines !== false;
+  });
 }
 
 function onThresholdChange() {
@@ -232,6 +237,16 @@ function onThresholdChange() {
     if (chrome.runtime.lastError) return;
     if (response && response.ok) {
       setStatus(val > 0 ? 'Auto-export every ' + val + ' links' : 'Auto-export disabled', 2000);
+    }
+  });
+}
+
+function onPrefetchToggle() {
+  var enabled = document.getElementById('prefetchToggle').checked;
+  chrome.runtime.sendMessage({ type: 'set-prefetch-setting', value: enabled }, function(response) {
+    if (chrome.runtime.lastError) return;
+    if (response && response.ok) {
+      setStatus(enabled ? 'Deadline prefetch enabled' : 'Deadline prefetch disabled', 2000);
     }
   });
 }
@@ -255,5 +270,6 @@ document.addEventListener('DOMContentLoaded', function() {
   document.getElementById('downloadBtn').addEventListener('click', downloadAll);
   document.getElementById('clearBtn').addEventListener('click', clearLinks);
   document.getElementById('thresholdInput').addEventListener('change', onThresholdChange);
+  document.getElementById('prefetchToggle').addEventListener('change', onPrefetchToggle);
   document.getElementById('resetStats').addEventListener('click', resetEntryStats);
 });

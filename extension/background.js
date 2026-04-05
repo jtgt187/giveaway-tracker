@@ -1,6 +1,7 @@
 let links = [];
 let lastExportIndex = 0;       // tracks how many links have been exported
 let autoExportThreshold = 0;   // 0 = disabled
+let prefetchDeadlines = true;  // auto-fetch deadlines in background tabs
 
 // -- Auto-entry session stats ----------------------------------------
 let entryStats = {
@@ -10,6 +11,10 @@ let entryStats = {
   failed: 0,
   total: 0,
 };
+
+// -- Deadline prefetch queue ------------------------------------------
+let deadlineQueue = [];
+let deadlinePrefetchRunning = false;
 
 // -- Platform action script mapping ----------------------------------
 // Keyed by `${platform}:${actionType}`, falling back to `${platform}:follow`
@@ -52,6 +57,7 @@ function persist() {
     gleam_links: links,
     gleam_last_export: lastExportIndex,
     gleam_auto_threshold: autoExportThreshold,
+    gleam_prefetch_deadlines: prefetchDeadlines,
     gleam_entry_stats: entryStats
   });
 }
@@ -65,11 +71,12 @@ function updateBadge() {
 // -- Restore state on startup -----------------------------------------
 
 chrome.storage.local.get(
-  ['gleam_links', 'gleam_last_export', 'gleam_auto_threshold', 'gleam_entry_stats'],
+  ['gleam_links', 'gleam_last_export', 'gleam_auto_threshold', 'gleam_prefetch_deadlines', 'gleam_entry_stats'],
   (result) => {
     if (result.gleam_links) links = result.gleam_links;
     if (typeof result.gleam_last_export === 'number') lastExportIndex = result.gleam_last_export;
     if (typeof result.gleam_auto_threshold === 'number') autoExportThreshold = result.gleam_auto_threshold;
+    if (typeof result.gleam_prefetch_deadlines === 'boolean') prefetchDeadlines = result.gleam_prefetch_deadlines;
     if (result.gleam_entry_stats) entryStats = result.gleam_entry_stats;
     updateBadge();
   }
@@ -91,7 +98,7 @@ function backgroundDownloadNdjson(entries) {
       url: dataUrl,
       filename: 'gleam-links.ndjson',
       saveAs: false,
-      conflictAction: 'overwrite'
+      conflictAction: 'uniquify'
     }, () => {
       if (chrome.runtime.lastError) {
         console.warn('Gleam Monitor: auto-export download error', chrome.runtime.lastError.message);
@@ -113,6 +120,72 @@ function checkAutoExport() {
     lastExportIndex = links.length;
     persist();
   }
+}
+
+// -- Deadline prefetch in background tabs -----------------------------
+
+/**
+ * Queue a link for background deadline prefetch.
+ * Only queues if prefetching is enabled and the link has no deadline yet.
+ */
+function queueDeadlinePrefetch(href) {
+  if (!prefetchDeadlines) return;
+  // Check if already has a deadline
+  const entry = links.find(l => l.href === href);
+  if (entry && entry.deadline) return;
+  // Don't queue duplicates
+  if (deadlineQueue.includes(href)) return;
+  deadlineQueue.push(href);
+  processDeadlineQueue();
+}
+
+/**
+ * Process the deadline prefetch queue one at a time.
+ * Opens each gleam URL in a hidden background tab so gleam-entry.js
+ * can auto-extract the deadline and send it back via update-giveaway-meta.
+ * Waits a random 8-15s between items to avoid rate limiting.
+ */
+async function processDeadlineQueue() {
+  if (deadlinePrefetchRunning) return; // Already processing
+  if (deadlineQueue.length === 0) return;
+
+  deadlinePrefetchRunning = true;
+
+  while (deadlineQueue.length > 0) {
+    const href = deadlineQueue.shift();
+
+    // Re-check: might already have a deadline by now (e.g. user visited the page)
+    const entry = links.find(l => l.href === href);
+    if (entry && entry.deadline) continue;
+
+    let tabId = null;
+    try {
+      // Open in a background tab — gleam-entry.js content script will auto-run
+      const tab = await chrome.tabs.create({ url: href, active: false });
+      tabId = tab.id;
+
+      // Wait for page load
+      await waitForTabLoad(tabId, 15000);
+
+      // Give gleam-entry.js time to parse the page and send metadata
+      await sleep(5000);
+
+    } catch (e) {
+      console.warn('[GleamMonitor] Deadline prefetch error for', href, e.message);
+    } finally {
+      if (tabId) {
+        try { await chrome.tabs.remove(tabId); } catch (e) {}
+      }
+    }
+
+    // Random delay 8-15s before the next one (appear more human, avoid rate limits)
+    if (deadlineQueue.length > 0) {
+      const delay = 8000 + Math.floor(Math.random() * 7000);
+      await sleep(delay);
+    }
+  }
+
+  deadlinePrefetchRunning = false;
 }
 
 // -- Social action tab orchestration ----------------------------------
@@ -296,6 +369,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       persist();
       updateBadge();
       checkAutoExport();
+      // Queue for background deadline prefetch
+      queueDeadlinePrefetch(msg.href);
     }
     sendResponse({ count: links.length });
     return true;
@@ -349,8 +424,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // -- Mark links as exported (called by popup after successful download) --
   if (msg.type === 'mark-exported') {
     const idx = parseInt(msg.upToIndex, 10);
-    if (idx > lastExportIndex) {
-      lastExportIndex = idx;
+    if (!isNaN(idx) && idx > lastExportIndex) {
+      lastExportIndex = Math.min(idx, links.length);
       persist();
     }
     sendResponse({ ok: true, lastExportIndex });
@@ -377,6 +452,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     autoExportThreshold = parseInt(msg.value, 10) || 0;
     persist();
     sendResponse({ ok: true, autoExportThreshold });
+    return true;
+  }
+
+  // -- Get / set deadline prefetch setting --
+  if (msg.type === 'get-prefetch-setting') {
+    sendResponse({ prefetchDeadlines });
+    return true;
+  }
+
+  if (msg.type === 'set-prefetch-setting') {
+    prefetchDeadlines = !!msg.value;
+    persist();
+    sendResponse({ ok: true, prefetchDeadlines });
     return true;
   }
 

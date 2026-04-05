@@ -424,12 +424,19 @@ def check_terms_conditions(page, url):
 
 
 def find_browser_profile():
+    import platform
     possible_paths = []
     if os.name == "nt":
         appdata = os.environ.get("LOCALAPPDATA", "")
         possible_paths.extend([
             os.path.join(appdata, "Google", "Chrome", "User Data"),
             os.path.join(appdata, "Microsoft", "Edge", "User Data"),
+        ])
+    elif platform.system() == "Darwin":
+        possible_paths.extend([
+            os.path.expanduser("~/Library/Application Support/Google/Chrome"),
+            os.path.expanduser("~/Library/Application Support/Microsoft Edge"),
+            os.path.expanduser("~/Library/Application Support/Chromium"),
         ])
     else:
         possible_paths.extend([
@@ -522,9 +529,11 @@ def auto_enter_giveaway(url, callback=None):
                     'a:has-text("Follow"), a:has-text("Visit"), a:has-text("Click")'
                 )
                 count = simple_methods.count()
+                entered_count = 0
                 for i in range(min(count, 5)):
                     try:
                         simple_methods.nth(i).click()
+                        entered_count += 1
                         emit(f"Completed entry method {i + 1}")
                         time.sleep(2)
 
@@ -535,8 +544,12 @@ def auto_enter_giveaway(url, callback=None):
                     except Exception as e:
                         emit(f"Entry method {i + 1} failed: {str(e)}")
 
-                emit("Entry completed successfully!")
-                return True, log
+                if entered_count > 0:
+                    emit("Entry completed successfully!")
+                    return True, log
+                else:
+                    emit("No entry methods were completed")
+                    return False, log
 
             except Exception as e:
                 emit(f"Error during auto-entry: {str(e)}")

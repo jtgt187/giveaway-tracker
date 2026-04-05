@@ -163,11 +163,13 @@
     if (lower.indexOf('view') !== -1) return 'view';
     if (lower.indexOf('watch') !== -1) return 'watch';
     if (lower.indexOf('retweet') !== -1) return 'retweet';
-    if (lower.indexOf('like') !== -1) return 'like';
+    // Check 'click' before 'like' to avoid false-matches in phrases like
+    // "click the link below" where "like" is a substring of "link".
+    if (lower.indexOf('click') !== -1 || lower.indexOf('enter') !== -1) return 'click';
+    if (/\blike\b/.test(lower)) return 'like';
     if (lower.indexOf('tweet') !== -1) return 'tweet';
     if (lower.indexOf('share') !== -1) return 'share';
     if (lower.indexOf('comment') !== -1) return 'comment';
-    if (lower.indexOf('click') !== -1 || lower.indexOf('enter') !== -1) return 'click';
     return 'unknown';
   }
 
@@ -523,7 +525,7 @@
     var textEl = document.getElementById('gae-progress-text');
 
     if (progressEl) progressEl.classList.add('active');
-    if (fillEl) fillEl.style.width = Math.round((current / total) * 100) + '%';
+    if (fillEl) fillEl.style.width = (total > 0 ? Math.round((current / total) * 100) : 0) + '%';
     if (textEl) textEl.textContent = text || (current + ' / ' + total);
   }
 

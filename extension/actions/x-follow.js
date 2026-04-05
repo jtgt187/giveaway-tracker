@@ -149,6 +149,16 @@
     followBtn.click();
     await sleep(2000);
 
+    // Handle confirmation sheet dialog (X sometimes shows "Follow @user" confirmation)
+    var confirmBtn = document.querySelector('[data-testid="confirmationSheetConfirm"]');
+    if (confirmBtn) {
+      var confirmRect = confirmBtn.getBoundingClientRect();
+      if (confirmRect.width > 0 && confirmRect.height > 0) {
+        confirmBtn.click();
+        await sleep(2000);
+      }
+    }
+
     // Verify the follow was successful
     if (isAlreadyFollowing()) {
       return { success: true, alreadyFollowing: false, platform: 'x' };
