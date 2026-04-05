@@ -696,3 +696,138 @@ def check_giveaway_terms_batch(urls, callback=None):
         return results
 
     return _run_in_thread(_do_batch)
+
+
+# ---------------------------------------------------------------------------
+# Deadline extraction
+# ---------------------------------------------------------------------------
+
+# CSS selectors where Gleam typically renders countdown/end-date info
+_DEADLINE_SELECTORS = [
+    '.countdown',
+    '.competition-countdown',
+    '.incentive-timer',
+    '.timer',
+    '.ends-at',
+    '.end-date',
+    '.competition-ends',
+    '[class*="countdown"]',
+    '[class*="timer"]',
+    '[class*="deadline"]',
+]
+
+# Regex patterns for dates near end-related keywords in page text
+_DEADLINE_TEXT_RE = re.compile(
+    r'(?:ends?|closing|closes?|deadline|expires?)[:\s]+'
+    r'(\w+\s+\d{1,2}\s+\w+\s+\d{4}(?:\s+at\s+\d{2}:\d{2}(?::\d{2})?)?)',
+    re.IGNORECASE,
+)
+
+_DEADLINE_DATE_NEAR_RE = re.compile(
+    r'(?:ends?|closing|closes?|deadline|expires?).{0,50}?'
+    r'(\d{1,2}\s+\w+\s+\d{4}(?:\s+at\s+\d{2}:\d{2}(?::\d{2})?)?)',
+    re.IGNORECASE,
+)
+
+
+def _extract_deadline_from_page(page):
+    """Extract a deadline string from the current Playwright page.
+
+    Tries Gleam-specific CSS selectors first, then falls back to regex
+    scanning of the page body text.
+    """
+    for sel in _DEADLINE_SELECTORS:
+        try:
+            el = page.query_selector(sel)
+            if el:
+                text = (el.text_content() or '').strip()
+                if len(text) > 3 and re.search(r'\d', text):
+                    return text
+        except Exception:
+            continue
+
+    # Fallback: regex scan of body text
+    try:
+        body_text = page.evaluate('document.body ? document.body.textContent : ""')
+    except Exception:
+        body_text = ''
+
+    m = _DEADLINE_TEXT_RE.search(body_text)
+    if m:
+        return m.group(1).strip()
+
+    m = _DEADLINE_DATE_NEAR_RE.search(body_text)
+    if m:
+        return m.group(1).strip()
+
+    return ''
+
+
+def fetch_giveaway_deadlines_batch(urls, callback=None):
+    """Fetch deadlines for multiple giveaway URLs using a single browser.
+
+    Returns:
+        list of (url, deadline_text) tuples.
+        deadline_text is an empty string if no deadline could be found.
+    """
+    if not urls:
+        return []
+
+    profile_path = find_browser_profile()
+
+    def emit(msg):
+        if callback:
+            callback(msg)
+
+    def _do_batch():
+        results = []
+
+        with sync_playwright() as p:
+            launch_args = {
+                "headless": False,
+                "args": [
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ],
+            }
+
+            if profile_path:
+                browser = p.chromium.launch_persistent_context(
+                    user_data_dir=profile_path,
+                    headless=False,
+                    args=launch_args["args"],
+                )
+                page = browser.pages[0] if browser.pages else browser.new_page()
+            else:
+                browser = p.chromium.launch(headless=False, args=launch_args["args"])
+                context = browser.new_context()
+                page = context.new_page()
+
+            try:
+                for i, url in enumerate(urls, 1):
+                    emit(f"[{i}/{len(urls)}] Fetching deadline: {url}")
+                    try:
+                        page.goto(url, wait_until="networkidle", timeout=30000)
+                        time.sleep(3)  # let the Gleam widget render
+
+                        deadline = _extract_deadline_from_page(page)
+                        if deadline:
+                            emit(f"  Deadline: {deadline}")
+                        else:
+                            emit(f"  No deadline found")
+
+                        results.append((url, deadline))
+                    except Exception as e:
+                        emit(f"  Error: {str(e)}")
+                        results.append((url, ''))
+            finally:
+                try:
+                    if hasattr(browser, 'close'):
+                        browser.close()
+                except Exception:
+                    pass
+
+        return results
+
+    return _run_in_thread(_do_batch)

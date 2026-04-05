@@ -88,9 +88,16 @@ def _save_blacklist(urls):
 
 
 def add_to_blacklist(url, reason=""):
-    blacklist = _load_blacklist()
-    blacklist.add(url)
-    _save_blacklist(blacklist)
+    global _blacklist_cache
+    # Use in-memory cache if available, avoid full file re-read
+    if _blacklist_cache is None:
+        _load_blacklist()
+    if url not in _blacklist_cache:
+        _blacklist_cache.add(url)
+        # Append-only write: O(1) instead of rewriting the entire file
+        path = _get_blacklist_path()
+        with open(path, "a") as f:
+            f.write(url + "\n")
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("DELETE FROM giveaways WHERE url = ?", (url,))
@@ -225,6 +232,15 @@ def update_giveaway_entries(giveaway_id, total_entries, your_entries):
     cursor.execute("""
         UPDATE giveaways SET total_entries = ?, your_entries = ?, win_probability = ? WHERE id = ?
     """, (total_entries, your_entries, prob, giveaway_id))
+    conn.commit()
+    conn.close()
+
+
+def update_giveaway_deadline(giveaway_id, deadline):
+    """Update the deadline field for a giveaway."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE giveaways SET deadline = ? WHERE id = ?", (deadline, giveaway_id))
     conn.commit()
     conn.close()
 

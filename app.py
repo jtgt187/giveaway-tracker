@@ -10,9 +10,9 @@ import json
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from database import init_db, add_giveaway, add_giveaways_batch, get_giveaways, get_giveaways_display, update_giveaway_status, get_stats, update_giveaway_entries, get_giveaway_by_url, delete_not_eligible, update_terms_check, add_to_blacklist, get_blacklist, remove_from_blacklist, remove_expired_giveaways, get_connection
+from database import init_db, add_giveaway, add_giveaways_batch, get_giveaways, get_giveaways_display, update_giveaway_status, get_stats, update_giveaway_entries, get_giveaway_by_url, delete_not_eligible, update_terms_check, add_to_blacklist, get_blacklist, remove_from_blacklist, remove_expired_giveaways, get_connection, update_giveaway_deadline
 from config import load_config, save_config
-from entry.auto_enter import auto_enter_giveaway, check_giveaway_terms, check_giveaway_terms_batch
+from entry.auto_enter import auto_enter_giveaway, check_giveaway_terms, check_giveaway_terms_batch, fetch_giveaway_deadlines_batch
 from utils.country_check import is_eligible_for_country, is_region_blocked, is_ended
 from utils.probability import format_probability
 
@@ -868,8 +868,14 @@ def import_ndjson_links():
                             continue
                         href = entry.get("href", "")
                         text = entry.get("text", "") or href
+                        deadline = entry.get("deadline", "")
                         if href and "gleam.io" in href:
-                            batch.append({"title": text, "url": href, "source": "extension"})
+                            batch.append({
+                                "title": text,
+                                "url": href,
+                                "source": "extension",
+                                "deadline": deadline,
+                            })
                     except json.JSONDecodeError:
                         continue
         except OSError as e:
@@ -1148,9 +1154,15 @@ def main():
                 ["all", "new", "eligible", "participated", "not_eligible", "expired", "skipped"]
             )
 
-        giveaways = _cached_giveaways_display() if status_filter == "all" else _cached_giveaways_display(status=status_filter)
+        @st.fragment
+        def _render_giveaway_table():
+            """Fragment-wrapped giveaway table — only this section reruns on X click."""
+            giveaways = _cached_giveaways_display() if status_filter == "all" else _cached_giveaways_display(status=status_filter)
 
-        if giveaways:
+            if not giveaways:
+                st.caption("No giveaways found.")
+                return
+
             df = pd.DataFrame(giveaways)
 
             # Vectorized sorting: map country_restriction to numeric order
@@ -1247,7 +1259,7 @@ def main():
                         if st.button("✗", key=f"{key_prefix}bl_{gid}", help="Remove & blacklist"):
                             add_to_blacklist(url, "Manually blacklisted")
                             _cached_giveaways_display.clear()
-                            st.rerun()
+                            st.rerun(scope="fragment")
                     with col_title:
                         st.markdown(f'<a class="ga-title ga-clickable" href="{html_escape(url, quote=True)}" target="_blank" rel="noopener">{html_escape(title)}</a>', unsafe_allow_html=True)
                     with col_status:
@@ -1286,13 +1298,17 @@ def main():
                         deleted = delete_not_eligible()
                         _cached_giveaways_display.clear()
                         st.success(f"Deleted {deleted} not-eligible giveaways.")
-                        st.rerun()
+                        st.rerun(scope="fragment")
                 with st.expander("Review not-eligible giveaways", expanded=False):
                     _render_giveaway_rows(df_not_eligible, key_prefix="ne_")
 
+        _render_giveaway_table()
+
+        giveaways = _cached_giveaways_display() if status_filter == "all" else _cached_giveaways_display(status=status_filter)
+        if giveaways:
             st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
             st.markdown('<div class="section-title">Actions</div>', unsafe_allow_html=True)
-            action_col1, action_col2, action_col3 = st.columns(3)
+            action_col1, action_col2, action_col3, action_col4 = st.columns(4)
             with action_col1:
                 if st.button("🔄 Check T&C", use_container_width=True):
                     unchecked = [g for g in giveaways if not g.get("terms_checked")]
@@ -1313,11 +1329,30 @@ def main():
                         _cached_giveaways_display.clear()
                         st.rerun()
             with action_col2:
+                if st.button("📅 Fetch Deadlines", use_container_width=True):
+                    missing_dl = [g for g in giveaways if not g.get("deadline")]
+                    if not missing_dl:
+                        st.info("All giveaways already have deadlines.")
+                    else:
+                        st.info(f"Fetching deadlines for {len(missing_dl)} giveaways...")
+                        missing_urls = [g["url"] for g in missing_dl]
+                        url_to_id = {g["url"]: g["id"] for g in missing_dl}
+                        results = fetch_giveaway_deadlines_batch(missing_urls)
+                        updated = 0
+                        for url, deadline_text in results:
+                            gid = url_to_id.get(url)
+                            if gid and deadline_text:
+                                update_giveaway_deadline(gid, deadline_text)
+                                updated += 1
+                        st.success(f"Found deadlines for {updated}/{len(results)} giveaways!")
+                        _cached_giveaways_display.clear()
+                        st.rerun()
+            with action_col3:
                 if st.button("🔄 Refresh Eligibility", use_container_width=True):
                     scan_existing_entries()
                     _cached_giveaways_display.clear()
                     st.rerun()
-            with action_col3:
+            with action_col4:
                 if st.session_state.get("confirm_clear_all"):
                     st.warning("This will delete all giveaway data. Are you sure?")
                     confirm_col1, confirm_col2 = st.columns(2)

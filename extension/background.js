@@ -272,6 +272,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ count: links.length });
         return true;
       }
+      // Only store giveaway/competition URLs, not FAQ/about/docs etc.
+      const path = u.pathname.replace(/\/+$/, '');
+      const isGiveaway =
+        /^\/(?:giveaways|competitions)\/[A-Za-z0-9]{4,6}$/.test(path) ||
+        /^\/[A-Za-z0-9]{4,6}\/[^/]+$/.test(path);
+      if (!isGiveaway) {
+        sendResponse({ count: links.length });
+        return true;
+      }
     } catch (e) {
       sendResponse({ count: links.length });
       return true;
@@ -289,6 +298,30 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       checkAutoExport();
     }
     sendResponse({ count: links.length });
+    return true;
+  }
+
+  // -- Update giveaway metadata (title + deadline) from gleam-entry.js --
+  if (msg.type === 'update-giveaway-meta') {
+    const idx = links.findIndex(l => l.href === msg.href);
+    if (idx !== -1) {
+      if (msg.deadline) links[idx].deadline = msg.deadline;
+      if (msg.title && msg.title.length > 3) links[idx].text = msg.title;
+      persist();
+    } else {
+      // The link might not have been collected yet (e.g. user navigated directly).
+      // Store it as a new entry with metadata.
+      links.push({
+        href: msg.href,
+        text: msg.title || '',
+        deadline: msg.deadline || '',
+        t: new Date().toISOString()
+      });
+      persist();
+      updateBadge();
+      checkAutoExport();
+    }
+    sendResponse({ ok: true });
     return true;
   }
 

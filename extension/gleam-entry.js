@@ -340,6 +340,89 @@
     return document.title || 'Gleam Giveaway';
   }
 
+  // Extract the giveaway deadline/end date from the Gleam widget.
+  // Gleam typically shows a countdown timer or an end-date element.
+  function extractDeadline() {
+    // Try common selectors for Gleam countdown/timer/end-date elements
+    var timerSelectors = [
+      '.countdown',
+      '.competition-countdown',
+      '.incentive-timer',
+      '.timer',
+      '.ends-at',
+      '.end-date',
+      '.competition-ends',
+      '[ng-bind*="countdown"]',
+      '[ng-bind*="end"]',
+      '[ng-bind*="timer"]',
+      '[class*="countdown"]',
+      '[class*="timer"]',
+      '[class*="deadline"]',
+    ];
+
+    for (var i = 0; i < timerSelectors.length; i++) {
+      var el = document.querySelector(timerSelectors[i]);
+      if (el) {
+        var text = (el.textContent || '').trim();
+        // Must contain something that looks like a date or time span
+        if (text.length > 3 && /\d/.test(text)) return text;
+      }
+    }
+
+    // Fallback: scan the page text for date patterns near "end" / "closes" / "deadline"
+    var body = document.body ? document.body.textContent || '' : '';
+
+    // Pattern: "Ends Friday 03 April 2026 at 22:59:59" or similar
+    var endDateMatch = body.match(
+      /(?:ends?|closing|closes?|deadline|expires?)[:\s]+(\w+\s+\d{1,2}\s+\w+\s+\d{4}(?:\s+at\s+\d{2}:\d{2}(?::\d{2})?)?)/i
+    );
+    if (endDateMatch) return endDateMatch[1].trim();
+
+    // Pattern: "03 April 2026" near end-related keywords (within 50 chars)
+    var dateNearEnd = body.match(
+      /(?:ends?|closing|closes?|deadline|expires?).{0,50}?(\d{1,2}\s+\w+\s+\d{4}(?:\s+at\s+\d{2}:\d{2}(?::\d{2})?)?)/i
+    );
+    if (dateNearEnd) return dateNearEnd[1].trim();
+
+    return '';
+  }
+
+  // Normalize a gleam URL (same logic as content.js)
+  function normalizeGleamUrl(urlStr) {
+    try {
+      var u = new URL(urlStr);
+      if (u.hostname.indexOf('gleam.io') !== -1) {
+        u.search = '';
+        u.hash = '';
+        return u.toString().replace(/\/+$/, '');
+      }
+      return urlStr;
+    } catch (e) {
+      return urlStr;
+    }
+  }
+
+  // Send giveaway metadata (title + deadline) to the background script
+  // so it can be stored alongside the link entry and exported in NDJSON.
+  function sendGiveawayMeta() {
+    var title = extractGiveawayTitle();
+    var deadline = extractDeadline();
+    var href = normalizeGleamUrl(location.href);
+
+    chrome.runtime.sendMessage({
+      type: 'update-giveaway-meta',
+      href: href,
+      title: title,
+      deadline: deadline,
+    }, function(response) {
+      if (chrome.runtime.lastError) {
+        console.warn('[GleamAutoEntry] sendGiveawayMeta error:', chrome.runtime.lastError.message);
+      } else {
+        console.log('[GleamAutoEntry] Metadata sent — title:', title, 'deadline:', deadline);
+      }
+    });
+  }
+
   // -- Overlay UI ------------------------------------------------------
 
   function createOverlay() {
@@ -848,6 +931,9 @@
 
     // Give the widget a moment to fully render
     await sleep(2000);
+
+    // Send giveaway metadata (title + deadline) to background for storage/export
+    sendGiveawayMeta();
 
     entryMethods = parseEntryMethods();
     console.log('[GleamAutoEntry] Found ' + entryMethods.length + ' entry methods.');

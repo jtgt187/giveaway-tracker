@@ -16,6 +16,25 @@
     }
   }
 
+  // Only accept actual giveaway/competition URLs, not FAQ/about/docs/login etc.
+  // Valid patterns:
+  //   /XXXXX/title-slug   (4-6 alphanum ID + slug)
+  //   /giveaways/XXXXX    (giveaways path + 4-6 char ID)
+  //   /competitions/XXXXX (competitions path + 4-6 char ID)
+  function isGiveawayPath(urlStr) {
+    try {
+      const u = new URL(urlStr);
+      const path = u.pathname.replace(/\/+$/, '');
+      // /giveaways/XXXXX or /competitions/XXXXX
+      if (/^\/(?:giveaways|competitions)\/[A-Za-z0-9]{4,6}$/.test(path)) return true;
+      // /XXXXX/any-slug (the most common gleam format)
+      if (/^\/[A-Za-z0-9]{4,6}\/[^/]+$/.test(path)) return true;
+      return false;
+    } catch (e) {
+      return false;
+    }
+  }
+
   // Normalize gleam URLs: strip query params and trailing slashes for better dedup
   function normalizeGleamUrl(urlStr) {
     try {
@@ -92,19 +111,21 @@
   function extractFromHTML() {
     const anchors = document.querySelectorAll('a[href*="gleam.io"]');
 
-    if (anchors.length === 0) {
-      updateIndicator('Gleam: No links');
-      return;
-    }
-
     anchors.forEach(a => {
       try {
         const url = new URL(a.href, location.href).toString();
-        if (!isGleamUrl(url)) return;
+        if (!isGleamUrl(url) || !isGiveawayPath(url)) return;
         const text = (a.textContent || '').trim();
         sendLink(url, text);
       } catch (e) {}
     });
+
+    // Also scan plain text for gleam.io URLs (search result snippets, etc.)
+    scanTextForGleamUrls();
+
+    if (pageCount === 0) {
+      updateIndicator('Gleam: No links');
+    }
   }
 
   function scanMutations() {
@@ -112,7 +133,7 @@
     anchors.forEach(a => {
       try {
         const url = new URL(a.href, location.href).toString();
-        if (!isGleamUrl(url)) return;
+        if (!isGleamUrl(url) || !isGiveawayPath(url)) return;
         const normalized = normalizeGleamUrl(url);
         if (!seenHref.has(normalized)) {
           const text = (a.textContent || '').trim();
@@ -120,11 +141,79 @@
         }
       } catch (e) {}
     });
+
+    // Also scan text content for URLs not wrapped in <a> tags
+    scanTextForGleamUrls();
+  }
+
+  // Scan plain text content for gleam.io URLs (search snippets, cite elements, etc.)
+  // This catches URLs displayed as text in Google/Bing/DuckDuckGo search results
+  // where the URL appears in the preview snippet but is not a clickable link.
+  function scanTextForGleamUrls() {
+    // Regex to match full gleam.io URLs in plain text
+    const GLEAM_TEXT_RE = /https?:\/\/(?:[\w-]+\.)*gleam\.io\/[^\s<>"')}\]]+/gi;
+
+    // Targeted containers: search engine snippets, cite elements, and common content areas.
+    // Scoped to avoid scanning the entire DOM for performance.
+    const containers = document.querySelectorAll(
+      // Google
+      '.VwiC3b, cite, .IsZvec, .st,' +
+      // Bing
+      '.b_caption, .b_snippet,' +
+      // DuckDuckGo
+      '.result__snippet, .result__url,' +
+      // Yahoo
+      '.compText,' +
+      // Generic content
+      'article, .post-body, .post-content, .entry-content,' +
+      'p, li, td, dd, blockquote'
+    );
+
+    containers.forEach(el => {
+      const text = el.textContent || '';
+      // Quick bail-out: skip elements that don't mention gleam.io at all
+      if (text.indexOf('gleam.io') === -1) return;
+
+      let match;
+      GLEAM_TEXT_RE.lastIndex = 0;
+      while ((match = GLEAM_TEXT_RE.exec(text)) !== null) {
+        // Strip trailing punctuation that may have been captured
+        let url = match[0].replace(/[.,;:!?)]+$/, '');
+        if (isGleamUrl(url) && isGiveawayPath(url)) {
+          const snippet = text.substring(0, 140).trim();
+          sendLink(url, snippet);
+        }
+      }
+
+      // Also check for breadcrumb-style URLs (gleam.io › giveaways › xxxxx)
+      scanBreadcrumbUrls(text, el);
+    });
+  }
+
+  // Convert breadcrumb-style URLs displayed by search engines:
+  //   "gleam.io › CkSGl › glampings-in-bloom" -> "https://gleam.io/CkSGl/glampings-in-bloom"
+  //   "gleam.io › giveaways › wyzeg"           -> "https://gleam.io/giveaways/wyzeg"
+  function scanBreadcrumbUrls(text, contextEl) {
+    // Match gleam.io followed by one or more › separated path segments
+    const BREADCRUMB_RE = /gleam\.io\s*›\s*(\S+(?:\s*›\s*\S+)*)/gi;
+    let match;
+    while ((match = BREADCRUMB_RE.exec(text)) !== null) {
+      const pathPart = match[1].replace(/\s*›\s*/g, '/').replace(/[.,;:!?)]+$/, '');
+      const url = 'https://gleam.io/' + pathPart;
+      if (isGiveawayPath(url)) {
+        const snippet = (contextEl ? contextEl.textContent || '' : text).substring(0, 140).trim();
+        sendLink(url, snippet);
+      }
+    }
   }
 
   function initObserver() {
+    let debounceTimer = null;
     const observer = new MutationObserver(() => {
-      scanMutations();
+      // Debounce: wait 300ms after last mutation before scanning
+      // to avoid excessive scanning during rapid DOM updates
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(scanMutations, 300);
     });
 
     if (document.body) {
