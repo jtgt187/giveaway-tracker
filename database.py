@@ -1,11 +1,81 @@
 import sqlite3
 import os
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
+from urllib.parse import urlparse
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "giveaways.db")
 
 # In-memory blacklist cache to avoid reading the file on every add_giveaway() call
 _blacklist_cache = None
+
+
+# ---------------------------------------------------------------------------
+# Title extraction & cleanup
+# ---------------------------------------------------------------------------
+
+def title_from_url_slug(url):
+    """Extract a clean, human-readable title from a Gleam URL slug.
+
+    Examples:
+        "https://gleam.io/jyldJ/aoc-easter-hunt-giveaway"
+            -> "AOC Easter Hunt Giveaway"
+        "https://gleam.io/abc/win-stuff"
+            -> "Win Stuff"
+
+    Returns an empty string if no slug can be extracted.
+    """
+    try:
+        parsed = urlparse(url)
+        parts = [p for p in parsed.path.strip("/").split("/") if p]
+        # Gleam URLs: /<id>/<slug>  or /giveaways/<id>
+        if len(parts) >= 2:
+            slug = parts[-1]
+        else:
+            return ""
+        # Skip if the slug looks like an ID (all alphanumeric, short)
+        if re.fullmatch(r"[A-Za-z0-9]{3,7}", slug):
+            return ""
+        # Convert slug to title: replace hyphens with spaces, title-case
+        title = slug.replace("-", " ").strip()
+        if not title:
+            return ""
+        return title.title()
+    except Exception:
+        return ""
+
+
+def clean_title(title, url=""):
+    """Clean up a giveaway title, removing noise from scraped link text.
+
+    Fixes:
+        - Trailing "New" badge from listing sites (e.g. "Giveaway XNew" -> "Giveaway X")
+        - Leading/trailing whitespace
+        - Titles that are just a raw URL -> extract slug title instead
+        - Excessively long snippet text (> 120 chars) -> use slug title
+
+    Returns the cleaned title, or a slug-derived title as fallback.
+    """
+    if not title:
+        return title_from_url_slug(url) if url else ""
+
+    title = title.strip()
+
+    # If title is a raw URL, use slug instead
+    if title.startswith("http://") or title.startswith("https://"):
+        return title_from_url_slug(title) or title_from_url_slug(url) or title
+
+    # Strip trailing "New" badge (case-sensitive: listing sites add literal "New")
+    if title.endswith("New") and len(title) > 4:
+        title = title[:-3].rstrip()
+
+    # If title is excessively long (likely a scraped snippet), prefer slug
+    if len(title) > 120 and url:
+        slug_title = title_from_url_slug(url)
+        if slug_title:
+            return slug_title
+
+    return title
 
 
 def get_connection():
@@ -395,30 +465,140 @@ def get_unenriched_giveaways():
 def parse_deadline(deadline_text):
     """Parse a deadline string into a datetime object.
 
-    Handles common deadline formats:
-        "Friday 03 April 2026 at 22:59:59"
+    Handles many common deadline formats:
+        "Friday 03 April 2026 at 22:59:59"    (Gleam primary)
+        "03 April 2026 at 22:59:59"            (without day name)
+        "03 April 2026"                         (date only)
+        "April 17, 2026"                        (US full month)
+        "Apr 17, 2026"                          (US abbreviated month)
+        "April 17, 2026 11:59 PM"               (US with 12-hour time)
+        "Apr 17, 2026 11:59 PM"                 (US abbreviated with 12-hour)
+        "April 17, 2026 at 23:59:59"            (US with 24-hour time)
+        "2026-04-17T23:59:59"                   (ISO 8601)
+        "2026-04-17"                             (ISO 8601 date only)
+        "17/04/2026"                             (DD/MM/YYYY)
+        "04/17/2026"                             (MM/DD/YYYY via heuristic)
+        "11 days"                                (relative countdown)
+        "11d 5h" / "2d 3h 15m"                   (compact countdown)
 
     Returns None for empty strings or unparseable text.
     """
     if not deadline_text or not deadline_text.strip():
         return None
     text = deadline_text.strip()
+
+    # ---- Exact strptime formats (most specific first) ----
+
     # Primary format: "Friday 03 April 2026 at 22:59:59"
-    try:
-        return datetime.strptime(text, "%A %d %B %Y at %H:%M:%S")
-    except ValueError:
-        pass
-    # Fallback: try without day name in case format varies
-    try:
-        return datetime.strptime(text, "%d %B %Y at %H:%M:%S")
-    except ValueError:
-        pass
-    # Fallback: date only
-    try:
-        return datetime.strptime(text, "%d %B %Y")
-    except ValueError:
-        pass
+    for fmt in (
+        "%A %d %B %Y at %H:%M:%S",   # Friday 03 April 2026 at 22:59:59
+        "%d %B %Y at %H:%M:%S",       # 03 April 2026 at 22:59:59
+        "%d %B %Y at %H:%M",          # 03 April 2026 at 22:59
+        "%d %B %Y",                    # 03 April 2026
+        "%B %d, %Y at %H:%M:%S",      # April 17, 2026 at 23:59:59
+        "%B %d, %Y at %H:%M",         # April 17, 2026 at 23:59
+        "%B %d, %Y %I:%M %p",         # April 17, 2026 11:59 PM
+        "%B %d, %Y %I:%M:%S %p",      # April 17, 2026 11:59:59 PM
+        "%B %d, %Y",                   # April 17, 2026
+        "%b %d, %Y at %H:%M:%S",      # Apr 17, 2026 at 23:59:59
+        "%b %d, %Y at %H:%M",         # Apr 17, 2026 at 23:59
+        "%b %d, %Y %I:%M %p",         # Apr 17, 2026 11:59 PM
+        "%b %d, %Y %I:%M:%S %p",      # Apr 17, 2026 11:59:59 PM
+        "%b %d, %Y",                   # Apr 17, 2026
+        "%Y-%m-%dT%H:%M:%S",          # 2026-04-17T23:59:59
+        "%Y-%m-%d %H:%M:%S",          # 2026-04-17 23:59:59
+        "%Y-%m-%d",                    # 2026-04-17
+    ):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+
+    # ---- DD/MM/YYYY or MM/DD/YYYY with slashes ----
+    slash_match = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", text)
+    if slash_match:
+        a, b, year = int(slash_match.group(1)), int(slash_match.group(2)), int(slash_match.group(3))
+        # If first number > 12, it must be DD/MM/YYYY
+        if a > 12 and 1 <= b <= 12:
+            try:
+                return datetime(year, b, a)
+            except ValueError:
+                pass
+        # If second number > 12, it must be MM/DD/YYYY
+        elif b > 12 and 1 <= a <= 12:
+            try:
+                return datetime(year, a, b)
+            except ValueError:
+                pass
+        # Ambiguous (both <= 12): assume DD/MM/YYYY (more common in Gleam's EU audience)
+        elif 1 <= a <= 31 and 1 <= b <= 12:
+            try:
+                return datetime(year, b, a)
+            except ValueError:
+                pass
+
+    # ---- Relative countdown text: "11 days", "2d 3h", "5h 30m" ----
+    countdown = _parse_countdown(text)
+    if countdown is not None:
+        return countdown
+
     return None
+
+
+# Pre-compiled patterns for countdown parsing
+_COUNTDOWN_FULL_RE = re.compile(
+    r"(\d+)\s*(?:days?|d)\b", re.IGNORECASE
+)
+_COUNTDOWN_HOURS_RE = re.compile(
+    r"(\d+)\s*(?:hours?|hrs?|h)\b", re.IGNORECASE
+)
+_COUNTDOWN_MINS_RE = re.compile(
+    r"(\d+)\s*(?:minutes?|mins?|m)\b", re.IGNORECASE
+)
+_COUNTDOWN_SECS_RE = re.compile(
+    r"(\d+)\s*(?:seconds?|secs?|s)\b", re.IGNORECASE
+)
+
+
+def _parse_countdown(text):
+    """Parse relative countdown text like '11 days', '2d 3h 15m' into an
+    absolute datetime (now + delta).
+
+    Only matches if the text contains at least one time-unit keyword
+    and looks like a countdown (not a random sentence containing 'days').
+    Returns a datetime or None.
+    """
+    # Must contain at least one digit followed by a time unit
+    if not re.search(r"\d+\s*(?:days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b", text, re.IGNORECASE):
+        return None
+
+    # Reject strings that are clearly not countdowns (contain non-countdown words)
+    # Allow simple patterns like "11 days", "2d 3h 15m", "Ends in 5 days"
+    stripped = re.sub(r"(?:ends?\s+in|remaining|left|only)\s*", "", text, flags=re.IGNORECASE).strip()
+
+    days = 0
+    hours = 0
+    minutes = 0
+    seconds = 0
+
+    m = _COUNTDOWN_FULL_RE.search(stripped)
+    if m:
+        days = int(m.group(1))
+    m = _COUNTDOWN_HOURS_RE.search(stripped)
+    if m:
+        hours = int(m.group(1))
+    m = _COUNTDOWN_MINS_RE.search(stripped)
+    if m:
+        minutes = int(m.group(1))
+    m = _COUNTDOWN_SECS_RE.search(stripped)
+    if m:
+        seconds = int(m.group(1))
+
+    total = timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds)
+    if total.total_seconds() == 0:
+        return None
+
+    return datetime.now() + total
 
 
 def remove_expired_giveaways():
@@ -439,3 +619,44 @@ def remove_expired_giveaways():
     conn.commit()
     conn.close()
     return len(expired_ids)
+
+
+def cleanup_titles():
+    """One-time cleanup of existing giveaway titles in the database.
+
+    Applies clean_title() to every row, fixing:
+        - Trailing "New" badges
+        - Raw URLs used as titles
+        - Excessively long snippet text
+
+    Returns the count of updated rows.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, title, url FROM giveaways")
+    rows = cursor.fetchall()
+    updated = 0
+    for row in rows:
+        old_title = row["title"]
+        new_title = clean_title(old_title, row["url"])
+        if new_title != old_title:
+            cursor.execute("UPDATE giveaways SET title = ? WHERE id = ?", (new_title, row["id"]))
+            updated += 1
+    conn.commit()
+    conn.close()
+    return updated
+
+
+def remove_non_gleam_giveaways():
+    """Delete giveaways whose URL is not on gleam.io.
+
+    These entries can never have deadlines fetched or ended status checked,
+    so they linger forever.  Returns the count of removed rows.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM giveaways WHERE url NOT LIKE 'https://gleam.io/%'")
+    removed = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return removed

@@ -696,3 +696,355 @@ def test_get_stats_gleam_only_filters(tmp_db):
 
     all_stats = get_stats(gleam_only=False)
     assert all_stats["total"] == 2
+
+
+# ---------------------------------------------------------------------------
+# title_from_url_slug  (Title extraction from URL)
+# ---------------------------------------------------------------------------
+
+def test_title_from_url_slug_basic():
+    from database import title_from_url_slug
+
+    result = title_from_url_slug("https://gleam.io/jyldJ/aoc-easter-hunt-giveaway")
+    assert result == "Aoc Easter Hunt Giveaway"
+
+
+def test_title_from_url_slug_simple():
+    from database import title_from_url_slug
+
+    result = title_from_url_slug("https://gleam.io/abc/win-stuff")
+    assert result == "Win Stuff"
+
+
+def test_title_from_url_slug_single_word():
+    from database import title_from_url_slug
+
+    result = title_from_url_slug("https://gleam.io/abc/giveaway")
+    assert result == "Giveaway"
+
+
+def test_title_from_url_slug_no_slug():
+    """URL with only an ID (no slug) should return empty string."""
+    from database import title_from_url_slug
+
+    result = title_from_url_slug("https://gleam.io/abc123")
+    assert result == ""
+
+
+def test_title_from_url_slug_giveaways_path():
+    """URLs like /giveaways/<id> should extract from last path segment."""
+    from database import title_from_url_slug
+
+    result = title_from_url_slug("https://gleam.io/giveaways/wyzeg")
+    # "wyzeg" is a short alphanumeric ID, should return empty
+    assert result == ""
+
+
+def test_title_from_url_slug_empty():
+    from database import title_from_url_slug
+
+    assert title_from_url_slug("") == ""
+    assert title_from_url_slug("not-a-url") == ""
+
+
+def test_title_from_url_slug_real_examples():
+    """Test with real gleam.io URLs from the database."""
+    from database import title_from_url_slug
+
+    assert title_from_url_slug("https://gleam.io/qzO90/cubot-easters-day-giveaway") == "Cubot Easters Day Giveaway"
+    assert title_from_url_slug("https://gleam.io/lFR5N/logitech-g-laystation-giveaway") == "Logitech G Laystation Giveaway"
+    assert title_from_url_slug("https://gleam.io/oAibF/the-ballin-backyard-giveaway-presented-by-solo-stove") == "The Ballin Backyard Giveaway Presented By Solo Stove"
+
+
+# ---------------------------------------------------------------------------
+# clean_title  (Title cleanup)
+# ---------------------------------------------------------------------------
+
+def test_clean_title_strips_trailing_new():
+    from database import clean_title
+
+    assert clean_title("Logitech G LAYSTATION GiveawayNew") == "Logitech G LAYSTATION Giveaway"
+    assert clean_title("Milwaukee Film FestivalNew") == "Milwaukee Film Festival"
+
+
+def test_clean_title_preserves_normal_title():
+    from database import clean_title
+
+    assert clean_title("Win a PlayStation 5") == "Win a PlayStation 5"
+    assert clean_title("AMD x Echo Guild: RWF Sweepstakes") == "AMD x Echo Guild: RWF Sweepstakes"
+
+
+def test_clean_title_raw_url_becomes_slug():
+    from database import clean_title
+
+    result = clean_title("https://gleam.io/abc/win-cool-stuff")
+    assert result == "Win Cool Stuff"
+
+
+def test_clean_title_empty_uses_url_slug():
+    from database import clean_title
+
+    result = clean_title("", "https://gleam.io/abc/aoc-easter-hunt-giveaway")
+    assert result == "Aoc Easter Hunt Giveaway"
+
+
+def test_clean_title_long_snippet_uses_slug():
+    from database import clean_title
+
+    long_text = "This is a very long snippet of text from a search engine result that describes the giveaway in detail but is not actually the title of the giveaway itself lorem ipsum"
+    result = clean_title(long_text, "https://gleam.io/abc/cool-giveaway")
+    assert result == "Cool Giveaway"
+
+
+def test_clean_title_none_with_url():
+    from database import clean_title
+
+    result = clean_title(None, "https://gleam.io/abc/some-giveaway")
+    assert result == "Some Giveaway"
+
+
+def test_clean_title_none_without_url():
+    from database import clean_title
+
+    result = clean_title(None)
+    assert result == ""
+
+
+def test_clean_title_new_only_short():
+    """Title 'New' alone (4 chars) should not be stripped (guard against over-stripping)."""
+    from database import clean_title
+
+    assert clean_title("New") == "New"
+
+
+# ---------------------------------------------------------------------------
+# parse_deadline  -- expanded formats
+# ---------------------------------------------------------------------------
+
+def test_parse_deadline_us_full_month():
+    from database import parse_deadline
+
+    dt = parse_deadline("April 17, 2026")
+    assert dt is not None
+    assert dt.year == 2026
+    assert dt.month == 4
+    assert dt.day == 17
+
+
+def test_parse_deadline_us_abbreviated_month():
+    from database import parse_deadline
+
+    dt = parse_deadline("Apr 17, 2026")
+    assert dt is not None
+    assert dt.year == 2026
+    assert dt.month == 4
+    assert dt.day == 17
+
+
+def test_parse_deadline_us_12_hour():
+    from database import parse_deadline
+
+    dt = parse_deadline("April 17, 2026 11:59 PM")
+    assert dt is not None
+    assert dt.year == 2026
+    assert dt.month == 4
+    assert dt.day == 17
+    assert dt.hour == 23
+    assert dt.minute == 59
+
+
+def test_parse_deadline_us_with_at():
+    from database import parse_deadline
+
+    dt = parse_deadline("April 17, 2026 at 23:59:59")
+    assert dt is not None
+    assert dt.year == 2026
+    assert dt.hour == 23
+    assert dt.minute == 59
+    assert dt.second == 59
+
+
+def test_parse_deadline_iso8601():
+    from database import parse_deadline
+
+    dt = parse_deadline("2026-04-17T23:59:59")
+    assert dt is not None
+    assert dt.year == 2026
+    assert dt.month == 4
+    assert dt.day == 17
+    assert dt.hour == 23
+
+
+def test_parse_deadline_iso8601_date_only():
+    from database import parse_deadline
+
+    dt = parse_deadline("2026-04-17")
+    assert dt is not None
+    assert dt.year == 2026
+    assert dt.month == 4
+    assert dt.day == 17
+
+
+def test_parse_deadline_iso8601_space():
+    from database import parse_deadline
+
+    dt = parse_deadline("2026-04-17 23:59:59")
+    assert dt is not None
+    assert dt.year == 2026
+    assert dt.hour == 23
+
+
+def test_parse_deadline_slash_dd_mm_yyyy():
+    from database import parse_deadline
+
+    dt = parse_deadline("17/04/2026")
+    assert dt is not None
+    assert dt.year == 2026
+    assert dt.month == 4
+    assert dt.day == 17
+
+
+def test_parse_deadline_slash_mm_dd_yyyy():
+    """When first number <= 12 and second > 12, treat as MM/DD/YYYY."""
+    from database import parse_deadline
+
+    dt = parse_deadline("04/17/2026")
+    assert dt is not None
+    assert dt.year == 2026
+    assert dt.month == 4
+    assert dt.day == 17
+
+
+def test_parse_deadline_countdown_days():
+    """Relative countdown like '11 days' should produce a future datetime."""
+    from database import parse_deadline
+    from datetime import datetime, timedelta
+
+    dt = parse_deadline("11 days")
+    assert dt is not None
+    # Should be roughly 11 days from now
+    expected = datetime.now() + timedelta(days=11)
+    diff = abs((dt - expected).total_seconds())
+    assert diff < 5  # within 5 seconds tolerance
+
+
+def test_parse_deadline_countdown_compact():
+    """Compact countdown like '2d 3h' should produce a future datetime."""
+    from database import parse_deadline
+    from datetime import datetime, timedelta
+
+    dt = parse_deadline("2d 3h")
+    assert dt is not None
+    expected = datetime.now() + timedelta(days=2, hours=3)
+    diff = abs((dt - expected).total_seconds())
+    assert diff < 5
+
+
+def test_parse_deadline_countdown_full():
+    """Full countdown like '5 days 12 hours 30 minutes' should work."""
+    from database import parse_deadline
+    from datetime import datetime, timedelta
+
+    dt = parse_deadline("5 days 12 hours 30 minutes")
+    assert dt is not None
+    expected = datetime.now() + timedelta(days=5, hours=12, minutes=30)
+    diff = abs((dt - expected).total_seconds())
+    assert diff < 5
+
+
+def test_parse_deadline_countdown_ends_in():
+    """Countdown with 'Ends in' prefix should work."""
+    from database import parse_deadline
+    from datetime import datetime, timedelta
+
+    dt = parse_deadline("Ends in 3 days")
+    assert dt is not None
+    expected = datetime.now() + timedelta(days=3)
+    diff = abs((dt - expected).total_seconds())
+    assert diff < 5
+
+
+def test_parse_deadline_countdown_zero_returns_none():
+    """A countdown with no recognized time units should return None."""
+    from database import parse_deadline
+
+    assert parse_deadline("0d 0h 0m") is None
+
+
+def test_parse_deadline_abbrev_month_12_hour():
+    from database import parse_deadline
+
+    dt = parse_deadline("Apr 17, 2026 11:59 PM")
+    assert dt is not None
+    assert dt.hour == 23
+    assert dt.minute == 59
+
+
+def test_parse_deadline_with_at_no_seconds():
+    from database import parse_deadline
+
+    dt = parse_deadline("03 April 2026 at 22:59")
+    assert dt is not None
+    assert dt.hour == 22
+    assert dt.minute == 59
+
+
+# ---------------------------------------------------------------------------
+# cleanup_titles  (One-time title fix)
+# ---------------------------------------------------------------------------
+
+def test_cleanup_titles_fixes_trailing_new(tmp_db):
+    from database import add_giveaway, get_giveaways, cleanup_titles
+
+    add_giveaway("Awesome GiveawayNew", "https://gleam.io/abc/awesome-giveaway", "test")
+    updated = cleanup_titles()
+    assert updated == 1
+
+    rows = get_giveaways(gleam_only=False, exclude_not_eligible=False)
+    assert rows[0]["title"] == "Awesome Giveaway"
+
+
+def test_cleanup_titles_preserves_good_titles(tmp_db):
+    from database import add_giveaway, cleanup_titles
+
+    add_giveaway("Win a PS5", "https://gleam.io/abc/win-ps5", "test")
+    updated = cleanup_titles()
+    assert updated == 0
+
+
+def test_cleanup_titles_fixes_url_titles(tmp_db):
+    from database import add_giveaway, get_giveaways, cleanup_titles
+
+    add_giveaway("https://gleam.io/abc/cool-giveaway", "https://gleam.io/abc/cool-giveaway", "test")
+    updated = cleanup_titles()
+    assert updated == 1
+
+    rows = get_giveaways(gleam_only=False, exclude_not_eligible=False)
+    assert rows[0]["title"] == "Cool Giveaway"
+
+
+# ---------------------------------------------------------------------------
+# remove_non_gleam_giveaways  (Cleanup non-gleam URLs)
+# ---------------------------------------------------------------------------
+
+def test_remove_non_gleam_giveaways(tmp_db):
+    from database import add_giveaway, get_giveaways, remove_non_gleam_giveaways
+
+    add_giveaway("Gleam", "https://gleam.io/abc/test", "test")
+    add_giveaway("Other", "https://giveawaydrop.com/test", "test")
+    add_giveaway("Another", "https://example.com/giveaway", "test")
+
+    removed = remove_non_gleam_giveaways()
+    assert removed == 2
+
+    rows = get_giveaways(gleam_only=False, exclude_not_eligible=False)
+    assert len(rows) == 1
+    assert rows[0]["url"] == "https://gleam.io/abc/test"
+
+
+def test_remove_non_gleam_giveaways_none_to_remove(tmp_db):
+    from database import add_giveaway, remove_non_gleam_giveaways
+
+    add_giveaway("Gleam", "https://gleam.io/abc/test", "test")
+    removed = remove_non_gleam_giveaways()
+    assert removed == 0

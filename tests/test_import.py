@@ -206,18 +206,53 @@ class TestImportNdjsonLinks:
         assert ndjson_path.read_text() == ""
 
     def test_text_fallback_when_missing(self, app_module, tmp_config, tmp_db, tmp_path):
-        """When 'text' key is missing, href should be used as title."""
+        """When 'text' key is missing, slug-derived title should be used."""
         from database import get_giveaways
 
         _setup_import_dir(
             tmp_path, None,
-            entries=[{"href": "https://gleam.io/notitle/test"}],
+            entries=[{"href": "https://gleam.io/notitle/cool-giveaway"}],
         )
 
         app_module.import_ndjson_links()
 
         rows = get_giveaways(gleam_only=False, exclude_not_eligible=False)
-        assert rows[0]["title"] == "https://gleam.io/notitle/test"
+        assert rows[0]["title"] == "Cool Giveaway"
+
+    def test_title_cleaned_on_import(self, app_module, tmp_config, tmp_db, tmp_path):
+        """Titles with trailing 'New' badge should be cleaned during import."""
+        from database import get_giveaways
+
+        _setup_import_dir(
+            tmp_path, None,
+            entries=[{"href": "https://gleam.io/abc/awesome-giveaway", "text": "Awesome GiveawayNew"}],
+        )
+
+        app_module.import_ndjson_links()
+
+        rows = get_giveaways(gleam_only=False, exclude_not_eligible=False)
+        assert rows[0]["title"] == "Awesome Giveaway"
+
+    def test_non_gleam_urls_rejected_strict(self, app_module, tmp_config, tmp_db, tmp_path):
+        """Non-gleam.io URLs that contain 'gleam.io' as substring should be rejected."""
+        from database import get_giveaways
+
+        _setup_import_dir(
+            tmp_path, None,
+            entries=[
+                {"href": "https://gleam.io/abc/real", "text": "Real"},
+                {"href": "https://notgleam.io/abc/fake", "text": "Fake"},
+                {"href": "https://giveawaydrop.com/gleam.io/test", "text": "Sneaky"},
+                {"href": "http://gleam.io/abc/http-only", "text": "HTTP"},
+            ],
+        )
+
+        count, msg = app_module.import_ndjson_links()
+        assert count == 1
+
+        rows = get_giveaways(gleam_only=False, exclude_not_eligible=False)
+        assert len(rows) == 1
+        assert rows[0]["url"] == "https://gleam.io/abc/real"
 
     def test_blank_lines_ignored(self, app_module, tmp_config, tmp_db, tmp_path):
         """Blank lines in the NDJSON file should be silently skipped."""
