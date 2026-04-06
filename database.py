@@ -11,12 +11,46 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "giveaways.db")
 _blacklist_cache = None
 _blacklist_lock = threading.Lock()
 
-
 # ---------------------------------------------------------------------------
 # Title extraction & cleanup
 # ---------------------------------------------------------------------------
 
-def title_from_url_slug(url):
+# Status messages that gleam.io displays instead of a real title when the
+# competition is paused, ended, or otherwise unavailable.  Matched
+# case-insensitively against extracted titles.
+BAD_TITLES = {
+    "competition paused",
+    "competition ended",
+    "competition has ended",
+    "this competition has ended",
+    "this giveaway has ended",
+    "this promotion has ended",
+    "giveaway ended",
+    "giveaway has ended",
+    "entries are now closed",
+    "gleam giveaway",
+}
+
+
+def _is_bad_title(title):
+    """Return True if *title* is a known status/placeholder message."""
+    return title.strip().lower() in BAD_TITLES
+
+
+def _extract_gleam_id(url):
+    """Return the short alphanumeric giveaway ID from a Gleam URL, or ''."""
+    try:
+        parsed = urlparse(url)
+        parts = [p for p in parsed.path.strip("/").split("/") if p]
+        for part in parts:
+            if re.fullmatch(r"[A-Za-z0-9]{3,7}", part):
+                return part
+    except Exception:
+        pass
+    return ""
+
+
+def title_from_url_slug(url, id_fallback=False):
     """Extract a clean, human-readable title from a Gleam URL slug.
 
     Examples:
@@ -25,7 +59,11 @@ def title_from_url_slug(url):
         "https://gleam.io/abc/win-stuff"
             -> "Win Stuff"
 
-    Returns an empty string if no slug can be extracted.
+    When *id_fallback* is True and no human-readable slug is found, return
+    the short giveaway ID (e.g. ``"VPItO"``) instead of an empty string.
+    This is useful as a last-resort title so the entry isn't completely blank.
+
+    Returns an empty string if no slug can be extracted (unless *id_fallback*).
     """
     try:
         parsed = urlparse(url)
@@ -33,10 +71,15 @@ def title_from_url_slug(url):
         # Gleam URLs: /<id>/<slug>  or /giveaways/<id>
         if len(parts) >= 2:
             slug = parts[-1]
+        elif len(parts) == 1 and parsed.netloc:
+            # Single-segment path (e.g. "https://gleam.io/VPItO")
+            slug = parts[0]
         else:
             return ""
         # Skip if the slug looks like an ID (all alphanumeric, short)
         if re.fullmatch(r"[A-Za-z0-9]{3,7}", slug):
+            if id_fallback:
+                return slug
             return ""
         # Convert slug to title: replace hyphens with spaces, title-case
         title = slug.replace("-", " ").strip()
@@ -54,18 +97,31 @@ def clean_title(title, url=""):
         - Trailing "New" badge from listing sites (e.g. "Giveaway XNew" -> "Giveaway X")
         - Leading/trailing whitespace
         - Titles that are just a raw URL -> extract slug title instead
+        - Breadcrumb-style search-engine titles (e.g. "https://gleam.io > giveaways > VPItO")
+        - Known status-message titles (e.g. "Competition paused")
         - Excessively long snippet text (> 120 chars) -> use slug title
 
     Returns the cleaned title, or a slug-derived title as fallback.
     """
     if not title:
-        return title_from_url_slug(url) if url else ""
+        return title_from_url_slug(url, id_fallback=True) if url else ""
 
     title = title.strip()
 
     # If title is a raw URL, use slug instead
     if title.startswith("http://") or title.startswith("https://"):
-        return title_from_url_slug(title) or title_from_url_slug(url) or title
+        return title_from_url_slug(title) or title_from_url_slug(url, id_fallback=True) or title
+
+    # Breadcrumb-style title from search engines (e.g. "gleam.io > giveaways > VPItO")
+    if "\u203a" in title:
+        slug_title = title_from_url_slug(url, id_fallback=True)
+        if slug_title:
+            return slug_title
+        # Can't salvage — fall through to return the breadcrumb as-is
+
+    # Reject known status-message titles in favour of the URL slug
+    if _is_bad_title(title):
+        return title_from_url_slug(url, id_fallback=True) or ""
 
     # Strip trailing "New" badge (case-sensitive: listing sites add literal "New")
     if title.endswith("New") and len(title) > 4:

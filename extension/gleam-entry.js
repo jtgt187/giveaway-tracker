@@ -322,6 +322,29 @@
 
   // -- Giveaway Info Extraction ----------------------------------------
 
+  // Status messages that Gleam shows instead of a real title when the
+  // competition is paused, ended, or unavailable.  Matched case-insensitively.
+  var BAD_TITLES = [
+    'competition paused',
+    'competition ended',
+    'competition has ended',
+    'this competition has ended',
+    'this giveaway has ended',
+    'this promotion has ended',
+    'giveaway ended',
+    'giveaway has ended',
+    'entries are now closed',
+    'gleam giveaway',
+  ];
+
+  function isBadTitle(text) {
+    var lower = text.toLowerCase();
+    for (var i = 0; i < BAD_TITLES.length; i++) {
+      if (lower === BAD_TITLES[i]) return true;
+    }
+    return false;
+  }
+
   function extractGiveawayTitle() {
     var selectors = [
       '.competition-title',
@@ -336,11 +359,15 @@
       var el = document.querySelector(selectors[i]);
       if (el) {
         var text = (el.textContent || '').trim();
-        if (text.length > 3) return text;
+        if (text.length > 3 && !isBadTitle(text)) return text;
       }
     }
 
-    return document.title || 'Gleam Giveaway';
+    // Fallback: document.title (also filtered)
+    var docTitle = (document.title || '').trim();
+    if (docTitle.length > 3 && !isBadTitle(docTitle)) return docTitle;
+
+    return '';
   }
 
   // Extract the giveaway deadline/end date from the Gleam widget.

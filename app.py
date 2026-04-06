@@ -166,7 +166,7 @@ class EnrichmentWorker:
 
         total = len(unenriched)
         total_work = total + 1  # +1 for eligibility scan
-        completed = [0]  # mutable counter for callback
+        completed = [0]  # mutable counter for callback (thread-safe via worker lock)
 
         self._set_step(f"Enriching (0/{total})...", 0)
         urls = [g["url"] for g in unenriched]

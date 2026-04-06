@@ -301,15 +301,16 @@
       if (isTruncatedUrl(url)) {
         const resolved = resolveFullUrl(contextEl, url);
         if (resolved) {
-          const snippet = (contextEl ? contextEl.textContent || '' : text).substring(0, 140).trim();
-          sendLink(resolved, snippet);
+          sendLink(resolved, '');
         }
         continue;
       }
 
       if (isGiveawayPath(url)) {
-        const snippet = (contextEl ? contextEl.textContent || '' : text).substring(0, 140).trim();
-        sendLink(url, snippet);
+        // Don't send breadcrumb text as a title — it's noise like
+        // "gleam.io > giveaways > VPItO".  The real title will come from
+        // the background prefetch or URL slug extraction.
+        sendLink(url, '');
       }
     }
   }

@@ -17,6 +17,7 @@ import re
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from database import (
+    _is_bad_title,
     add_giveaway,
     clean_title,
     get_giveaway_by_url,
@@ -194,10 +195,14 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 # Update title if provided and better than current
                 cleaned = clean_title(title, href)
-                if cleaned and len(cleaned) > 3:
+                if cleaned and len(cleaned) > 3 and not _is_bad_title(cleaned):
                     current = existing.get('title', '')
-                    # Replace if current is empty, a URL, or shorter
-                    if not current or current.startswith('http') or len(cleaned) > len(current):
+                    # Replace if current is empty, a URL, a bad status message,
+                    # or the cleaned title is longer (and not a status message)
+                    if (not current
+                            or current.startswith('http')
+                            or _is_bad_title(current)
+                            or len(cleaned) > len(current)):
                         updates.append('title = ?')
                         params.append(cleaned)
 

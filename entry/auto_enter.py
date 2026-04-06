@@ -4,6 +4,7 @@ import time
 import os
 import re
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, Future
 from playwright.sync_api import sync_playwright
 
@@ -198,8 +199,12 @@ TERMS_SELECTORS = [
     "a[ng-click*='ermsAndConditions']",
     # Gleam T&C heading that also acts as a toggle
     "h2.entry-heading--toc",
-    # Gleam data-track attribute
+    # Gleam data-track attribute (embedded giveaways use ###APP_NAME### Click|Terms)
     "a[data-track-event*='Terms']",
+    # Embedded giveaway button with data-hide (toggles .popup-block container)
+    "a[data-hide*='popup-block']",
+    # German-language Gleam pages
+    "a:has-text('Teilnahmebedingungen')",
     # Generic Angular ng-click for terms
     "a[ng-click*='terms']",
     "a[ng-click*='Terms']",
@@ -224,6 +229,8 @@ TERMS_CONTAINER_SELECTORS = [
     ".user-fragment[ng-bind-html*='terms_and_conditions']",
     ".user-fragment",
     "div[ng-show*='showTermsAndConditions']",
+    # Embedded giveaways: popup-block container toggled via data-hide attribute
+    ".popup-block",
     ".terms-content",
     ".competition-terms",
     ".modal-body",
@@ -784,15 +791,147 @@ def _extract_deadline_from_page(page):
 
 
 # ---------------------------------------------------------------------------
-# Combined batch enrichment
+# Combined batch enrichment (parallel workers)
 # ---------------------------------------------------------------------------
 
-def enrich_giveaways_batch(urls, on_result=None, callback=None):
-    """Enrich multiple giveaway URLs in a single browser session.
+# Number of browser instances to run concurrently during enrichment.
+ENRICHMENT_WORKERS = 4
 
-    Visits each URL once and extracts deadline, T&C, and ended/region
-    status in one pass.  Uses a fresh browser (no persistent context)
-    to avoid profile-lock errors when the user's browser is open.
+
+def _enrich_single_url(page, url, emit):
+    """Enrich one URL on an already-loaded *page*.  Returns a result dict."""
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        time.sleep(3)  # let the Gleam widget render
+
+        # -- Ended / region-blocked (fast text checks) --
+        ended = detect_ended(page)
+        region_blocked = detect_region_restriction(page)
+
+        if ended:
+            emit(f"  Ended")
+        if region_blocked:
+            emit(f"  Region blocked")
+
+        # -- Deadline --
+        deadline = ''
+        if not ended and not region_blocked:
+            deadline = _extract_deadline_from_page(page)
+            if deadline:
+                emit(f"  Deadline: {deadline}")
+
+        # -- T&C --
+        excluded = []
+        region = None
+        if not ended and not region_blocked:
+            excluded, region = check_terms_conditions(page, url)
+            if excluded:
+                emit(f"  Excluded: {', '.join(excluded)}")
+            if region:
+                emit(f"  Region: {region}")
+
+        if not ended and not region_blocked and not excluded and not region and not deadline:
+            emit(f"  No restrictions or deadline found")
+
+        return {
+            "url": url,
+            "deadline": deadline,
+            "excluded": excluded,
+            "region": region,
+            "ended": ended,
+            "region_blocked": region_blocked,
+        }
+
+    except Exception as e:
+        emit(f"  Error: {str(e)}")
+        return {
+            "url": url,
+            "deadline": '',
+            "excluded": [],
+            "region": None,
+            "ended": False,
+            "region_blocked": False,
+        }
+
+
+def _enrich_worker(worker_id, urls_chunk, total_urls, on_result, emit, counter, lock):
+    """Worker function: launches its own browser and enriches its chunk.
+
+    Runs in a dedicated thread with its own ``sync_playwright()`` context
+    so that each worker has an isolated browser instance (Playwright sync
+    API is not thread-safe across shared objects).
+
+    Args:
+        worker_id: integer identifier for log messages.
+        urls_chunk: list of URLs this worker should process.
+        total_urls: total number of URLs across all workers (for log messages).
+        on_result: callback invoked per URL (may be None).
+        emit: logging callback.
+        counter: mutable list ``[n]`` tracking the global completed count.
+        lock: ``threading.Lock`` protecting *counter* and *on_result*.
+    """
+    results = []
+
+    # Each worker needs its own event loop on Windows for Playwright
+    _original_loop = None
+    _new_loop = None
+    try:
+        _original_loop = asyncio.get_event_loop()
+    except RuntimeError:
+        _original_loop = None
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        _new_loop = asyncio.ProactorEventLoop()
+        asyncio.set_event_loop(_new_loop)
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=False,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ],
+            )
+            context = browser.new_context()
+            page = context.new_page()
+
+            try:
+                for url in urls_chunk:
+                    with lock:
+                        idx = counter[0] + 1
+                    emit(f"[W{worker_id}] [{idx}/{total_urls}] Enriching: {url}")
+
+                    entry = _enrich_single_url(page, url, emit)
+                    results.append(entry)
+
+                    with lock:
+                        counter[0] += 1
+                        if on_result:
+                            on_result(entry)
+            finally:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+    finally:
+        if sys.platform == "win32":
+            if _new_loop is not None:
+                _new_loop.close()
+            if _original_loop is not None:
+                asyncio.set_event_loop(_original_loop)
+
+    return results
+
+
+def enrich_giveaways_batch(urls, on_result=None, callback=None):
+    """Enrich multiple giveaway URLs using parallel browser workers.
+
+    Splits the URL list into ``ENRICHMENT_WORKERS`` chunks and launches
+    one headless Chromium instance per chunk in separate threads.  Each
+    worker processes its URLs sequentially, but the workers run
+    concurrently for ~4x throughput.
 
     Args:
         urls: list of giveaway URLs to enrich.
@@ -824,87 +963,41 @@ def enrich_giveaways_batch(urls, on_result=None, callback=None):
         if callback:
             callback(msg)
 
-    def _do_batch():
-        results = []
+    n_workers = min(ENRICHMENT_WORKERS, len(urls))
 
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=False,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                ],
-            )
-            context = browser.new_context()
-            page = context.new_page()
+    # Split URLs into roughly-equal chunks for each worker
+    chunks = [[] for _ in range(n_workers)]
+    for i, url in enumerate(urls):
+        chunks[i % n_workers].append(url)
 
-            try:
-                for i, url in enumerate(urls, 1):
-                    emit(f"[{i}/{len(urls)}] Enriching: {url}")
-                    try:
-                        page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                        time.sleep(3)  # let the Gleam widget render
+    # Shared mutable counter and lock for thread-safe progress tracking
+    counter = [0]  # completed count
+    lock = threading.Lock()
+    total = len(urls)
 
-                        # -- Ended / region-blocked (fast text checks) --
-                        ended = detect_ended(page)
-                        region_blocked = detect_region_restriction(page)
+    emit(f"Starting enrichment: {total} URLs across {n_workers} parallel workers")
 
-                        if ended:
-                            emit(f"  Ended")
-                        if region_blocked:
-                            emit(f"  Region blocked")
+    def _run_all_workers():
+        all_results = []
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = []
+            for wid, chunk in enumerate(chunks, 1):
+                if not chunk:
+                    continue
+                futures.append(
+                    pool.submit(
+                        _enrich_worker,
+                        wid, chunk, total, on_result, emit, counter, lock,
+                    )
+                )
 
-                        # -- Deadline --
-                        deadline = ''
-                        if not ended and not region_blocked:
-                            deadline = _extract_deadline_from_page(page)
-                            if deadline:
-                                emit(f"  Deadline: {deadline}")
-
-                        # -- T&C --
-                        excluded = []
-                        region = None
-                        if not ended and not region_blocked:
-                            excluded, region = check_terms_conditions(page, url)
-                            if excluded:
-                                emit(f"  Excluded: {', '.join(excluded)}")
-                            if region:
-                                emit(f"  Region: {region}")
-
-                        if not ended and not region_blocked and not excluded and not region and not deadline:
-                            emit(f"  No restrictions or deadline found")
-
-                        entry = {
-                            "url": url,
-                            "deadline": deadline,
-                            "excluded": excluded,
-                            "region": region,
-                            "ended": ended,
-                            "region_blocked": region_blocked,
-                        }
-                        results.append(entry)
-
-                    except Exception as e:
-                        emit(f"  Error: {str(e)}")
-                        entry = {
-                            "url": url,
-                            "deadline": '',
-                            "excluded": [],
-                            "region": None,
-                            "ended": False,
-                            "region_blocked": False,
-                        }
-                        results.append(entry)
-
-                    if on_result:
-                        on_result(results[-1])
-            finally:
+            for future in futures:
                 try:
-                    browser.close()
-                except Exception:
-                    pass
+                    worker_results = future.result()
+                    all_results.extend(worker_results)
+                except Exception as e:
+                    emit(f"Worker error: {e}")
 
-        return results
+        return all_results
 
-    return _run_in_thread(_do_batch)
+    return _run_in_thread(_run_all_workers)
