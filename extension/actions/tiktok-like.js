@@ -24,16 +24,20 @@
     if (likeBtn) {
       // Check if the like icon has an active/filled state (color change)
       var color = window.getComputedStyle(likeBtn).color;
-      // TikTok uses red (rgb(254, 44, 85)) for liked state
-      if (color && (color.includes('254') || color.includes('fe2c55'))) return true;
+      // TikTok uses red (rgb(254, 44, 85) or #fe2c55) for liked state
+      // Check for the specific TikTok red, not just any color containing '254'
+      if (color && (color.includes('rgb(254, 44, 85)') || color.includes('rgb(255, 44, 85)') || color.includes('fe2c55'))) return true;
       // Also check aria-pressed or class names
       var classList = (likeBtn.className || '').toLowerCase();
       if (classList.includes('active') || classList.includes('liked')) return true;
     }
 
-    // Check for aria-pressed on like buttons
-    var ariaButtons = document.querySelectorAll('[aria-pressed="true"][aria-label*="like" i]');
-    if (ariaButtons.length > 0) return true;
+    // Check for aria-pressed on like buttons (avoid CSS case-insensitive flag for compat)
+    var ariaButtons = document.querySelectorAll('[aria-pressed="true"]');
+    for (var ab = 0; ab < ariaButtons.length; ab++) {
+      var abLabel = (ariaButtons[ab].getAttribute('aria-label') || '').toLowerCase();
+      if (abLabel.includes('like') && !abLabel.includes('unlike')) return true;
+    }
 
     // Check for "liked" class on any like-related element
     var likedElements = document.querySelectorAll('[class*="like"][class*="active"], [class*="Like"][class*="active"]');
@@ -61,6 +65,10 @@
       // Strategy 1: data-e2e attribute
       likeBtn = document.querySelector('[data-e2e="like-icon"]');
       if (likeBtn) {
+        // Re-check liked state before proceeding (avoid accidental unlikes)
+        if (isAlreadyLiked()) {
+          return { success: true, alreadyDone: true, platform: 'tiktok', action: 'like' };
+        }
         // Walk up to the clickable parent if needed
         var clickable = likeBtn.closest('button') || likeBtn.closest('[role="button"]') || likeBtn;
         likeBtn = clickable;
@@ -71,7 +79,7 @@
       var buttons = document.querySelectorAll('button[aria-label], [role="button"][aria-label]');
       for (var i = 0; i < buttons.length; i++) {
         var label = (buttons[i].getAttribute('aria-label') || '').toLowerCase();
-        if (label === 'like' || label.includes('like video')) {
+        if ((label === 'like' || label.includes('like video')) && !label.includes('unlike')) {
           var rect = buttons[i].getBoundingClientRect();
           if (rect.width > 0 && rect.height > 0) {
             likeBtn = buttons[i];

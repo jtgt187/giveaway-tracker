@@ -80,8 +80,17 @@ function updateRecentLinks() {
     list.innerHTML = recent.map(function(l) {
       var displayUrl = l.href.replace('https://', '').replace('http://', '');
       var label = l.text || displayUrl;
+      // Sanitize URL: only allow http/https to prevent javascript: XSS
+      var safeHref = '';
+      try {
+        var urlObj = new URL(l.href);
+        if (urlObj.protocol === 'http:' || urlObj.protocol === 'https:') {
+          safeHref = l.href;
+        }
+      } catch (e) {}
+      if (!safeHref) return ''; // Skip invalid URLs
       return '<div class="recent-item">' +
-        '<a href="' + escapeHtml(l.href) + '" target="_blank" title="' + escapeHtml(l.href) + '">' +
+        '<a href="' + escapeHtml(safeHref) + '" target="_blank" rel="noopener" title="' + escapeHtml(l.href) + '">' +
           escapeHtml(label.substring(0, 60)) +
         '</a>' +
       '</div>';
@@ -193,11 +202,24 @@ function updateEntryStats() {
 
     var lastEntryEl = document.getElementById('lastEntry');
     if (stats.lastUrl && stats.lastTime) {
+      // Sanitize URL: only allow http/https protocols to prevent javascript: XSS
+      var safeUrl = '';
+      try {
+        var urlObj = new URL(stats.lastUrl);
+        if (urlObj.protocol === 'http:' || urlObj.protocol === 'https:') {
+          safeUrl = stats.lastUrl;
+        }
+      } catch (e) {}
+
       var timeAgo = getTimeAgo(stats.lastTime);
       var shortUrl = stats.lastUrl.replace('https://', '').replace('http://', '');
       if (shortUrl.length > 40) shortUrl = shortUrl.substring(0, 40) + '...';
-      lastEntryEl.innerHTML = 'Last: <a href="' + escapeHtml(stats.lastUrl) + '" target="_blank">' +
-        escapeHtml(shortUrl) + '</a> (' + timeAgo + ')';
+      if (safeUrl) {
+        lastEntryEl.innerHTML = 'Last: <a href="' + escapeHtml(safeUrl) + '" target="_blank" rel="noopener">' +
+          escapeHtml(shortUrl) + '</a> (' + timeAgo + ')';
+      } else {
+        lastEntryEl.textContent = 'Last: ' + shortUrl + ' (' + timeAgo + ')';
+      }
     } else {
       lastEntryEl.textContent = 'No entries yet';
     }

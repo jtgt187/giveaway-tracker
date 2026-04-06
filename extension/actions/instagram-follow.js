@@ -74,11 +74,15 @@
   }
 
   function isAlreadyFollowing() {
-    // Look for "Following" or "Requested" button anywhere on profile page (localized)
-    if (findButtonByText(FOLLOWING_TEXTS)) return true;
+    // Scope search to header/profile area to avoid matching suggested user "Following" buttons
+    var profileArea = document.querySelector('header') || document.querySelector('main');
+    var searchRoot = profileArea || document;
 
-    // Also check aria-labels (Instagram uses these)
-    var buttons = document.querySelectorAll('button, [role="button"]');
+    // Look for "Following" or "Requested" button in profile area (localized)
+    if (findButtonByText(FOLLOWING_TEXTS, searchRoot)) return true;
+
+    // Also check aria-labels within the profile area
+    var buttons = searchRoot.querySelectorAll('button, [role="button"]');
     for (var i = 0; i < buttons.length; i++) {
       var label = (buttons[i].getAttribute('aria-label') || '').toLowerCase();
       if (isFollowingText(label)) return true;

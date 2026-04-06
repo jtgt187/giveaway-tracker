@@ -63,6 +63,25 @@ function persist() {
     gleam_auto_threshold: autoExportThreshold,
     gleam_prefetch_deadlines: prefetchDeadlines,
     gleam_entry_stats: entryStats
+  }, () => {
+    if (chrome.runtime.lastError) {
+      console.error('[GleamMonitor] Storage persist error:', chrome.runtime.lastError.message);
+      // If quota exceeded, try to trim old links to free space
+      if (chrome.runtime.lastError.message.includes('QUOTA')) {
+        const trimCount = Math.floor(links.length * 0.1) || 10;
+        console.warn('[GleamMonitor] Trimming', trimCount, 'oldest links to free storage');
+        links.splice(0, trimCount);
+        if (lastExportIndex > links.length) lastExportIndex = links.length;
+        // Retry once without the callback to avoid infinite loop
+        chrome.storage.local.set({
+          gleam_links: links,
+          gleam_last_export: lastExportIndex,
+          gleam_auto_threshold: autoExportThreshold,
+          gleam_prefetch_deadlines: prefetchDeadlines,
+          gleam_entry_stats: entryStats
+        });
+      }
+    }
   });
 }
 
@@ -113,10 +132,15 @@ function checkLocalApi() {
     });
 }
 
-// Re-check API availability every 30 seconds (best-effort; MV3 service
-// workers may sleep and kill this interval, so sync functions also
-// re-check inline when localApiAvailable is false).
-setInterval(checkLocalApi, 30000);
+// Re-check API availability every 30 seconds using chrome.alarms
+// (survives service worker sleep, unlike setInterval which dies).
+chrome.alarms.create('check-local-api', { periodInMinutes: 0.5 });
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === 'check-local-api') {
+    checkLocalApi();
+  }
+});
 
 /**
  * Push a new or updated link to the local database via the API.
@@ -166,7 +190,7 @@ function _postToApi(path, data) {
 // This is only used for auto-export where no popup is waiting for a
 // response, avoiding the "message port closed" problem entirely.
 
-function backgroundDownloadNdjson(entries) {
+function backgroundDownloadNdjson(entries, onSuccess) {
   if (entries.length === 0) return;
 
   try {
@@ -178,9 +202,11 @@ function backgroundDownloadNdjson(entries) {
       filename: 'gleam-links.ndjson',
       saveAs: false,
       conflictAction: 'uniquify'
-    }, () => {
+    }, (downloadId) => {
       if (chrome.runtime.lastError) {
         console.warn('Gleam Monitor: auto-export download error', chrome.runtime.lastError.message);
+      } else if (downloadId && onSuccess) {
+        onSuccess();
       }
     });
   } catch (e) {
@@ -195,9 +221,12 @@ function checkAutoExport() {
   const unexported = links.length - lastExportIndex;
   if (unexported >= autoExportThreshold) {
     const newEntries = links.slice(lastExportIndex);
-    backgroundDownloadNdjson(newEntries);
-    lastExportIndex = links.length;
-    persist();
+    const exportUpTo = links.length;
+    backgroundDownloadNdjson(newEntries, () => {
+      // Only advance index after confirmed successful download
+      lastExportIndex = exportUpTo;
+      persist();
+    });
   }
 }
 
@@ -436,8 +465,8 @@ function handleMessage(msg, sender, sendResponse) {
       // Only store giveaway/competition URLs, not FAQ/about/docs etc.
       const path = u.pathname.replace(/\/+$/, '');
       const isGiveaway =
-        /^\/(?:giveaways|competitions)\/[A-Za-z0-9]{4,6}$/.test(path) ||
-        /^\/[A-Za-z0-9]{4,6}\/[^/]+$/.test(path);
+        /^\/(?:giveaways|competitions)\/[A-Za-z0-9]{4,8}$/.test(path) ||
+        /^\/[A-Za-z0-9]{4,8}\/[^/]+$/.test(path);
       if (!isGiveaway) {
         sendResponse({ count: links.length });
         return;
@@ -474,6 +503,20 @@ function handleMessage(msg, sender, sendResponse) {
 
   // -- Update giveaway metadata (title + deadline) from gleam-entry.js --
   if (msg.type === 'update-giveaway-meta') {
+    // Validate the URL before processing
+    let isValidGleamUrl = false;
+    try {
+      const u = new URL(msg.href);
+      if (u.hostname === 'gleam.io' || u.hostname.endsWith('.gleam.io')) {
+        isValidGleamUrl = true;
+      }
+    } catch (e) {}
+
+    if (!isValidGleamUrl) {
+      sendResponse({ ok: false, error: 'invalid_url' });
+      return;
+    }
+
     const idx = links.findIndex(l => l.href === msg.href);
     if (idx !== -1) {
       if (msg.deadline) links[idx].deadline = msg.deadline;
@@ -481,18 +524,29 @@ function handleMessage(msg, sender, sendResponse) {
       persist();
     } else {
       // The link might not have been collected yet (e.g. user navigated directly).
-      // Store it as a new entry with metadata.
-      const entry = {
-        href: msg.href,
-        text: msg.title || '',
-        deadline: msg.deadline || '',
-        t: new Date().toISOString()
-      };
-      links.push(entry);
-      persist();
-      updateBadge();
-      checkAutoExport();
-      syncToLocalApi(entry);
+      // Validate it's a giveaway path before storing.
+      let isGiveawayPath = false;
+      try {
+        const u = new URL(msg.href);
+        const path = u.pathname.replace(/\/+$/, '');
+        isGiveawayPath =
+          /^\/(?:giveaways|competitions)\/[A-Za-z0-9]{4,8}$/.test(path) ||
+          /^\/[A-Za-z0-9]{4,8}\/[^/]+$/.test(path);
+      } catch (e) {}
+
+      if (isGiveawayPath) {
+        const entry = {
+          href: msg.href,
+          text: msg.title || '',
+          deadline: msg.deadline || '',
+          t: new Date().toISOString()
+        };
+        links.push(entry);
+        persist();
+        updateBadge();
+        checkAutoExport();
+        syncToLocalApi(entry);
+      }
     }
     // Always sync the metadata update to the local DB
     syncMetaToLocalApi(msg.href, msg.title || '', msg.deadline || '');

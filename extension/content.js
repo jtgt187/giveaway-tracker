@@ -26,9 +26,9 @@
       const u = new URL(urlStr);
       const path = u.pathname.replace(/\/+$/, '');
       // /giveaways/XXXXX or /competitions/XXXXX
-      if (/^\/(?:giveaways|competitions)\/[A-Za-z0-9]{4,6}$/.test(path)) return true;
+      if (/^\/(?:giveaways|competitions)\/[A-Za-z0-9]{4,8}$/.test(path)) return true;
       // /XXXXX/any-slug (the most common gleam format)
-      if (/^\/[A-Za-z0-9]{4,6}\/[^/]+$/.test(path)) return true;
+      if (/^\/[A-Za-z0-9]{4,8}\/[^/]+$/.test(path)) return true;
       return false;
     } catch (e) {
       return false;
@@ -325,6 +325,26 @@
 
     if (document.body) {
       observer.observe(document.body, { childList: true, subtree: true });
+    }
+
+    // Disconnect observer when page unloads to prevent leaks
+    window.addEventListener('pagehide', () => {
+      observer.disconnect();
+      if (debounceTimer) clearTimeout(debounceTimer);
+    });
+
+    // Also disconnect if extension context is invalidated (extension updated/reloaded)
+    if (chrome.runtime && chrome.runtime.id) {
+      const checkInterval = setInterval(() => {
+        try {
+          // Accessing chrome.runtime.id throws if context is invalidated
+          void chrome.runtime.id;
+        } catch (e) {
+          observer.disconnect();
+          if (debounceTimer) clearTimeout(debounceTimer);
+          clearInterval(checkInterval);
+        }
+      }, 10000);
     }
   }
 

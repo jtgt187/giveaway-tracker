@@ -1,6 +1,7 @@
 import sqlite3
 import os
 import re
+import threading
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
@@ -8,6 +9,7 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "giveaways.db")
 
 # In-memory blacklist cache to avoid reading the file on every add_giveaway() call
 _blacklist_cache = None
+_blacklist_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -162,15 +164,16 @@ def _save_blacklist(urls):
 
 def add_to_blacklist(url, reason=""):
     global _blacklist_cache
-    # Use in-memory cache if available, avoid full file re-read
-    if _blacklist_cache is None:
-        _load_blacklist()
-    if url not in _blacklist_cache:
-        _blacklist_cache.add(url)
-        # Append-only write: O(1) instead of rewriting the entire file
-        path = _get_blacklist_path()
-        with open(path, "a") as f:
-            f.write(url + "\n")
+    with _blacklist_lock:
+        # Use in-memory cache if available, avoid full file re-read
+        if _blacklist_cache is None:
+            _load_blacklist()
+        if url not in _blacklist_cache:
+            _blacklist_cache.add(url)
+            # Append-only write: O(1) instead of rewriting the entire file
+            path = _get_blacklist_path()
+            with open(path, "a") as f:
+                f.write(url + "\n")
     conn = get_connection()
     try:
         cursor = conn.cursor()
@@ -181,20 +184,23 @@ def add_to_blacklist(url, reason=""):
 
 
 def get_blacklist():
-    return list(_load_blacklist())
+    with _blacklist_lock:
+        return list(_load_blacklist())
 
 
 def remove_from_blacklist(url):
-    blacklist = _load_blacklist()
-    blacklist.discard(url)
-    _save_blacklist(blacklist)
+    with _blacklist_lock:
+        blacklist = _load_blacklist()
+        blacklist.discard(url)
+        _save_blacklist(blacklist)
 
 
 def is_blacklisted(url):
     global _blacklist_cache
-    if _blacklist_cache is None:
-        _load_blacklist()
-    return url in _blacklist_cache
+    with _blacklist_lock:
+        if _blacklist_cache is None:
+            _load_blacklist()
+        return url in _blacklist_cache
 
 
 def add_giveaway(title, url, source, description="", deadline="", country_restriction="worldwide", terms_checked=False, terms_excluded=""):
@@ -224,35 +230,37 @@ def add_giveaways_batch(giveaway_list):
     if not giveaway_list:
         return 0
     conn = get_connection()
-    cursor = conn.cursor()
-    now = datetime.now().isoformat()
-    new_count = 0
-    for g in giveaway_list:
-        url = g.get("url", "")
-        if not url or is_blacklisted(url):
-            continue
-        try:
-            cursor.execute("""
-                INSERT OR IGNORE INTO giveaways
-                    (title, url, source, description, deadline, country_restriction,
-                     terms_checked, terms_excluded, discovered_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                g.get("title", ""),
-                url,
-                g.get("source", ""),
-                g.get("description", ""),
-                g.get("deadline", ""),
-                g.get("country_restriction", "worldwide"),
-                g.get("terms_checked", False),
-                g.get("terms_excluded", ""),
-                now,
-            ))
-            new_count += cursor.rowcount
-        except sqlite3.IntegrityError:
-            pass
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+        new_count = 0
+        for g in giveaway_list:
+            url = g.get("url", "")
+            if not url or is_blacklisted(url):
+                continue
+            try:
+                cursor.execute("""
+                    INSERT OR IGNORE INTO giveaways
+                        (title, url, source, description, deadline, country_restriction,
+                         terms_checked, terms_excluded, discovered_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    g.get("title", ""),
+                    url,
+                    g.get("source", ""),
+                    g.get("description", ""),
+                    g.get("deadline", ""),
+                    g.get("country_restriction", "worldwide"),
+                    g.get("terms_checked", False),
+                    g.get("terms_excluded", ""),
+                    now,
+                ))
+                new_count += cursor.rowcount
+            except sqlite3.IntegrityError:
+                pass
+        conn.commit()
+    finally:
+        conn.close()
     return new_count
 
 
@@ -316,12 +324,25 @@ def update_giveaway_entries(giveaway_id, total_entries, your_entries):
 
 
 def update_giveaway_deadline(giveaway_id, deadline):
-    """Update the deadline field for a giveaway."""
+    """Update the deadline field for a giveaway.
+
+    If the deadline is a relative countdown (e.g. '11 days'), convert it to an
+    absolute ISO datetime before storing so it doesn't become stale.
+    """
+    stored = deadline
+    if deadline and re.search(
+        r'\d+\s*(?:days?|d|hours?|hrs?|h|minutes?|mins?|m)\b', deadline, re.IGNORECASE
+    ):
+        dt = _parse_countdown(deadline)
+        if dt:
+            stored = dt.strftime("%d %B %Y at %H:%M:%S")
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE giveaways SET deadline = ? WHERE id = ?", (deadline, giveaway_id))
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE giveaways SET deadline = ? WHERE id = ?", (stored, giveaway_id))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_giveaway_by_url(url):
@@ -439,9 +460,10 @@ def delete_not_eligible():
 def get_unenriched_giveaways():
     """Return giveaways that still need enrichment (missing deadline or unchecked T&C).
 
-    Returns a dict with two lists:
-      - 'missing_deadline': dicts with id/url for entries with empty deadline
-      - 'unchecked_terms':  dicts with id/url for entries with terms_checked = 0
+    Returns a list of dicts with ``id`` and ``url`` for every active giveaway
+    that is missing a deadline OR has unchecked T&C.  The combined function
+    ``enrich_giveaways_batch`` visits each URL once and extracts everything.
+
     Only includes giveaways that haven't been marked as not_eligible or expired.
     """
     conn = get_connection()
@@ -449,20 +471,13 @@ def get_unenriched_giveaways():
     active_filter = "status NOT IN ('not_eligible', 'expired', 'skipped')"
 
     cursor.execute(
-        f"SELECT id, url FROM giveaways WHERE (deadline = '' OR deadline IS NULL) AND {active_filter}"
+        f"SELECT id, url FROM giveaways "
+        f"WHERE ((deadline = '' OR deadline IS NULL) OR terms_checked = 0) "
+        f"AND {active_filter}"
     )
-    missing_deadline = [dict(r) for r in cursor.fetchall()]
-
-    cursor.execute(
-        f"SELECT id, url FROM giveaways WHERE terms_checked = 0 AND {active_filter}"
-    )
-    unchecked_terms = [dict(r) for r in cursor.fetchall()]
-
+    rows = [dict(r) for r in cursor.fetchall()]
     conn.close()
-    return {
-        "missing_deadline": missing_deadline,
-        "unchecked_terms": unchecked_terms,
-    }
+    return rows
 
 
 def parse_deadline(deadline_text):
@@ -559,7 +574,7 @@ _COUNTDOWN_MINS_RE = re.compile(
     r"(\d+)\s*(?:minutes?|mins?|m)\b", re.IGNORECASE
 )
 _COUNTDOWN_SECS_RE = re.compile(
-    r"(\d+)\s*(?:seconds?|secs?|s)\b", re.IGNORECASE
+    r"(\d+)\s*(?:seconds?|secs?)\b", re.IGNORECASE
 )
 
 
@@ -605,22 +620,38 @@ def _parse_countdown(text):
 
 
 def remove_expired_giveaways():
-    """Delete giveaways whose deadline has passed. Returns the count of removed rows."""
+    """Delete giveaways whose deadline has passed. Returns the count of removed rows.
+
+    Skips relative countdown deadlines (e.g. '11 days') since re-parsing them
+    would produce incorrect results -- they should have been converted to
+    absolute dates at import/enrichment time.
+    """
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, deadline FROM giveaways WHERE deadline != ''")
-    rows = cursor.fetchall()
-    now = datetime.now()
-    expired_ids = []
-    for row in rows:
-        dt = parse_deadline(row["deadline"])
-        if dt and dt < now:
-            expired_ids.append(row["id"])
-    if expired_ids:
-        placeholders = ",".join("?" for _ in expired_ids)
-        cursor.execute(f"DELETE FROM giveaways WHERE id IN ({placeholders})", expired_ids)
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, deadline FROM giveaways WHERE deadline != ''")
+        rows = cursor.fetchall()
+        now = datetime.now()
+        expired_ids = []
+        # Pre-compiled pattern to detect relative countdowns that shouldn't be re-parsed
+        relative_re = re.compile(
+            r'^\s*(?:ends?\s+in\s+)?\d+\s*(?:days?|d|hours?|hrs?|h|minutes?|mins?|m)\b',
+            re.IGNORECASE,
+        )
+        for row in rows:
+            dl = row["deadline"]
+            # Skip relative countdowns -- they can't be meaningfully re-evaluated
+            if relative_re.search(dl):
+                continue
+            dt = parse_deadline(dl)
+            if dt and dt < now:
+                expired_ids.append(row["id"])
+        if expired_ids:
+            placeholders = ",".join("?" for _ in expired_ids)
+            cursor.execute(f"DELETE FROM giveaways WHERE id IN ({placeholders})", expired_ids)
+        conn.commit()
+    finally:
+        conn.close()
     return len(expired_ids)
 
 

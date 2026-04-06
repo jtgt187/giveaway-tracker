@@ -47,10 +47,15 @@
     var loginModal = document.querySelector('[data-a-target="login-modal"]');
     if (loginModal) return true;
     // Check for prominent "Log In" button in the top nav
+    // Only treat as not-logged-in if NO avatar/user menu is present
     var loginBtn = document.querySelector('[data-a-target="login-button"]');
     if (loginBtn) {
-      var rect = loginBtn.getBoundingClientRect();
-      if (rect.width > 0 && rect.height > 0) return true;
+      // Verify there's no user menu (which indicates logged in)
+      var userMenu = document.querySelector('[data-a-target="user-menu-toggle"]');
+      if (!userMenu) {
+        var rect = loginBtn.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) return true;
+      }
     }
     return false;
   }

@@ -144,9 +144,25 @@ def detect_country_restriction(html_text):
             if keyword in text:
                 return country
 
-    # Second pass: generic restriction phrases (no specific country found).
+    # Second pass: generic restriction phrases with context scan.
+    # Check if nearby text mentions a known country to avoid returning
+    # "restricted" when a specific country can be identified.
     for keyword in RESTRICTED_KEYWORDS:
-        if keyword in text:
+        pos = text.find(keyword)
+        if pos != -1:
+            # Scan nearby text for country mentions
+            start = max(0, pos - 50)
+            end = min(len(text), pos + len(keyword) + 500)
+            context = text[start:end]
+            # Check if any country is mentioned near the restriction phrase
+            for country, country_kws in COUNTRY_KEYWORDS.items():
+                if country == "worldwide":
+                    continue
+                for ckw in country_kws:
+                    # Use simpler keywords (the first 1-2 words of each phrase)
+                    base_word = ckw.split(" ")[0]
+                    if len(base_word) >= 4 and base_word in context:
+                        return country
             return "restricted"
 
     return "worldwide"

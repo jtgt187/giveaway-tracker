@@ -56,7 +56,7 @@
       var buttons = document.querySelectorAll('article [role="button"]');
       for (var i = 0; i < buttons.length; i++) {
         var label = (buttons[i].getAttribute('aria-label') || '').toLowerCase();
-        if (label.includes('repost') || label.includes('retweet')) {
+        if ((label.includes('repost') || label.includes('retweet')) && !label.includes('undo') && !label.includes('un-')) {
           retweetBtn = buttons[i];
           break;
         }
@@ -86,7 +86,7 @@
     var repostMenuItem = null;
     for (var j = 0; j < menuItems.length; j++) {
       var txt = (menuItems[j].textContent || '').trim().toLowerCase();
-      if (txt === 'repost' || txt === 'retweet') {
+      if (txt === 'repost' || txt === 'retweet' || txt.startsWith('repost') || txt.startsWith('retweet')) {
         repostMenuItem = menuItems[j];
         break;
       }

@@ -78,20 +78,22 @@ ENDED_KEYWORDS = [
 # ---------------------------------------------------------------------------
 
 # Countries whose mention in an exclusion context means we are NOT eligible.
+# NOTE: Keywords are matched with word-boundary awareness via _word_in_text()
+# to avoid substring false positives (e.g. "austria" matching "australia").
 EXCLUDED_COUNTRIES = {
     "us": [
-        "usa", "united states", "us only", "usa only",
+        "usa", "united states", "usa only",
         "united states of america", "u.s.", "u.s.a.",
     ],
     "uk": [
         "united kingdom", "uk only", "great britain", "britain",
         "england", "scotland", "wales", "northern ireland",
     ],
-    "canada": ["canada", "canadian", "can only"],
+    "canada": ["canada", "canadian"],
     "australia": ["australia", "australian", "aus only"],
-    "france": ["france", "french", "france only", "frankreich"],
-    "spain": ["spain", "spanish", "spain only", "spanien"],
-    "italy": ["italy", "italian", "italy only", "italien"],
+    "france": ["france", "france only", "frankreich"],
+    "spain": ["spain", "spain only", "spanien"],
+    "italy": ["italy", "italy only", "italien"],
     "netherlands": ["netherlands", "dutch", "holland", "niederlande"],
     "belgium": ["belgium", "belgian", "belgien"],
     "austria": ["austria", "austrian", "österreich"],
@@ -101,7 +103,7 @@ EXCLUDED_COUNTRIES = {
     "norway": ["norway", "norwegian", "norwegen"],
     "denmark": ["denmark", "danish", "dänemark"],
     "finland": ["finland", "finnish", "finnland"],
-    "poland": ["poland", "polish", "polen"],
+    "poland": ["poland", "polen"],
     "japan": ["japan", "japanese"],
     "china": ["china", "chinese"],
     "brazil": ["brazil", "brazilian", "brasilien"],
@@ -112,6 +114,8 @@ EXCLUDED_COUNTRIES = {
 }
 
 # Trigger phrases that signal the T&C text specifies excluded countries.
+# NOTE: "excluding" was removed because it matches "excluding taxes/shipping"
+# and then falsely flags all countries found anywhere in the text.
 EXCLUSION_KEYWORDS = [
     "not eligible in",
     "not available in",
@@ -119,7 +123,8 @@ EXCLUSION_KEYWORDS = [
     "countries not eligible",
     "void in",
     "void where prohibited",
-    "excluding",
+    "excluding residents",
+    "excluding countries",
 ]
 
 # Trigger phrases that signal the T&C text specifies *included* countries
@@ -227,7 +232,10 @@ TERMS_CONTAINER_SELECTORS = [
 
 
 def detect_region_restriction(page):
-    page_text = page.inner_text("body")
+    try:
+        page_text = page.inner_text("body")
+    except Exception:
+        return False
     for keyword in REGION_RESTRICTED_KEYWORDS:
         if keyword in page_text.lower():
             return True
@@ -236,7 +244,10 @@ def detect_region_restriction(page):
 
 def detect_ended(page):
     """Check if the giveaway page shows a 'competition ended' message."""
-    page_text = page.inner_text("body")
+    try:
+        page_text = page.inner_text("body")
+    except Exception:
+        return False
     for keyword in ENDED_KEYWORDS:
         if keyword in page_text.lower():
             return True
@@ -247,7 +258,10 @@ def detect_captcha(page):
     for selector in CAPTCHA_SELECTORS:
         if page.locator(selector).count() > 0:
             return True
-    page_text = page.inner_text("body")
+    try:
+        page_text = page.inner_text("body")
+    except Exception:
+        return False
     captcha_keywords = ["captcha", "verify you are human", "prove you are human", "security check"]
     for keyword in captcha_keywords:
         if keyword in page_text.lower():
@@ -279,20 +293,50 @@ def _extract_tc_text(page):
         except Exception:
             continue
     # Fallback: full page
-    return page.inner_text("body").lower()
+    try:
+        return page.inner_text("body").lower()
+    except Exception:
+        return ""
+
+
+# Pre-compiled regex cache for word-boundary matching
+_WORD_RE_CACHE = {}
+
+
+def _word_in_text(word, text):
+    """Check if *word* appears in *text* with word boundaries.
+
+    Prevents 'austria' from matching inside 'australia', etc.
+    """
+    if word not in _WORD_RE_CACHE:
+        # Escape the word for regex, wrap in word boundaries
+        _WORD_RE_CACHE[word] = re.compile(r'\b' + re.escape(word) + r'\b', re.IGNORECASE)
+    return bool(_WORD_RE_CACHE[word].search(text))
 
 
 def _detect_excluded_countries(text):
     """Scan *text* for exclusion trigger phrases and return a list of
-    excluded country codes (e.g. ["us", "uk", "canada"])."""
-    found_exclusion = any(kw in text for kw in EXCLUSION_KEYWORDS)
-    if not found_exclusion:
+    excluded country codes (e.g. ["us", "uk", "canada"]).
+
+    Only scans for countries in the vicinity of exclusion keywords
+    to avoid false positives from country names elsewhere in the text.
+    """
+    # Find exclusion context: text around each exclusion keyword
+    exclusion_context = ""
+    for kw in EXCLUSION_KEYWORDS:
+        pos = text.find(kw)
+        if pos != -1:
+            start = max(0, pos - 50)
+            end = min(len(text), pos + len(kw) + 500)
+            exclusion_context += " " + text[start:end]
+
+    if not exclusion_context:
         return []
 
     excluded = []
     for country, keywords in EXCLUDED_COUNTRIES.items():
         for keyword in keywords:
-            if keyword in text:
+            if _word_in_text(keyword, exclusion_context):
                 if country not in excluded:
                     excluded.append(country)
                 break
@@ -329,13 +373,14 @@ def _detect_included_region(text):
                 return region
 
     # Check if DACH countries are listed individually (before single-country check)
-    has_germany = any(kw in inclusion_context for kw in ["germany", "deutschland"])
-    has_austria = any(kw in inclusion_context for kw in ["austria", "österreich"])
-    has_switzerland = any(kw in inclusion_context for kw in ["switzerland", "schweiz"])
+    has_germany = any(_word_in_text(kw, inclusion_context) for kw in ["germany", "deutschland"])
+    has_austria = any(_word_in_text(kw, inclusion_context) for kw in ["austria", "österreich"])
+    has_switzerland = any(_word_in_text(kw, inclusion_context) for kw in ["switzerland", "schweiz"])
     if has_germany and has_austria and has_switzerland:
         return "dach"
     if has_germany and has_austria:
-        return "dach"  # Close enough to DACH
+        # Only DE+AT -- not full DACH (Switzerland not mentioned)
+        return "germany"
 
     # Check if Germany is explicitly mentioned as an included country
     if has_germany:
@@ -472,6 +517,7 @@ def auto_enter_giveaway(url, callback=None):
 
     def _do_enter():
         emit(f"Opening giveaway: {url}")
+        nonlocal profile_path
 
         with sync_playwright() as p:
             launch_args = {
@@ -484,13 +530,25 @@ def auto_enter_giveaway(url, callback=None):
             }
 
             if profile_path:
-                browser = p.chromium.launch_persistent_context(
-                    user_data_dir=profile_path,
-                    channel=browser_channel,
-                    headless=False,
-                    args=launch_args["args"],
-                )
-                page = browser.pages[0] if browser.pages else browser.new_page()
+                try:
+                    browser = p.chromium.launch_persistent_context(
+                        user_data_dir=profile_path,
+                        channel=browser_channel,
+                        headless=False,
+                        args=launch_args["args"],
+                    )
+                except Exception as profile_err:
+                    err_msg = str(profile_err).lower()
+                    if "lock" in err_msg or "already in use" in err_msg or "single instance" in err_msg:
+                        emit("Browser profile locked (browser running). Using temporary profile.")
+                    else:
+                        emit(f"Could not use browser profile: {profile_err}. Using temporary profile.")
+                    browser = p.chromium.launch(headless=False, args=launch_args["args"])
+                    context = browser.new_context()
+                    page = context.new_page()
+                    profile_path = None
+                if profile_path:
+                    page = browser.pages[0] if browser.pages else browser.new_page()
             else:
                 browser = p.chromium.launch(headless=False, args=launch_args["args"])
                 context = browser.new_context()
@@ -498,16 +556,16 @@ def auto_enter_giveaway(url, callback=None):
 
             try:
                 emit("Navigating to giveaway page...")
-                page.goto(url, wait_until="networkidle", timeout=30000)
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 time.sleep(3)
 
                 if detect_region_restriction(page):
                     emit("Region restriction detected! This giveaway is not available in your country.")
-                    return "region_restricted", log
+                    return ("region_restricted", log)
 
                 if detect_ended(page):
                     emit("This competition has ended!")
-                    return "ended", log
+                    return ("ended", log)
 
                 if detect_captcha(page):
                     emit("CAPTCHA detected! Please solve it manually in the opened browser...")
@@ -516,7 +574,7 @@ def auto_enter_giveaway(url, callback=None):
                         emit("CAPTCHA solved, continuing...")
                     else:
                         emit("CAPTCHA timeout, skipping this giveaway")
-                        return False, log
+                        return ("failed", log)
 
                 emit("Looking for Gleam entry widget...")
 
@@ -556,14 +614,14 @@ def auto_enter_giveaway(url, callback=None):
 
                 if entered_count > 0:
                     emit("Entry completed successfully!")
-                    return True, log
+                    return ("success", log)
                 else:
                     emit("No entry methods were completed")
-                    return False, log
+                    return ("failed", log)
 
             except Exception as e:
                 emit(f"Error during auto-entry: {str(e)}")
-                return False, log
+                return ("failed", log)
             finally:
                 try:
                     if hasattr(browser, 'close'):
@@ -592,6 +650,7 @@ def check_giveaway_terms(url, callback=None):
             callback(msg)
 
     def _do_check():
+        nonlocal profile_path
         excluded_countries = []
         detected_region = None
 
@@ -606,13 +665,25 @@ def check_giveaway_terms(url, callback=None):
             }
 
             if profile_path:
-                browser = p.chromium.launch_persistent_context(
-                    user_data_dir=profile_path,
-                    channel=browser_channel,
-                    headless=False,
-                    args=launch_args["args"],
-                )
-                page = browser.pages[0] if browser.pages else browser.new_page()
+                try:
+                    browser = p.chromium.launch_persistent_context(
+                        user_data_dir=profile_path,
+                        channel=browser_channel,
+                        headless=False,
+                        args=launch_args["args"],
+                    )
+                except Exception as profile_err:
+                    err_msg = str(profile_err).lower()
+                    if "lock" in err_msg or "already in use" in err_msg or "single instance" in err_msg:
+                        emit("Browser profile locked (browser running). Using temporary profile.")
+                    else:
+                        emit(f"Could not use browser profile: {profile_err}. Using temporary profile.")
+                    browser = p.chromium.launch(headless=False, args=launch_args["args"])
+                    context = browser.new_context()
+                    page = context.new_page()
+                    profile_path = None
+                if profile_path:
+                    page = browser.pages[0] if browser.pages else browser.new_page()
             else:
                 browser = p.chromium.launch(headless=False, args=launch_args["args"])
                 context = browser.new_context()
@@ -620,7 +691,7 @@ def check_giveaway_terms(url, callback=None):
 
             try:
                 emit(f"Checking T&C: {url}")
-                page.goto(url, wait_until="networkidle", timeout=30000)
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 time.sleep(3)
 
                 excluded_countries, detected_region = check_terms_conditions(page, url)
@@ -645,79 +716,6 @@ def check_giveaway_terms(url, callback=None):
                     pass
 
     return _run_in_thread(_do_check)
-
-
-def check_giveaway_terms_batch(urls, callback=None):
-    """Check T&C for multiple giveaway URLs using a single browser instance.
-
-    Returns:
-        list of (url, excluded_countries, detected_region) tuples
-    """
-    if not urls:
-        return []
-
-    profile_path, browser_channel = find_browser_profile()
-
-    def emit(msg):
-        if callback:
-            callback(msg)
-
-    def _do_batch():
-        results = []
-
-        with sync_playwright() as p:
-            launch_args = {
-                "headless": False,
-                "args": [
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                ],
-            }
-
-            if profile_path:
-                browser = p.chromium.launch_persistent_context(
-                    user_data_dir=profile_path,
-                    channel=browser_channel,
-                    headless=False,
-                    args=launch_args["args"],
-                )
-                page = browser.pages[0] if browser.pages else browser.new_page()
-            else:
-                browser = p.chromium.launch(headless=False, args=launch_args["args"])
-                context = browser.new_context()
-                page = context.new_page()
-
-            try:
-                for i, url in enumerate(urls, 1):
-                    emit(f"[{i}/{len(urls)}] Checking T&C: {url}")
-                    try:
-                        page.goto(url, wait_until="networkidle", timeout=30000)
-                        time.sleep(2)
-
-                        excluded, region = check_terms_conditions(page, url)
-
-                        if excluded:
-                            emit(f"  Excluded: {', '.join(excluded)}")
-                        if region:
-                            emit(f"  Region: {region}")
-                        if not excluded and not region:
-                            emit(f"  No restrictions found")
-
-                        results.append((url, excluded, region))
-                    except Exception as e:
-                        emit(f"  Error: {str(e)}")
-                        results.append((url, [], None))
-            finally:
-                try:
-                    if hasattr(browser, 'close'):
-                        browser.close()
-                except Exception:
-                    pass
-
-        return results
-
-    return _run_in_thread(_do_batch)
 
 
 # ---------------------------------------------------------------------------
@@ -785,20 +783,39 @@ def _extract_deadline_from_page(page):
     return ''
 
 
-def fetch_giveaway_deadlines_batch(urls, callback=None, on_result=None):
-    """Fetch deadlines for multiple giveaway URLs using a single browser.
+# ---------------------------------------------------------------------------
+# Combined batch enrichment
+# ---------------------------------------------------------------------------
+
+def enrich_giveaways_batch(urls, on_result=None, callback=None):
+    """Enrich multiple giveaway URLs in a single browser session.
+
+    Visits each URL once and extracts deadline, T&C, and ended/region
+    status in one pass.  Uses a fresh browser (no persistent context)
+    to avoid profile-lock errors when the user's browser is open.
 
     Args:
-        urls: list of giveaway URLs to fetch deadlines for.
+        urls: list of giveaway URLs to enrich.
+        on_result: optional callable invoked after each URL with a dict::
+
+                {"url", "deadline", "excluded", "region", "ended", "region_blocked"}
+
+            so the caller can persist results incrementally.
+            **Must not call Streamlit widgets** (runs in a background
+            thread).
         callback: optional callable receiving log messages (str).
-        on_result: optional callable invoked after each URL with
-            ``(url, deadline_text)`` so the caller can persist results
-            incrementally (e.g. write to the DB while the batch is
-            still running).
 
     Returns:
-        list of (url, deadline_text) tuples.
-        deadline_text is an empty string if no deadline could be found.
+        list of dicts, one per URL::
+
+            {
+                "url": str,
+                "deadline": str,           # empty string if not found
+                "excluded": list[str],     # excluded country codes
+                "region": str | None,      # detected region
+                "ended": bool,
+                "region_blocked": bool,
+            }
     """
     if not urls:
         return []
@@ -824,24 +841,64 @@ def fetch_giveaway_deadlines_batch(urls, callback=None, on_result=None):
 
             try:
                 for i, url in enumerate(urls, 1):
-                    emit(f"[{i}/{len(urls)}] Fetching deadline: {url}")
+                    emit(f"[{i}/{len(urls)}] Enriching: {url}")
                     try:
-                        page.goto(url, wait_until="networkidle", timeout=30000)
+                        page.goto(url, wait_until="domcontentloaded", timeout=30000)
                         time.sleep(3)  # let the Gleam widget render
 
-                        deadline = _extract_deadline_from_page(page)
-                        if deadline:
-                            emit(f"  Deadline: {deadline}")
-                        else:
-                            emit(f"  No deadline found")
+                        # -- Ended / region-blocked (fast text checks) --
+                        ended = detect_ended(page)
+                        region_blocked = detect_region_restriction(page)
 
-                        results.append((url, deadline))
+                        if ended:
+                            emit(f"  Ended")
+                        if region_blocked:
+                            emit(f"  Region blocked")
+
+                        # -- Deadline --
+                        deadline = ''
+                        if not ended and not region_blocked:
+                            deadline = _extract_deadline_from_page(page)
+                            if deadline:
+                                emit(f"  Deadline: {deadline}")
+
+                        # -- T&C --
+                        excluded = []
+                        region = None
+                        if not ended and not region_blocked:
+                            excluded, region = check_terms_conditions(page, url)
+                            if excluded:
+                                emit(f"  Excluded: {', '.join(excluded)}")
+                            if region:
+                                emit(f"  Region: {region}")
+
+                        if not ended and not region_blocked and not excluded and not region and not deadline:
+                            emit(f"  No restrictions or deadline found")
+
+                        entry = {
+                            "url": url,
+                            "deadline": deadline,
+                            "excluded": excluded,
+                            "region": region,
+                            "ended": ended,
+                            "region_blocked": region_blocked,
+                        }
+                        results.append(entry)
+
                     except Exception as e:
                         emit(f"  Error: {str(e)}")
-                        results.append((url, ''))
+                        entry = {
+                            "url": url,
+                            "deadline": '',
+                            "excluded": [],
+                            "region": None,
+                            "ended": False,
+                            "region_blocked": False,
+                        }
+                        results.append(entry)
 
                     if on_result:
-                        on_result(*results[-1])
+                        on_result(results[-1])
             finally:
                 try:
                     browser.close()

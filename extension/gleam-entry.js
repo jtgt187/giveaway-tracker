@@ -6,9 +6,10 @@
   // -- Guard: only run on competition/giveaway pages --------------------
   const path = location.pathname;
   // Gleam competition URLs look like: /competitions/xxxxx/yyyy or /xxxxx/yyyy
-  // Skip non-competition pages like /giveaways, /login, /account, etc.
-  const skipPaths = ['/giveaways', '/login', '/signup', '/account', '/settings', '/privacy', '/terms'];
-  if (skipPaths.some(p => path.startsWith(p))) return;
+  // Skip non-competition pages like /login, /account, etc.
+  // Note: /giveaways/XXXXX is a valid giveaway URL, so only skip /giveaways exactly
+  const skipPathsExact = ['/giveaways', '/login', '/signup', '/account', '/settings', '/privacy', '/terms'];
+  if (skipPathsExact.some(p => path === p || path === p + '/')) return;
   // Must have at least one path segment after domain
   if (path === '/' || path === '') return;
 
@@ -502,6 +503,7 @@
   }
 
   function updateEntryStatus(index, status) {
+    if (index < 0 || index >= entryMethods.length) return;
     entryMethods[index].status = status;
 
     var item = document.querySelector('.gae-entry-item[data-index="' + index + '"]');

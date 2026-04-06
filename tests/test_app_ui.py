@@ -493,7 +493,7 @@ def test_status_filter_selectbox_filters_correctly(tmp_db, sample_giveaways):
 
 
 # ===========================================================================
-# "Check T&C" button
+# "Enrich All" button (T&C + deadlines + ended/region detection)
 # ===========================================================================
 
 def test_check_tc_updates_terms(tmp_db, sample_giveaway):
@@ -503,7 +503,7 @@ def test_check_tc_updates_terms(tmp_db, sample_giveaway):
     add_giveaway(**sample_giveaway)
     gid = get_giveaways()[0]["id"]
 
-    # Simulate check_giveaway_terms_batch result
+    # Simulate enrich_giveaways_batch result
     update_terms_check(gid, True, "us,uk", detected_region="worldwide")
 
     row = get_giveaways()[0]

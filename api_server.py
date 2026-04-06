@@ -48,7 +48,18 @@ class APIHandler(BaseHTTPRequestHandler):
         pass
 
     def _set_cors_headers(self):
-        self.send_header('Access-Control-Allow-Origin', '*')
+        # Only allow the Chrome extension and localhost origins (not wildcard)
+        origin = self.headers.get('Origin', '')
+        allowed = (
+            origin.startswith('chrome-extension://')
+            or origin.startswith('http://localhost')
+            or origin.startswith('http://127.0.0.1')
+            or origin == ''  # same-origin requests have no Origin header
+        )
+        if allowed:
+            self.send_header('Access-Control-Allow-Origin', origin or 'http://127.0.0.1:7778')
+        else:
+            self.send_header('Access-Control-Allow-Origin', 'null')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
 
@@ -62,8 +73,14 @@ class APIHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _read_json(self):
-        length = int(self.headers.get('Content-Length', 0))
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+        except (ValueError, TypeError):
+            return None
         if length == 0:
+            return None
+        # Reject excessively large payloads (max 1 MB)
+        if length > 1_048_576:
             return None
         raw = self.rfile.read(length)
         try:
@@ -161,36 +178,38 @@ class APIHandler(BaseHTTPRequestHandler):
 
         if existing:
             conn = get_connection()
-            cursor = conn.cursor()
-            updates = []
-            params = []
+            try:
+                cursor = conn.cursor()
+                updates = []
+                params = []
 
-            # Update deadline if provided and current one is empty or relative
-            current_deadline = existing.get('deadline', '')
-            if deadline and (
-                not current_deadline
-                or (_is_relative_deadline(current_deadline) and not _is_relative_deadline(deadline))
-            ):
-                updates.append('deadline = ?')
-                params.append(deadline)
+                # Update deadline if provided and current one is empty or relative
+                current_deadline = existing.get('deadline', '')
+                if deadline and (
+                    not current_deadline
+                    or (_is_relative_deadline(current_deadline) and not _is_relative_deadline(deadline))
+                ):
+                    updates.append('deadline = ?')
+                    params.append(deadline)
 
-            # Update title if provided and better than current
-            cleaned = clean_title(title, href)
-            if cleaned and len(cleaned) > 3:
-                current = existing.get('title', '')
-                # Replace if current is empty, a URL, or shorter
-                if not current or current.startswith('http') or len(cleaned) > len(current):
-                    updates.append('title = ?')
-                    params.append(cleaned)
+                # Update title if provided and better than current
+                cleaned = clean_title(title, href)
+                if cleaned and len(cleaned) > 3:
+                    current = existing.get('title', '')
+                    # Replace if current is empty, a URL, or shorter
+                    if not current or current.startswith('http') or len(cleaned) > len(current):
+                        updates.append('title = ?')
+                        params.append(cleaned)
 
-            if updates:
-                params.append(existing['id'])
-                cursor.execute(
-                    f"UPDATE giveaways SET {', '.join(updates)} WHERE id = ?",
-                    params,
-                )
-                conn.commit()
-            conn.close()
+                if updates:
+                    params.append(existing['id'])
+                    cursor.execute(
+                        f"UPDATE giveaways SET {', '.join(updates)} WHERE id = ?",
+                        params,
+                    )
+                    conn.commit()
+            finally:
+                conn.close()
             self._send_json({'updated': bool(updates), 'id': existing['id']})
         else:
             # Link not in DB yet -- add it

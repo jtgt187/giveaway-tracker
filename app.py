@@ -13,11 +13,16 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from database import init_db, add_giveaway, add_giveaways_batch, get_giveaways, get_giveaways_display, update_giveaway_status, get_stats, update_giveaway_entries, get_giveaway_by_url, delete_not_eligible, update_terms_check, add_to_blacklist, get_blacklist, remove_from_blacklist, remove_expired_giveaways, get_connection, update_giveaway_deadline, get_unenriched_giveaways, clean_title, cleanup_titles, remove_non_gleam_giveaways, remove_truncated_giveaways
 from config import load_config, save_config
-from entry.auto_enter import auto_enter_giveaway, check_giveaway_terms, check_giveaway_terms_batch, fetch_giveaway_deadlines_batch
+from entry.auto_enter import auto_enter_giveaway, check_giveaway_terms, enrich_giveaways_batch
 from utils.country_check import is_eligible_for_country, is_region_blocked, is_ended
 from utils.probability import format_probability
 
-init_db()
+try:
+    init_db()
+except Exception as _init_err:
+    import traceback
+    print(f"[giveaway-tracker] Database initialization failed: {_init_err}", file=sys.stderr)
+    traceback.print_exc()
 
 # Start the local API server for live Chrome extension sync (port 7778)
 from api_server import start_api_server as _start_api_server
@@ -138,84 +143,71 @@ class EnrichmentWorker:
             with self._lock:
                 self._running = False
                 self._done = True
-            # Clear the cached display data so the next rerun picks up enriched data
-            _cached_giveaways_display.clear()
+            # Signal that cached display data should be invalidated on the
+            # next Streamlit rerun.  We do NOT call _cached_giveaways_display.clear()
+            # here because st.cache_data is not thread-safe.
+            self._cache_dirty = True
+
+    @property
+    def cache_dirty(self):
+        with self._lock:
+            return getattr(self, '_cache_dirty', False)
+
+    def clear_cache_dirty(self):
+        with self._lock:
+            self._cache_dirty = False
 
     def _do_enrichment(self):
         unenriched = get_unenriched_giveaways()
-        missing_dl = unenriched["missing_deadline"]
-        unchecked_tc = unenriched["unchecked_terms"]
 
-        if not missing_dl and not unchecked_tc:
+        if not unenriched:
             self._set_step("Nothing to enrich", 100)
             return
 
-        total_work = len(missing_dl) + len(unchecked_tc) + 1  # +1 for eligibility scan
-        completed = 0
+        total = len(unenriched)
+        total_work = total + 1  # +1 for eligibility scan
+        completed = [0]  # mutable counter for callback
 
-        # Step 1: Fetch missing deadlines
-        if missing_dl:
-            self._set_step(f"Fetching deadlines (0/{len(missing_dl)})...", 0)
-            urls = [g["url"] for g in missing_dl]
-            url_to_id = {g["url"]: g["id"] for g in missing_dl}
-            updated = 0
+        self._set_step(f"Enriching (0/{total})...", 0)
+        urls = [g["url"] for g in unenriched]
+        url_to_id = {g["url"]: g["id"] for g in unenriched}
 
-            def _on_deadline(url, deadline_text):
-                nonlocal updated, completed
-                gid = url_to_id.get(url)
-                if gid and deadline_text:
-                    update_giveaway_deadline(gid, deadline_text)
-                    updated += 1
-                completed += 1
-                pct = int(completed / total_work * 100)
-                self._set_step(
-                    f"Fetching deadlines ({completed}/{len(missing_dl)})...",
-                    pct,
-                )
-                self._set_detail(f"{url}")
+        def _on_result(entry):
+            gid = url_to_id.get(entry["url"])
+            if not gid:
+                completed[0] += 1
+                return
 
-            try:
-                fetch_giveaway_deadlines_batch(urls, on_result=_on_deadline)
-            except Exception as e:
-                self._set_error(f"Deadline fetch error: {e}")
-            # Ensure counter is correct even if some were skipped
-            completed = len(missing_dl)
-        else:
-            self._set_detail("All deadlines already populated")
+            # Persist deadline
+            if entry["deadline"]:
+                update_giveaway_deadline(gid, entry["deadline"])
 
-        # Step 2: Check T&C
-        if unchecked_tc:
-            self._set_step(f"Checking T&C (0/{len(unchecked_tc)})...",
-                           int(completed / total_work * 100))
-            urls = [g["url"] for g in unchecked_tc]
-            url_to_id = {g["url"]: g["id"] for g in unchecked_tc}
-            try:
-                results = check_giveaway_terms_batch(urls)
-                for url, excluded, detected_region in results:
-                    gid = url_to_id.get(url)
-                    if gid:
-                        excluded_str = ",".join(excluded) if excluded else ""
-                        update_terms_check(gid, True, excluded_str, detected_region)
-                    completed += 1
-                    pct = int(completed / total_work * 100)
-                    self._set_step(
-                        f"Checking T&C ({completed - len(missing_dl)}/{len(unchecked_tc)})...",
-                        pct,
-                    )
-                    self._set_detail(f"{url}")
-            except Exception as e:
-                self._set_error(f"T&C check error: {e}")
-            completed = len(missing_dl) + len(unchecked_tc)
-        else:
-            self._set_detail("All T&C already checked")
+            # Persist T&C results
+            excluded_str = ",".join(entry["excluded"]) if entry["excluded"] else ""
+            update_terms_check(gid, True, excluded_str, entry["region"])
 
-        # Step 3: Scan eligibility (fast, pure DB)
-        self._set_step("Scanning eligibility...", int(completed / total_work * 100))
+            # Auto-mark ended / region-blocked
+            if entry["ended"]:
+                update_giveaway_status(gid, "expired")
+            elif entry["region_blocked"]:
+                update_giveaway_status(gid, "not_eligible")
+
+            completed[0] += 1
+            pct = int(completed[0] / total_work * 100)
+            self._set_step(f"Enriching ({completed[0]}/{total})...", pct)
+            self._set_detail(entry["url"])
+
+        try:
+            enrich_giveaways_batch(urls, on_result=_on_result)
+        except Exception as e:
+            self._set_error(f"Enrichment error: {e}")
+
+        # Step 2: Scan eligibility (fast, pure DB)
+        self._set_step("Scanning eligibility...", 95)
         scan_existing_entries()
-        completed += 1
 
-        # Step 4: Remove expired
-        self._set_step("Removing expired giveaways...", 95)
+        # Step 3: Remove expired
+        self._set_step("Removing expired giveaways...", 97)
         remove_expired_giveaways()
 
         self._set_step("Enrichment complete", 100)
@@ -914,6 +906,12 @@ SVG_ICONS = {
 
 
 def scan_existing_entries():
+    """Re-evaluate eligibility for giveaways with status 'new'.
+
+    Uses an atomic UPDATE ... WHERE status = 'new' to avoid overwriting
+    statuses that were already changed by the enrichment worker (e.g. to
+    'expired' or 'not_eligible').
+    """
     giveaways = get_giveaways(status="new")
     if not giveaways:
         return
@@ -925,7 +923,39 @@ def scan_existing_entries():
         for g in giveaways:
             country = g.get("country_restriction", "worldwide")
             new_status = "eligible" if is_eligible_for_country(country, target_country) else "not_eligible"
-            cursor.execute("UPDATE giveaways SET status = ? WHERE id = ?", (new_status, g["id"]))
+            # Only update if status is still 'new' (atomic check to prevent race)
+            cursor.execute(
+                "UPDATE giveaways SET status = ? WHERE id = ? AND status = 'new'",
+                (new_status, g["id"]),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def rescan_all_eligibility():
+    """Re-evaluate eligibility for ALL giveaways when the target country changes.
+
+    Rechecks giveaways with status 'new', 'eligible', or 'not_eligible'.
+    Does NOT touch 'participated', 'expired', or 'skipped' statuses.
+    """
+    target_country = load_config().get("target_country", "germany")
+    from database import get_connection
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, country_restriction FROM giveaways WHERE status IN ('new', 'eligible', 'not_eligible')"
+        )
+        rows = cursor.fetchall()
+        for row in rows:
+            gid = row[0]
+            country = row[1] or "worldwide"
+            new_status = "eligible" if is_eligible_for_country(country, target_country) else "not_eligible"
+            cursor.execute(
+                "UPDATE giveaways SET status = ? WHERE id = ?",
+                (new_status, gid),
+            )
         conn.commit()
     finally:
         conn.close()
@@ -953,60 +983,53 @@ def run_enrichment_pipeline_blocking():
     Giveaways tab where the user expects to wait and see inline results.
     """
     unenriched = get_unenriched_giveaways()
-    missing_dl = unenriched["missing_deadline"]
-    unchecked_tc = unenriched["unchecked_terms"]
 
-    if not missing_dl and not unchecked_tc:
+    if not unenriched:
         return
 
     with st.status("Enriching giveaway data...", expanded=True) as status:
-        # Step 1: Fetch missing deadlines via Playwright
-        if missing_dl:
-            st.write(f"Fetching deadlines for {len(missing_dl)} giveaways...")
-            urls = [g["url"] for g in missing_dl]
-            url_to_id = {g["url"]: g["id"] for g in missing_dl}
-            updated = 0
+        total = len(unenriched)
+        st.write(f"Enriching {total} giveaways (deadlines, T&C, status)...")
+        urls = [g["url"] for g in unenriched]
+        url_to_id = {g["url"]: g["id"] for g in unenriched}
+        enriched = [0]
+        ended_count = [0]
+        blocked_count = [0]
 
-            def _save_deadline(url, deadline_text):
-                nonlocal updated
-                gid = url_to_id.get(url)
-                if gid and deadline_text:
-                    update_giveaway_deadline(gid, deadline_text)
-                    updated += 1
+        def _save_result(entry):
+            gid = url_to_id.get(entry["url"])
+            if not gid:
+                return
+            if entry["deadline"]:
+                update_giveaway_deadline(gid, entry["deadline"])
+            excluded_str = ",".join(entry["excluded"]) if entry["excluded"] else ""
+            update_terms_check(gid, True, excluded_str, entry["region"])
+            if entry["ended"]:
+                update_giveaway_status(gid, "expired")
+                ended_count[0] += 1
+            elif entry["region_blocked"]:
+                update_giveaway_status(gid, "not_eligible")
+                blocked_count[0] += 1
+            enriched[0] += 1
 
-            try:
-                fetch_giveaway_deadlines_batch(urls, on_result=_save_deadline)
-                st.write(f"Fetched {updated} deadline(s).")
-            except Exception as e:
-                st.write(f"Deadline fetch error: {e}")
-                if updated:
-                    st.write(f"({updated} deadline(s) were saved before the error.)")
-        else:
-            st.write("All deadlines already populated (extension prefetch).")
+        try:
+            enrich_giveaways_batch(urls, on_result=_save_result)
+            parts = [f"Enriched {enriched[0]}/{total} giveaways."]
+            if ended_count[0]:
+                parts.append(f"{ended_count[0]} ended.")
+            if blocked_count[0]:
+                parts.append(f"{blocked_count[0]} region-blocked.")
+            st.write(" ".join(parts))
+        except Exception as e:
+            st.write(f"Enrichment error: {e}")
+            if enriched[0]:
+                st.write(f"({enriched[0]} giveaway(s) were saved before the error.)")
 
-        # Step 2: Check T&C for unchecked entries
-        if unchecked_tc:
-            st.write(f"Checking T&C for {len(unchecked_tc)} giveaways...")
-            urls = [g["url"] for g in unchecked_tc]
-            url_to_id = {g["url"]: g["id"] for g in unchecked_tc}
-            try:
-                results = check_giveaway_terms_batch(urls)
-                for url, excluded, detected_region in results:
-                    gid = url_to_id.get(url)
-                    if gid:
-                        excluded_str = ",".join(excluded) if excluded else ""
-                        update_terms_check(gid, True, excluded_str, detected_region)
-                st.write(f"Checked T&C for {len(results)} giveaways.")
-            except Exception as e:
-                st.write(f"T&C check error: {e}")
-        else:
-            st.write("All T&C already checked.")
-
-        # Step 3: Re-scan eligibility with updated data
+        # Re-scan eligibility with updated data
         st.write("Scanning eligibility...")
         scan_existing_entries()
 
-        # Step 4: Remove any newly expired entries
+        # Remove any newly expired entries
         removed = remove_expired_giveaways()
         if removed:
             st.write(f"Removed {removed} expired giveaway(s).")
@@ -1230,6 +1253,11 @@ def main():
     </div>
     """, unsafe_allow_html=True)
 
+    # --- Invalidate display cache if background enrichment marked it dirty ---
+    if _enrichment_worker.cache_dirty:
+        _cached_giveaways_display.clear()
+        _enrichment_worker.clear_cache_dirty()
+
     # --- Background enrichment progress indicator ---
     _enrich_snap = _enrichment_worker.snapshot()
     if _enrich_snap["running"]:
@@ -1434,7 +1462,7 @@ def main():
                 for g in eligible:
                     with st.spinner(f"Entering: {g['title'][:50]}..."):
                         result, log = auto_enter_giveaway(g["url"])
-                        if result is True:
+                        if result == "success":
                             update_giveaway_status(g["id"], "participated")
                             entered += 1
                         elif result == "region_restricted":
@@ -1571,6 +1599,10 @@ def main():
                         if hours_left < 0:
                             countdown = "EXPIRED"
                             urgency_class = "urgency-critical"
+                        elif hours_left < 1:
+                            mins_left = max(0, int((dl_dt - now).total_seconds() / 60))
+                            countdown = f"{mins_left}m left"
+                            urgency_class = "urgency-critical"
                         elif hours_left < 24:
                             h = int(hours_left)
                             countdown = f"{h}h left"
@@ -1649,63 +1681,56 @@ def main():
             # Disable Playwright-dependent buttons while background enrichment is active
             _enrichment_busy = _enrichment_worker.running
 
-            action_col1, action_col2, action_col3, action_col4 = st.columns(4)
+            action_col1, action_col2, action_col3 = st.columns(3)
             with action_col1:
-                if st.button("🔄 Check T&C", use_container_width=True, disabled=_enrichment_busy):
-                    unchecked = [g for g in giveaways if not g.get("terms_checked")]
-                    if not unchecked:
-                        st.info("All giveaways already have T&C checked.")
+                if st.button("🔄 Enrich All", use_container_width=True, disabled=_enrichment_busy):
+                    unenriched = [g for g in giveaways
+                                  if not g.get("terms_checked") or not g.get("deadline")]
+                    if not unenriched:
+                        st.info("All giveaways already enriched.")
                     else:
-                        st.info(f"Checking T&C for {len(unchecked)} giveaways in a single browser session...")
-                        unchecked_urls = [g["url"] for g in unchecked]
-                        url_to_id = {g["url"]: g["id"] for g in unchecked}
-                        results = check_giveaway_terms_batch(unchecked_urls)
-                        for url, excluded, detected_region in results:
-                            gid = url_to_id.get(url)
-                            if gid:
-                                excluded_str = ",".join(excluded) if excluded else ""
-                                update_terms_check(gid, True, excluded_str, detected_region)
-                        st.success(f"Checked T&C for {len(results)} giveaways!")
+                        total = len(unenriched)
+                        st.info(f"Enriching {total} giveaways (deadlines, T&C, status)...")
+                        enrich_urls = [g["url"] for g in unenriched]
+                        url_to_id = {g["url"]: g["id"] for g in unenriched}
+                        ended_count = [0]
+                        blocked_count = [0]
+
+                        def _save_enrich(entry):
+                            gid = url_to_id.get(entry["url"])
+                            if not gid:
+                                return
+                            if entry["deadline"]:
+                                update_giveaway_deadline(gid, entry["deadline"])
+                            excluded_str = ",".join(entry["excluded"]) if entry["excluded"] else ""
+                            update_terms_check(gid, True, excluded_str, entry["region"])
+                            if entry["ended"]:
+                                update_giveaway_status(gid, "expired")
+                                ended_count[0] += 1
+                            elif entry["region_blocked"]:
+                                update_giveaway_status(gid, "not_eligible")
+                                blocked_count[0] += 1
+
+                        try:
+                            enrich_giveaways_batch(enrich_urls, on_result=_save_enrich)
+                        except Exception as e:
+                            st.error(f"Enrichment failed: {e}")
+                            return
+                        parts = [f"Enriched {total} giveaways!"]
+                        if ended_count[0]:
+                            parts.append(f"{ended_count[0]} ended.")
+                        if blocked_count[0]:
+                            parts.append(f"{blocked_count[0]} region-blocked.")
+                        st.success(" ".join(parts))
                         scan_existing_entries()
                         _cached_giveaways_display.clear()
                         st.rerun()
             with action_col2:
-                if st.button("📅 Fetch Deadlines", use_container_width=True, disabled=_enrichment_busy):
-                    missing_dl = [g for g in giveaways if not g.get("deadline")]
-                    if not missing_dl:
-                        st.info("All giveaways already have deadlines.")
-                    else:
-                        total = len(missing_dl)
-                        missing_urls = [g["url"] for g in missing_dl]
-                        url_to_id = {g["url"]: g["id"] for g in missing_dl}
-                        processed = [0]   # mutable counter for the callback
-                        found = [0]
-                        progress = st.progress(0, text=f"Fetching deadlines: 0/{total}...")
-
-                        def _save_deadline_live(url, deadline_text):
-                            gid = url_to_id.get(url)
-                            if gid and deadline_text:
-                                update_giveaway_deadline(gid, deadline_text)
-                                found[0] += 1
-                            processed[0] += 1
-                            progress.progress(
-                                processed[0] / total,
-                                text=f"Fetching deadlines: {processed[0]}/{total} checked, {found[0]} found...",
-                            )
-
-                        results = fetch_giveaway_deadlines_batch(
-                            missing_urls, on_result=_save_deadline_live,
-                        )
-                        progress.empty()
-                        st.success(f"Found deadlines for {found[0]}/{total} giveaways!")
-                        _cached_giveaways_display.clear()
-                        st.rerun()
-            with action_col3:
                 if st.button("🔄 Refresh Eligibility", use_container_width=True):
                     scan_existing_entries()
                     _cached_giveaways_display.clear()
                     st.rerun()
-            with action_col4:
+            with action_col3:
                 if st.session_state.get("confirm_clear_all"):
                     st.warning("This will delete all giveaway data. Are you sure?")
                     confirm_col1, confirm_col2 = st.columns(2)
@@ -1771,7 +1796,12 @@ def main():
                     dl_dt = _pd(g.get("deadline", ""))
                     if dl_dt:
                         hrs = (dl_dt - _now).total_seconds() / 3600
-                        if hrs < 24:
+                        if hrs < 0:
+                            dl_text = "EXPIRED"
+                        elif hrs < 1:
+                            mins = max(0, int((dl_dt - _now).total_seconds() / 60))
+                            dl_text = f"{mins}m left"
+                        elif hrs < 24:
                             dl_text = f"{int(hrs)}h left"
                         elif hrs < 72:
                             dl_text = f"{int(hrs/24)}d {int(hrs%24)}h left"
@@ -1808,7 +1838,7 @@ def main():
                                     update_giveaway_status(g["id"], "expired")
                                     st.session_state.entry_stats["failed"] += 1
                                     st.error("This competition has ended!")
-                                elif result is True:
+                                elif result == "success":
                                     update_giveaway_status(g["id"], "participated")
                                     st.session_state.entry_stats["entered"] += 1
                                     st.success("Entered successfully!")
@@ -1838,7 +1868,7 @@ def main():
                                 update_giveaway_status(g["id"], "expired")
                                 st.session_state.entry_stats["failed"] += 1
                                 st.error(f"Ended: {g['title'][:60]}")
-                            elif result is True:
+                            elif result == "success":
                                 update_giveaway_status(g["id"], "participated")
                                 st.session_state.entry_stats["entered"] += 1
                                 st.success(f"Entered: {g['title'][:60]}")
@@ -1894,7 +1924,10 @@ def main():
         if selected_country != config.get("target_country"):
             config["target_country"] = selected_country
             save_config(config)
-            st.success("Country updated!")
+            # Re-evaluate eligibility for all giveaways with the new country
+            rescan_all_eligibility()
+            _cached_giveaways_display.clear()
+            st.success("Country updated! Eligibility re-evaluated.")
         st.markdown('</div>', unsafe_allow_html=True)
 
         st.markdown('<div class="settings-section">', unsafe_allow_html=True)

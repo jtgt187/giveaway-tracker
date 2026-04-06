@@ -64,7 +64,7 @@
     var allBtns = document.querySelectorAll('[role="button"]');
     for (var j = 0; j < allBtns.length; j++) {
       var label = (allBtns[j].getAttribute('aria-label') || '').toLowerCase();
-      if (label.includes('following') && !label.includes('followers')) return true;
+      if (label.includes('following') && !label.includes('followers') && !label.includes('not following')) return true;
     }
 
     // Text-based fallback
@@ -93,7 +93,8 @@
 
     while (Date.now() - start < TIMEOUT) {
       // Strategy 1: data-testid selectors (most reliable)
-      followBtn = document.querySelector('[data-testid$="-follow"]');
+      // Use :not to exclude unfollow buttons (since $="-follow" also matches $="-unfollow")
+      followBtn = document.querySelector('[data-testid$="-follow"]:not([data-testid$="-unfollow"])');
       if (followBtn) {
         var btnText = (followBtn.textContent || '').trim().toLowerCase();
         if (btnText === 'following' || btnText === 'unfollow') {
@@ -113,12 +114,17 @@
       }
       if (followBtn) break;
 
-      // Strategy 3: aria-label based
-      var ariaButtons = document.querySelectorAll('[role="button"][aria-label*="Follow @"]');
-      if (ariaButtons.length > 0) {
-        followBtn = ariaButtons[0];
-        break;
+      // Strategy 3: aria-label based (use starts-with ^= to avoid matching "Following @")
+      var ariaButtons = document.querySelectorAll('[role="button"][aria-label^="Follow @"]');
+      for (var ai = 0; ai < ariaButtons.length; ai++) {
+        var ariaLabel = (ariaButtons[ai].getAttribute('aria-label') || '');
+        // Exclude "Following @" which also starts with "Follow"
+        if (!ariaLabel.startsWith('Following')) {
+          followBtn = ariaButtons[ai];
+          break;
+        }
       }
+      if (followBtn) break;
 
       // Strategy 4: Text-based fallback
       followBtn = findButtonByText('follow');

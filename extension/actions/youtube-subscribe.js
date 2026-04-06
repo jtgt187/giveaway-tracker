@@ -31,7 +31,7 @@
 
       // Check button text
       const btnText = (subBtn.textContent || '').trim().toLowerCase();
-      if (btnText.includes('subscribed') && !btnText.includes('subscribe')) return true;
+      if (btnText === 'subscribed') return true;
     }
 
     // Alternative: check for the subscribe button's aria state
@@ -47,8 +47,8 @@
   }
 
   function isNotLoggedIn() {
-    // YouTube shows "Sign in" button when not logged in
-    var signInBtn = document.querySelector('a[href*="accounts.google.com"], ytd-button-renderer a[href*="accounts.google.com"]');
+    // YouTube shows "Sign in" button when not logged in (only in top bar)
+    var signInBtn = document.querySelector('ytd-masthead a[href*="accounts.google.com/ServiceLogin"]');
     if (signInBtn) return true;
     // Check for the "Sign in" text button in top bar
     var buttons = document.querySelectorAll('ytd-button-renderer, tp-yt-paper-button');

@@ -26,7 +26,7 @@
     var buttons = document.querySelectorAll('article [role="button"]');
     for (var i = 0; i < buttons.length; i++) {
       var label = (buttons[i].getAttribute('aria-label') || '').toLowerCase();
-      if (label.includes('unlike') || label.includes('liked')) return true;
+      if (label.includes('unlike') || (label.includes('liked') && label.includes('@'))) return true;
     }
 
     return false;
@@ -56,7 +56,7 @@
       var buttons = document.querySelectorAll('article [role="button"]');
       for (var i = 0; i < buttons.length; i++) {
         var label = (buttons[i].getAttribute('aria-label') || '').toLowerCase();
-        if (label.includes('like') && !label.includes('unlike')) {
+        if (label.includes('like') && !label.includes('unlike') && !label.includes('liked')) {
           likeBtn = buttons[i];
           break;
         }
