@@ -25,10 +25,10 @@ def _run_in_thread(fn, *args, **kwargs):
         except RuntimeError:
             _original_loop = None
         if sys.platform == "win32":
-            # ProactorEventLoop (the default on Windows) is the only loop
-            # type that supports subprocess creation.  SelectorEventLoop
-            # does NOT support subprocesses on Windows.
-            _new_loop = asyncio.new_event_loop()
+            # Ensure the ProactorEventLoop policy is active in this thread
+            # so subprocess creation is supported (required on Python 3.12+).
+            asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+            _new_loop = asyncio.ProactorEventLoop()
             asyncio.set_event_loop(_new_loop)
         try:
             return fn(*args, **kwargs)

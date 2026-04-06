@@ -660,3 +660,22 @@ def remove_non_gleam_giveaways():
     conn.commit()
     conn.close()
     return removed
+
+
+def remove_truncated_giveaways():
+    """Delete giveaways whose URL was truncated by a search engine.
+
+    These contain the Unicode ellipsis character (U+2026 ``…``) or end with
+    three ASCII dots (``...``).  Such URLs point nowhere useful and produce
+    broken links in the UI.  Returns the count of removed rows.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    # U+2026 is stored as the literal character in SQLite text
+    cursor.execute(
+        "DELETE FROM giveaways WHERE url LIKE '%\u2026%' OR url LIKE '%...'"
+    )
+    removed = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return removed

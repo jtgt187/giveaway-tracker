@@ -290,6 +290,40 @@ class TestImportNdjsonLinks:
         rows = get_giveaways(gleam_only=False, exclude_not_eligible=False)
         assert rows[0]["source"] == "extension"
 
+    def test_truncated_urls_filtered_ellipsis(self, app_module, tmp_config, tmp_db, tmp_path):
+        """URLs containing Unicode ellipsis (U+2026) should be skipped during import."""
+        from database import get_giveaways
+
+        entries = [
+            {"href": "https://gleam.io/abc/good-link", "text": "Good"},
+            {"href": "https://gleam.io/def/truncated-titl\u2026", "text": "Truncated"},
+        ]
+        _setup_import_dir(tmp_path, None, entries=entries)
+
+        count, msg = app_module.import_ndjson_links()
+        assert count == 1
+
+        rows = get_giveaways(gleam_only=False, exclude_not_eligible=False)
+        assert len(rows) == 1
+        assert rows[0]["url"] == "https://gleam.io/abc/good-link"
+
+    def test_truncated_urls_filtered_three_dots(self, app_module, tmp_config, tmp_db, tmp_path):
+        """URLs ending with three ASCII dots should be skipped during import."""
+        from database import get_giveaways
+
+        entries = [
+            {"href": "https://gleam.io/abc/good-link", "text": "Good"},
+            {"href": "https://gleam.io/xyz/some-title...", "text": "Dotted"},
+        ]
+        _setup_import_dir(tmp_path, None, entries=entries)
+
+        count, msg = app_module.import_ndjson_links()
+        assert count == 1
+
+        rows = get_giveaways(gleam_only=False, exclude_not_eligible=False)
+        assert len(rows) == 1
+        assert rows[0]["url"] == "https://gleam.io/abc/good-link"
+
 
 # ===========================================================================
 # Multi-file import scenarios

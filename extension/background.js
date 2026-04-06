@@ -354,6 +354,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ count: links.length });
         return true;
       }
+      // Reject truncated URLs (containing ellipsis character or trailing dots)
+      if (u.href.includes('\u2026') || /\.{2,}$/.test(u.pathname)) {
+        sendResponse({ count: links.length });
+        return true;
+      }
     } catch (e) {
       sendResponse({ count: links.length });
       return true;

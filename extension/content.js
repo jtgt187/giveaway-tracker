@@ -96,6 +96,10 @@
   function sendLink(href, text) {
     const normalized = normalizeGleamUrl(href);
     if (seenHref.has(normalized)) return;
+    // Defense-in-depth: never send truncated URLs to the background script.
+    // extractFromHTML() trusts a.href which can still carry an ellipsis when
+    // Google renders truncated cite text as a link.
+    if (isTruncatedUrl(normalized)) return;
     seenHref.add(normalized);
     pageCount++;
 

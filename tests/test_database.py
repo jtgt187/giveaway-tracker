@@ -1048,3 +1048,61 @@ def test_remove_non_gleam_giveaways_none_to_remove(tmp_db):
     add_giveaway("Gleam", "https://gleam.io/abc/test", "test")
     removed = remove_non_gleam_giveaways()
     assert removed == 0
+
+
+# ---------------------------------------------------------------------------
+# remove_truncated_giveaways  (Cleanup truncated URLs)
+# ---------------------------------------------------------------------------
+
+def test_remove_truncated_giveaways_unicode_ellipsis(tmp_db):
+    """URLs containing Unicode ellipsis (U+2026) should be removed."""
+    from database import add_giveaway, get_giveaways, remove_truncated_giveaways
+
+    add_giveaway("Good", "https://gleam.io/abc/good-giveaway", "test")
+    add_giveaway("Truncated", "https://gleam.io/def/some-titl\u2026", "test")
+
+    removed = remove_truncated_giveaways()
+    assert removed == 1
+
+    rows = get_giveaways(gleam_only=False, exclude_not_eligible=False)
+    assert len(rows) == 1
+    assert rows[0]["url"] == "https://gleam.io/abc/good-giveaway"
+
+
+def test_remove_truncated_giveaways_three_dots(tmp_db):
+    """URLs ending with three ASCII dots should be removed."""
+    from database import add_giveaway, get_giveaways, remove_truncated_giveaways
+
+    add_giveaway("Good", "https://gleam.io/abc/good-giveaway", "test")
+    add_giveaway("Dotted", "https://gleam.io/xyz/some-title...", "test")
+
+    removed = remove_truncated_giveaways()
+    assert removed == 1
+
+    rows = get_giveaways(gleam_only=False, exclude_not_eligible=False)
+    assert len(rows) == 1
+    assert rows[0]["url"] == "https://gleam.io/abc/good-giveaway"
+
+
+def test_remove_truncated_giveaways_none_to_remove(tmp_db):
+    from database import add_giveaway, remove_truncated_giveaways
+
+    add_giveaway("Normal", "https://gleam.io/abc/test", "test")
+    removed = remove_truncated_giveaways()
+    assert removed == 0
+
+
+def test_remove_truncated_giveaways_mixed(tmp_db):
+    """Both ellipsis and dot-truncated URLs should be removed in one call."""
+    from database import add_giveaway, get_giveaways, remove_truncated_giveaways
+
+    add_giveaway("Good", "https://gleam.io/abc/good", "test")
+    add_giveaway("Ellipsis", "https://gleam.io/def/trunc\u2026", "test")
+    add_giveaway("Dots", "https://gleam.io/ghi/trunc...", "test")
+
+    removed = remove_truncated_giveaways()
+    assert removed == 2
+
+    rows = get_giveaways(gleam_only=False, exclude_not_eligible=False)
+    assert len(rows) == 1
+    assert rows[0]["url"] == "https://gleam.io/abc/good"

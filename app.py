@@ -10,7 +10,7 @@ import json
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from database import init_db, add_giveaway, add_giveaways_batch, get_giveaways, get_giveaways_display, update_giveaway_status, get_stats, update_giveaway_entries, get_giveaway_by_url, delete_not_eligible, update_terms_check, add_to_blacklist, get_blacklist, remove_from_blacklist, remove_expired_giveaways, get_connection, update_giveaway_deadline, get_unenriched_giveaways, clean_title, cleanup_titles, remove_non_gleam_giveaways
+from database import init_db, add_giveaway, add_giveaways_batch, get_giveaways, get_giveaways_display, update_giveaway_status, get_stats, update_giveaway_entries, get_giveaway_by_url, delete_not_eligible, update_terms_check, add_to_blacklist, get_blacklist, remove_from_blacklist, remove_expired_giveaways, get_connection, update_giveaway_deadline, get_unenriched_giveaways, clean_title, cleanup_titles, remove_non_gleam_giveaways, remove_truncated_giveaways
 from config import load_config, save_config
 from entry.auto_enter import auto_enter_giveaway, check_giveaway_terms, check_giveaway_terms_batch, fetch_giveaway_deadlines_batch
 from utils.country_check import is_eligible_for_country, is_region_blocked, is_ended
@@ -937,6 +937,9 @@ def import_ndjson_links():
                         deadline = entry.get("deadline", "")
                         # Strict gleam.io URL check: must start with https://gleam.io/
                         if href and href.startswith("https://gleam.io/"):
+                            # Skip truncated URLs (contain ellipsis … or end with ...)
+                            if "\u2026" in href or href.endswith("..."):
+                                continue
                             batch.append({
                                 "title": clean_title(text, href),
                                 "url": href,
@@ -974,12 +977,13 @@ def main():
     if "removed_giveaway_ids" not in st.session_state:
         st.session_state.removed_giveaway_ids = set()
 
-    # One-time cleanup on first load: remove non-gleam URLs and fix titles
+    # One-time cleanup on first load: remove non-gleam URLs, truncated URLs, and fix titles
     if "db_cleaned" not in st.session_state:
         non_gleam = remove_non_gleam_giveaways()
+        truncated = remove_truncated_giveaways()
         title_fixes = cleanup_titles()
         st.session_state.db_cleaned = True
-        if non_gleam or title_fixes:
+        if non_gleam or truncated or title_fixes:
             _cached_giveaways_display.clear()
 
     # Remove expired giveaways on every page load (fast indexed SQL query)
