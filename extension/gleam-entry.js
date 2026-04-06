@@ -373,7 +373,26 @@
   // Extract the giveaway deadline/end date from the Gleam widget.
   // Gleam typically shows a countdown timer or an end-date element.
   function extractDeadline() {
-    // Try common selectors for Gleam countdown/timer/end-date elements
+    // Priority 1: Gleam's gl-countdown element carries a data-ends Unix timestamp.
+    // This is the most reliable source and works on both standalone and embedded pages.
+    var countdownEl = document.querySelector('[gl-countdown][data-ends]')
+      || document.querySelector('.square-describe[data-ends]');
+    if (countdownEl) {
+      var endTs = parseInt(countdownEl.getAttribute('data-ends'), 10);
+      if (endTs > 0) {
+        // Convert Unix timestamp to ISO-like date string the backend can parse
+        var d = new Date(endTs * 1000);
+        // Format: "DD Month YYYY at HH:MM:SS" (matches backend parse_deadline patterns)
+        var months = ['January','February','March','April','May','June',
+                      'July','August','September','October','November','December'];
+        return d.getDate() + ' ' + months[d.getMonth()] + ' ' + d.getFullYear()
+          + ' at ' + String(d.getHours()).padStart(2,'0')
+          + ':' + String(d.getMinutes()).padStart(2,'0')
+          + ':' + String(d.getSeconds()).padStart(2,'0');
+      }
+    }
+
+    // Priority 2: Try common selectors for Gleam countdown/timer/end-date elements
     var timerSelectors = [
       '.countdown',
       '.competition-countdown',
@@ -417,6 +436,35 @@
     return '';
   }
 
+  // Detect if the giveaway has ended using Gleam's DOM elements.
+  // Checks the gl-countdown element for past data-ends timestamps and "Ended" status text.
+  function detectEnded() {
+    // Check gl-countdown data-ends attribute — if end timestamp is in the past, it's ended
+    var countdownEl = document.querySelector('[gl-countdown][data-ends]')
+      || document.querySelector('.square-describe[data-ends]');
+    if (countdownEl) {
+      var endTs = parseInt(countdownEl.getAttribute('data-ends'), 10);
+      if (endTs > 0 && endTs * 1000 < Date.now()) return true;
+      // Also check for the one-line class (Gleam adds this when ended)
+      if (countdownEl.classList.contains('one-line')) return true;
+    }
+
+    // Check for "Ended" text in the status span within the countdown element
+    var statusEls = document.querySelectorAll('.square-describe .status');
+    for (var i = 0; i < statusEls.length; i++) {
+      var text = (statusEls[i].textContent || '').trim().toLowerCase();
+      if (text === 'ended') return true;
+    }
+
+    // Fall back to existing keyword-based detection on page text
+    var bodyText = (document.body ? document.body.textContent || '' : '').toLowerCase();
+    for (var j = 0; j < BAD_TITLES.length; j++) {
+      if (bodyText.indexOf(BAD_TITLES[j]) !== -1) return true;
+    }
+
+    return false;
+  }
+
   // Normalize a gleam URL (same logic as content.js)
   function normalizeGleamUrl(urlStr) {
     try {
@@ -432,11 +480,12 @@
     }
   }
 
-  // Send giveaway metadata (title + deadline) to the background script
+  // Send giveaway metadata (title + deadline + ended status) to the background script
   // so it can be stored alongside the link entry and exported in NDJSON.
   function sendGiveawayMeta() {
     var title = extractGiveawayTitle();
     var deadline = extractDeadline();
+    var ended = detectEnded();
     var href = normalizeGleamUrl(location.href);
 
     chrome.runtime.sendMessage({
@@ -444,11 +493,12 @@
       href: href,
       title: title,
       deadline: deadline,
+      ended: ended,
     }, function(response) {
       if (chrome.runtime.lastError) {
         console.warn('[GleamAutoEntry] sendGiveawayMeta error:', chrome.runtime.lastError.message);
       } else {
-        console.log('[GleamAutoEntry] Metadata sent — title:', title, 'deadline:', deadline);
+        console.log('[GleamAutoEntry] Metadata sent — title:', title, 'deadline:', deadline, 'ended:', ended);
       }
     });
   }

@@ -161,10 +161,11 @@ function syncToLocalApi(entry) {
 }
 
 /**
- * Push a deadline/title update to the local database via the API.
+ * Push a deadline/title/ended update to the local database via the API.
  */
-function syncMetaToLocalApi(href, title, deadline) {
+function syncMetaToLocalApi(href, title, deadline, ended) {
   const payload = { href, title, deadline };
+  if (ended) payload.ended = true;
   if (localApiAvailable) {
     _postToApi('/api/meta', payload);
   } else {
@@ -549,7 +550,7 @@ function handleMessage(msg, sender, sendResponse) {
       }
     }
     // Always sync the metadata update to the local DB
-    syncMetaToLocalApi(msg.href, msg.title || '', msg.deadline || '');
+    syncMetaToLocalApi(msg.href, msg.title || '', msg.deadline || '', msg.ended || false);
     sendResponse({ ok: true });
     return;
   }

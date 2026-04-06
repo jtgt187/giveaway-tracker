@@ -12,6 +12,59 @@ _blacklist_cache = None
 _blacklist_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
+# Gleam URL validation
+# ---------------------------------------------------------------------------
+
+# Path patterns for actual giveaway/competition pages on gleam.io.
+# Mirrors the validation in extension/background.js and extension/content.js.
+# The key structural requirement is two path segments (/ID/slug), which
+# distinguishes giveaway pages from non-giveaway pages (/terms, /login, etc.)
+_GLEAM_GIVEAWAY_PATH_RE = re.compile(
+    r'^/(?:giveaways|competitions)/[A-Za-z0-9]+$'
+    r'|'
+    r'^/[A-Za-z0-9]+/[^/]+$'
+)
+
+# Non-giveaway paths that should always be rejected even though they're on gleam.io.
+_GLEAM_SKIP_PATHS = {
+    '/giveaways', '/login', '/signup', '/account', '/settings',
+    '/privacy', '/terms', '/about', '/contact', '/faq', '/help',
+    '/docs', '/api', '/embed',
+}
+
+
+def is_gleam_giveaway_url(url):
+    """Return True if *url* is a valid gleam.io giveaway/competition URL.
+
+    Validates both the hostname (must be gleam.io) and the path pattern
+    (must match ``/XXXXX/slug`` or ``/giveaways/XXXXX`` etc.).
+    Rejects non-giveaway paths like ``/terms``, ``/login``, ``/privacy``.
+    """
+    if not url or not isinstance(url, str):
+        return False
+    if not url.startswith('https://gleam.io/'):
+        return False
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.hostname != 'gleam.io':
+        return False
+    path = parsed.path.rstrip('/')
+    if not path or path == '/':
+        return False
+    # Check against known non-giveaway paths (exact match or prefix)
+    path_lower = path.lower()
+    for skip in _GLEAM_SKIP_PATHS:
+        if path_lower == skip or path_lower.startswith(skip + '/'):
+            return False
+    # Validate path matches giveaway pattern
+    if not _GLEAM_GIVEAWAY_PATH_RE.match(path):
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Title extraction & cleanup
 # ---------------------------------------------------------------------------
 
@@ -262,6 +315,8 @@ def is_blacklisted(url):
 def add_giveaway(title, url, source, description="", deadline="", country_restriction="worldwide", terms_checked=False, terms_excluded=""):
     if is_blacklisted(url):
         return False
+    if not is_gleam_giveaway_url(url):
+        return False
     conn = get_connection()
     try:
         cursor = conn.cursor()
@@ -292,7 +347,7 @@ def add_giveaways_batch(giveaway_list):
         new_count = 0
         for g in giveaway_list:
             url = g.get("url", "")
-            if not url or is_blacklisted(url):
+            if not url or is_blacklisted(url) or not is_gleam_giveaway_url(url):
                 continue
             try:
                 cursor.execute("""
@@ -769,3 +824,165 @@ def remove_truncated_giveaways():
     conn.commit()
     conn.close()
     return removed
+
+
+def remove_non_giveaway_gleam_paths():
+    """Delete gleam.io URLs that are not actual giveaway/competition pages.
+
+    Removes entries whose URL path matches non-giveaway pages like
+    ``/terms``, ``/privacy``, ``/login``, etc.  Returns the count of
+    removed rows.
+    """
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, url FROM giveaways WHERE url LIKE 'https://gleam.io/%'")
+    rows = cursor.fetchall()
+    bad_ids = []
+    for row in rows:
+        if not is_gleam_giveaway_url(row["url"]):
+            bad_ids.append(row["id"])
+    if bad_ids:
+        placeholders = ",".join("?" for _ in bad_ids)
+        cursor.execute(f"DELETE FROM giveaways WHERE id IN ({placeholders})", bad_ids)
+    conn.commit()
+    conn.close()
+    return len(bad_ids)
+
+
+# ---------------------------------------------------------------------------
+# Title-based expiry detection
+# ---------------------------------------------------------------------------
+
+# Patterns to extract dates from titles like "Ends April 5th", "Ends April 5, 2026",
+# "Ends 04/05/2026", etc.
+_TITLE_DATE_PATTERNS = [
+    # "Ends April 5th" / "Ends April 5Th" / "Ends April 5, 2026"
+    re.compile(
+        r'ends?\s+'
+        r'((?:january|february|march|april|may|june|july|august|september|october|november|december)'
+        r'\s+\d{1,2}(?:st|nd|rd|th)?'
+        r'(?:[,\s]+\d{4})?)',
+        re.IGNORECASE,
+    ),
+    # "Ends 04/05/2026" or "Ends 04-05-2026"
+    re.compile(
+        r'ends?\s+(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})',
+        re.IGNORECASE,
+    ),
+    # "Ends 5 April 2026" / "Ends 5 April"
+    re.compile(
+        r'ends?\s+'
+        r'(\d{1,2}\s+'
+        r'(?:january|february|march|april|may|june|july|august|september|october|november|december)'
+        r'(?:\s+\d{4})?)',
+        re.IGNORECASE,
+    ),
+]
+
+# Month name -> number mapping for manual parsing
+_MONTH_NAMES = {
+    'january': 1, 'february': 2, 'march': 3, 'april': 4,
+    'may': 5, 'june': 6, 'july': 7, 'august': 8,
+    'september': 9, 'october': 10, 'november': 11, 'december': 12,
+}
+
+
+def _parse_title_date(date_str):
+    """Try to parse a date string extracted from a giveaway title.
+
+    Handles formats like "April 5th", "April 5, 2026", "5 April 2026",
+    "04/05/2026".  If no year is specified, assumes the current year
+    (or next year if the date would be in the past by more than 30 days
+    with current year -- handles December->January rollover).
+    """
+    date_str = re.sub(r'(?:st|nd|rd|th)\b', '', date_str, flags=re.IGNORECASE).strip()
+
+    now = datetime.now()
+
+    # Try "Month Day [Year]" format
+    m = re.match(
+        r'(january|february|march|april|may|june|july|august|september|october|november|december)'
+        r'\s+(\d{1,2})(?:[,\s]+(\d{4}))?',
+        date_str, re.IGNORECASE,
+    )
+    if m:
+        month = _MONTH_NAMES[m.group(1).lower()]
+        day = int(m.group(2))
+        year = int(m.group(3)) if m.group(3) else now.year
+        try:
+            dt = datetime(year, month, day, 23, 59, 59)
+            return dt
+        except ValueError:
+            return None
+
+    # Try "Day Month [Year]" format
+    m = re.match(
+        r'(\d{1,2})\s+'
+        r'(january|february|march|april|may|june|july|august|september|october|november|december)'
+        r'(?:\s+(\d{4}))?',
+        date_str, re.IGNORECASE,
+    )
+    if m:
+        day = int(m.group(1))
+        month = _MONTH_NAMES[m.group(2).lower()]
+        year = int(m.group(3)) if m.group(3) else now.year
+        try:
+            dt = datetime(year, month, day, 23, 59, 59)
+            return dt
+        except ValueError:
+            return None
+
+    # Try numeric formats (MM/DD/YYYY or DD/MM/YYYY -- assume US format for titles)
+    m = re.match(r'(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})', date_str)
+    if m:
+        a, b, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if year < 100:
+            year += 2000
+        # Assume MM/DD/YYYY
+        month, day = a, b
+        if month > 12:
+            month, day = b, a
+        try:
+            return datetime(year, month, day, 23, 59, 59)
+        except ValueError:
+            return None
+
+    return None
+
+
+def expire_by_title_date():
+    """Scan giveaway titles for embedded end dates and mark expired ones.
+
+    Looks for patterns like "Ends April 5th" in the title text.  If the
+    parsed date is in the past, the giveaway status is set to ``expired``.
+
+    Returns the count of newly expired rows.
+    """
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT id, title FROM giveaways WHERE status NOT IN ('expired', 'skipped')"
+        )
+        rows = cursor.fetchall()
+        now = datetime.now()
+        expired_ids = []
+        for row in rows:
+            title = row["title"]
+            for pattern in _TITLE_DATE_PATTERNS:
+                m = pattern.search(title)
+                if m:
+                    dt = _parse_title_date(m.group(1))
+                    if dt and dt < now:
+                        expired_ids.append(row["id"])
+                    break  # only use the first matching pattern per title
+        if expired_ids:
+            placeholders = ",".join("?" for _ in expired_ids)
+            cursor.execute(
+                f"UPDATE giveaways SET status = 'expired' WHERE id IN ({placeholders})",
+                expired_ids,
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return len(expired_ids)

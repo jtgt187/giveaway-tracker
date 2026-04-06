@@ -574,7 +574,7 @@ def test_add_giveaway_with_terms_fields(tmp_db):
     from database import add_giveaway, get_giveaways
 
     add_giveaway(
-        "Terms Test", "https://gleam.io/terms/test", "test",
+        "Terms Test", "https://gleam.io/trmtst/test", "test",
         terms_checked=True, terms_excluded="us,uk",
     )
     row = get_giveaways()[0]
@@ -588,10 +588,15 @@ def test_add_giveaway_with_terms_fields(tmp_db):
 
 def test_get_giveaways_gleam_only_default(tmp_db):
     """Default gleam_only=True should filter out non-gleam URLs."""
-    from database import add_giveaway, get_giveaways
+    from database import add_giveaway, get_giveaways, get_connection
 
     add_giveaway("Gleam", "https://gleam.io/g1/test", "test")
-    add_giveaway("Other", "https://example.com/giveaway", "test")
+    # Insert non-gleam URL directly (bypasses validation, simulates legacy data)
+    conn = get_connection()
+    conn.execute("INSERT INTO giveaways (title, url, source) VALUES (?, ?, ?)",
+                 ("Other", "https://example.com/giveaway", "test"))
+    conn.commit()
+    conn.close()
 
     gleam_rows = get_giveaways(gleam_only=True)
     assert len(gleam_rows) == 1
@@ -686,10 +691,15 @@ def test_update_terms_check_no_region(tmp_db, sample_giveaway):
 
 def test_get_stats_gleam_only_filters(tmp_db):
     """get_stats with gleam_only should only count gleam URLs."""
-    from database import add_giveaway, get_stats
+    from database import add_giveaway, get_stats, get_connection
 
     add_giveaway("Gleam", "https://gleam.io/s1/test", "test")
-    add_giveaway("Other", "https://example.com/giveaway", "test")
+    # Insert non-gleam URL directly (bypasses validation, simulates legacy data)
+    conn = get_connection()
+    conn.execute("INSERT INTO giveaways (title, url, source) VALUES (?, ?, ?)",
+                 ("Other", "https://example.com/giveaway", "test"))
+    conn.commit()
+    conn.close()
 
     gleam_stats = get_stats(gleam_only=True)
     assert gleam_stats["total"] == 1
@@ -1028,11 +1038,17 @@ def test_cleanup_titles_fixes_url_titles(tmp_db):
 # ---------------------------------------------------------------------------
 
 def test_remove_non_gleam_giveaways(tmp_db):
-    from database import add_giveaway, get_giveaways, remove_non_gleam_giveaways
+    from database import add_giveaway, get_giveaways, remove_non_gleam_giveaways, get_connection
 
     add_giveaway("Gleam", "https://gleam.io/abc/test", "test")
-    add_giveaway("Other", "https://giveawaydrop.com/test", "test")
-    add_giveaway("Another", "https://example.com/giveaway", "test")
+    # Insert non-gleam URLs directly (bypasses validation, simulates legacy data)
+    conn = get_connection()
+    conn.execute("INSERT INTO giveaways (title, url, source) VALUES (?, ?, ?)",
+                 ("Other", "https://giveawaydrop.com/test", "test"))
+    conn.execute("INSERT INTO giveaways (title, url, source) VALUES (?, ?, ?)",
+                 ("Another", "https://example.com/giveaway", "test"))
+    conn.commit()
+    conn.close()
 
     removed = remove_non_gleam_giveaways()
     assert removed == 2

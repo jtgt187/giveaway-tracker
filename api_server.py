@@ -23,6 +23,7 @@ from database import (
     get_giveaway_by_url,
     get_giveaways_display,
     get_connection,
+    is_gleam_giveaway_url,
 )
 
 # Relative countdowns: "11 days", "2d 3h", "Ends in 5 days", etc.
@@ -138,9 +139,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
         href = data['href']
 
-        # Only accept gleam.io giveaway URLs
-        if not href.startswith('https://gleam.io/'):
-            self._send_json({'error': 'not a gleam.io URL'}, 400)
+        # Only accept valid gleam.io giveaway URLs (validates host + path pattern)
+        if not is_gleam_giveaway_url(href):
+            self._send_json({'error': 'not a valid gleam.io giveaway URL'}, 400)
             return
 
         text = data.get('text', '')
@@ -159,7 +160,7 @@ class APIHandler(BaseHTTPRequestHandler):
     def _handle_update_meta(self, data):
         """Update title and/or deadline for an existing giveaway.
 
-        Expects JSON: { href, title?, deadline? }
+        Expects JSON: { href, title?, deadline?, ended? }
         """
         if not data or not data.get('href'):
             self._send_json({'error': 'missing href'}, 400)
@@ -174,6 +175,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
         title = data.get('title', '')
         deadline = data.get('deadline', '')
+        ended = data.get('ended', False)
 
         existing = get_giveaway_by_url(href)
 
@@ -183,6 +185,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 cursor = conn.cursor()
                 updates = []
                 params = []
+
+                # If the extension detected this giveaway as ended, mark it expired
+                if ended and existing.get('status') not in ('expired', 'participated'):
+                    updates.append('status = ?')
+                    params.append('expired')
 
                 # Update deadline if provided and current one is empty or relative
                 current_deadline = existing.get('deadline', '')

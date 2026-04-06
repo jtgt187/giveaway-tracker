@@ -7,7 +7,7 @@ requests).  Each test maps to a specific UI element documented in the plan.
 Covers:
   - Blacklist "X" button (per-row)
   - "Delete All Not Eligible" button
-  - "Refresh Eligibility" button (scan_existing_entries logic)
+  - Eligibility scanning (scan_existing_entries logic, runs after enrichment)
   - "Check T&C" button (update_terms_check)
   - "Enter" button (success / region_restricted / ended)
   - "Skip" button
@@ -87,7 +87,7 @@ def test_delete_all_not_eligible_empty(tmp_db, sample_giveaway):
 
 
 # ===========================================================================
-# "Refresh Eligibility" button  (scan_existing_entries logic)
+# Eligibility scanning  (scan_existing_entries logic, runs after enrichment)
 # ===========================================================================
 
 def test_refresh_eligibility_transitions(tmp_db, sample_giveaways, tmp_config):

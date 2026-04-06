@@ -2,7 +2,7 @@
 
 Covers:
   - calculate_win_probability / format_probability (Win chance column)
-  - is_eligible_for_country (Refresh Eligibility button, scan_existing_entries)
+  - is_eligible_for_country (eligibility scanning / scan_existing_entries)
   - is_region_blocked (Enter button result handling)
   - is_ended (Enter button result handling)
   - detect_country_restriction (Check T&C button)
@@ -63,7 +63,7 @@ class TestFormatProbability:
 
 
 # ===========================================================================
-# Country Eligibility  (Refresh Eligibility button / scan_existing_entries)
+# Country Eligibility  (eligibility scanning / scan_existing_entries)
 # ===========================================================================
 
 class TestIsEligibleForCountry:

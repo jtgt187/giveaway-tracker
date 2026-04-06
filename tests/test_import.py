@@ -422,10 +422,10 @@ class TestMultiFileImport:
         from config import load_config, save_config
 
         files = []
-        for name in ["gleam-links.ndjson", "gleam-links (1).ndjson", "gleam-links-extra.ndjson"]:
+        for i, name in enumerate(["gleam-links.ndjson", "gleam-links (1).ndjson", "gleam-links-extra.ndjson"]):
             p = tmp_path / name
             _write_ndjson(str(p), [
-                {"href": f"https://gleam.io/{name}/link", "text": name},
+                {"href": f"https://gleam.io/fc{i}xx/link-from-file", "text": name},
             ])
             files.append(p)
 

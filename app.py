@@ -11,7 +11,7 @@ import threading
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from database import init_db, add_giveaway, add_giveaways_batch, get_giveaways, get_giveaways_display, update_giveaway_status, get_stats, update_giveaway_entries, get_giveaway_by_url, delete_not_eligible, update_terms_check, add_to_blacklist, get_blacklist, remove_from_blacklist, remove_expired_giveaways, get_connection, update_giveaway_deadline, get_unenriched_giveaways, clean_title, cleanup_titles, remove_non_gleam_giveaways, remove_truncated_giveaways
+from database import init_db, add_giveaway, add_giveaways_batch, get_giveaways, get_giveaways_display, update_giveaway_status, get_stats, update_giveaway_entries, get_giveaway_by_url, delete_not_eligible, update_terms_check, add_to_blacklist, get_blacklist, remove_from_blacklist, remove_expired_giveaways, get_connection, update_giveaway_deadline, get_unenriched_giveaways, clean_title, cleanup_titles, remove_non_gleam_giveaways, remove_truncated_giveaways, is_gleam_giveaway_url, remove_non_giveaway_gleam_paths, expire_by_title_date
 from config import load_config, save_config
 from entry.auto_enter import auto_enter_giveaway, check_giveaway_terms, enrich_giveaways_batch
 from utils.country_check import is_eligible_for_country, is_region_blocked, is_ended
@@ -179,18 +179,23 @@ class EnrichmentWorker:
                 return
 
             # Persist deadline
-            if entry["deadline"]:
+            if entry.get("deadline"):
                 update_giveaway_deadline(gid, entry["deadline"])
 
-            # Persist T&C results
-            excluded_str = ",".join(entry["excluded"]) if entry["excluded"] else ""
-            update_terms_check(gid, True, excluded_str, entry["region"])
+            # Persist T&C results (only if we actually checked T&C)
+            if not entry.get("email_blocked") and not entry.get("error"):
+                excluded_str = ",".join(entry["excluded"]) if entry.get("excluded") else ""
+                update_terms_check(gid, True, excluded_str, entry.get("region"))
 
-            # Auto-mark ended / region-blocked
-            if entry["ended"]:
+            # Auto-mark ended / region-blocked / needs_review
+            if entry.get("ended"):
                 update_giveaway_status(gid, "expired")
-            elif entry["region_blocked"]:
+            elif entry.get("region_blocked"):
                 update_giveaway_status(gid, "not_eligible")
+            elif entry.get("email_blocked"):
+                update_giveaway_status(gid, "needs_review", notes="enrichment_blocked:email_subscribe")
+            elif entry.get("error"):
+                update_giveaway_status(gid, "needs_review", notes=f"enrichment_error:{entry['error'][:200]}")
 
             completed[0] += 1
             pct = int(completed[0] / total_work * 100)
@@ -206,9 +211,11 @@ class EnrichmentWorker:
         self._set_step("Scanning eligibility...", 95)
         scan_existing_entries()
 
-        # Step 3: Remove expired
+        # Step 3: Remove expired and clean up invalid entries
         self._set_step("Removing expired giveaways...", 97)
         remove_expired_giveaways()
+        expire_by_title_date()
+        remove_non_giveaway_gleam_paths()
 
         self._set_step("Enrichment complete", 100)
 
@@ -551,6 +558,7 @@ CUSTOM_CSS = """
     .status-not_eligible { background: var(--error-bg); color: var(--error); }
     .status-expired { background: rgba(107, 114, 128, 0.1); color: #6b7280; }
     .status-skipped { background: var(--warning-bg); color: var(--warning); }
+    .status-needs_review { background: rgba(251, 146, 60, 0.1); color: #fb923c; }
 
     .log-entry {
         background: var(--bg-secondary);
@@ -765,6 +773,7 @@ CUSTOM_CSS = """
     .ga-badge-expired { background: rgba(107,114,128,0.15); color: #9ca3af; }
     .ga-badge-skipped { background: rgba(234,179,8,0.15); color: #facc15; }
     .ga-badge-not_eligible { background: rgba(239,68,68,0.15); color: #f87171; }
+    .ga-badge-needs_review { background: rgba(251,146,60,0.15); color: #fb923c; }
     .ga-table .ga-muted { color: var(--text-tertiary); }
 
     /* Highlighted row (last-clicked giveaway) */
@@ -1181,8 +1190,8 @@ def import_ndjson_links():
                         href = entry.get("href", "")
                         text = entry.get("text", "")
                         deadline = entry.get("deadline", "")
-                        # Strict gleam.io URL check: must start with https://gleam.io/
-                        if href and href.startswith("https://gleam.io/"):
+                        # Validate gleam.io giveaway URL (host + path pattern)
+                        if href and is_gleam_giveaway_url(href):
                             # Skip truncated URLs (contain ellipsis … or end with ...)
                             if "\u2026" in href or href.endswith("..."):
                                 continue
@@ -1223,18 +1232,22 @@ def main():
     if "removed_giveaway_ids" not in st.session_state:
         st.session_state.removed_giveaway_ids = set()
 
-    # One-time cleanup on first load: remove non-gleam URLs, truncated URLs, and fix titles
+    # One-time cleanup on first load: remove non-gleam URLs, truncated URLs,
+    # non-giveaway paths (e.g. /terms, /privacy), and fix titles
     if "db_cleaned" not in st.session_state:
         non_gleam = remove_non_gleam_giveaways()
         truncated = remove_truncated_giveaways()
+        non_giveaway = remove_non_giveaway_gleam_paths()
         title_fixes = cleanup_titles()
         st.session_state.db_cleaned = True
-        if non_gleam or truncated or title_fixes:
+        if non_gleam or truncated or non_giveaway or title_fixes:
             _cached_giveaways_display.clear()
 
     # Remove expired giveaways on every page load (fast indexed SQL query)
     removed = remove_expired_giveaways()
-    if removed:
+    # Also expire giveaways whose title contains a past date (e.g. "Ends April 5th")
+    title_expired = expire_by_title_date()
+    if removed or title_expired:
         _cached_giveaways_display.clear()
 
     # Auto-import links from the browser extension NDJSON file
@@ -1343,6 +1356,7 @@ def main():
             badge_labels = {
                 "new": "New", "eligible": "Eligible", "participated": "Participated",
                 "not_eligible": "Not Eligible", "expired": "Expired", "skipped": "Skipped",
+                "needs_review": "Needs Review",
             }
             html_rows = []
             for r in recent:
@@ -1505,7 +1519,7 @@ def main():
         with filter_col1:
             status_filter = st.selectbox(
                 "Filter by status",
-                ["all", "new", "eligible", "participated", "not_eligible", "expired", "skipped"]
+                ["all", "new", "eligible", "participated", "not_eligible", "expired", "skipped", "needs_review"]
             )
 
         @st.fragment
@@ -1570,6 +1584,7 @@ def main():
             badge_labels = {
                 "new": "New", "eligible": "Eligible", "participated": "Participated",
                 "not_eligible": "Not Eligible", "expired": "Expired", "skipped": "Skipped",
+                "needs_review": "Needs Review",
             }
 
             # Split: separate not-eligible from the rest when showing "all"
@@ -1681,7 +1696,7 @@ def main():
             # Disable Playwright-dependent buttons while background enrichment is active
             _enrichment_busy = _enrichment_worker.running
 
-            action_col1, action_col2, action_col3 = st.columns(3)
+            action_col1, action_col2 = st.columns(2)
             with action_col1:
                 if st.button("🔄 Enrich All", use_container_width=True, disabled=_enrichment_busy):
                     unenriched = [g for g in giveaways
@@ -1726,11 +1741,6 @@ def main():
                         _cached_giveaways_display.clear()
                         st.rerun()
             with action_col2:
-                if st.button("🔄 Refresh Eligibility", use_container_width=True):
-                    scan_existing_entries()
-                    _cached_giveaways_display.clear()
-                    st.rerun()
-            with action_col3:
                 if st.session_state.get("confirm_clear_all"):
                     st.warning("This will delete all giveaway data. Are you sure?")
                     confirm_col1, confirm_col2 = st.columns(2)

@@ -222,6 +222,100 @@ TERMS_SELECTORS = [
     "span:has-text('Terms and Conditions')",
 ]
 
+# CSS classes and attributes that identify gleam entry-method links.
+# Elements matching any of these should NEVER be treated as a T&C toggle.
+_ENTRY_METHOD_INDICATORS = [
+    "enter-link",
+    "email_subscribe",
+    "email-border",
+    "email_subscribe-border",
+]
+
+# data-track-event values that belong to entry methods, not T&C.
+_ENTRY_TRACK_EVENT_BLACKLIST = [
+    "email", "subscribe", "follow", "retweet", "like", "visit",
+    "watch", "share", "click|email", "click|subscribe",
+]
+
+
+def _is_entry_method_element(el):
+    """Return True if the Playwright element handle looks like an entry-method
+    button rather than a T&C toggle.  Checks CSS classes and
+    ``data-track-event`` against known entry-method patterns."""
+    try:
+        classes = el.get_attribute("class") or ""
+        for indicator in _ENTRY_METHOD_INDICATORS:
+            if indicator in classes:
+                return True
+        track_event = (el.get_attribute("data-track-event") or "").lower()
+        if track_event:
+            for keyword in _ENTRY_TRACK_EVENT_BLACKLIST:
+                if keyword in track_event:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _dismiss_expanded_entry_methods(page):
+    """Collapse any auto-expanded gleam entry methods so they don't block T&C.
+
+    Gleam auto-expands the first mandatory entry method (often an email
+    subscription).  This clicks the entry-method header to collapse it,
+    or presses Escape to close any overlay, so the T&C toggle becomes
+    accessible.
+    """
+    # Try clicking the expanded entry-method header to collapse it
+    collapse_selectors = [
+        # Expanded entry method that is currently shown
+        ".entry-method.expanded .enter-link",
+        "a.enter-link.actioned",
+        "a.enter-link.mandatory.default",
+        # Angular expanded state
+        "[ng-class*='expanded']",
+    ]
+    for selector in collapse_selectors:
+        try:
+            els = page.locator(selector)
+            if els.count() > 0:
+                # Click the body (outside the entry method) to deselect
+                page.click("body", position={"x": 10, "y": 10}, force=True)
+                time.sleep(0.5)
+                return True
+        except Exception:
+            continue
+
+    # Fallback: press Escape to dismiss any modal/overlay
+    try:
+        page.keyboard.press("Escape")
+        time.sleep(0.3)
+    except Exception:
+        pass
+
+    return False
+
+
+def _detect_email_entry_blocking(page):
+    """Detect if an email subscription entry method is expanded and blocking
+    the page, preventing T&C extraction.
+
+    Returns True if blocking email entry is detected.
+    """
+    blocking_selectors = [
+        "a.enter-link.email_subscribe-border",
+        "a.enter-link.email-border",
+        "a[data-track-event*='email'][data-track-event*='subscribe']",
+        ".entry-method .email-input:visible",
+        "input[type='email']:visible",
+    ]
+    for selector in blocking_selectors:
+        try:
+            if page.locator(selector).count() > 0:
+                return True
+        except Exception:
+            continue
+    return False
+
 # Selectors for the container that appears after clicking the T&C toggle.
 # Ordered from most specific (gleam) to generic.
 TERMS_CONTAINER_SELECTORS = [
@@ -424,17 +518,28 @@ def _click_terms_toggle(page):
     generic link selectors. After clicking, waits for the T&C container
     to become visible.
 
+    Skips any element that looks like a gleam entry-method button (email
+    subscribe, follow, etc.) to avoid accidentally triggering those
+    actions during enrichment.
+
     Returns True if a T&C element was found and clicked.
     """
     clicked = False
     for selector in TERMS_SELECTORS:
         try:
-            el = page.locator(selector).first
-            if el.count() > 0:
+            matches = page.locator(selector)
+            count = matches.count()
+            for i in range(count):
+                el = matches.nth(i)
+                # Guard: skip elements that are entry-method buttons
+                if _is_entry_method_element(el):
+                    continue
                 # Scroll into view and click
                 el.scroll_into_view_if_needed()
                 el.click()
                 clicked = True
+                break
+            if clicked:
                 break
         except Exception:
             continue
@@ -458,11 +563,17 @@ def _click_terms_toggle(page):
 def check_terms_conditions(page, url):
     """Check Terms & Conditions for country eligibility.
 
+    Dismisses any auto-expanded entry methods (e.g. email subscription)
+    before attempting to open the T&C section.
+
     Returns:
         excluded_countries: list of excluded country codes
         detected_region: str or None -- region detected from inclusive
             phrases (e.g. "worldwide", "eu", "dach", "germany", "restricted")
     """
+    # Step 0: Dismiss any auto-expanded entry methods (email subscribe, etc.)
+    _dismiss_expanded_entry_methods(page)
+
     # Step 1: Click the T&C toggle to reveal content
     _click_terms_toggle(page)
 
@@ -823,14 +934,26 @@ def _enrich_single_url(page, url, emit):
         # -- T&C --
         excluded = []
         region = None
+        email_blocked = False
         if not ended and not region_blocked:
-            excluded, region = check_terms_conditions(page, url)
-            if excluded:
-                emit(f"  Excluded: {', '.join(excluded)}")
-            if region:
-                emit(f"  Region: {region}")
+            # Check for email subscription blocking before T&C extraction
+            if _detect_email_entry_blocking(page):
+                emit(f"  Email subscription entry detected, attempting to dismiss...")
+                _dismiss_expanded_entry_methods(page)
+                time.sleep(1)
+                # Re-check after dismissal attempt
+                if _detect_email_entry_blocking(page):
+                    emit(f"  Email entry still blocking -- skipping T&C, flagging for review")
+                    email_blocked = True
 
-        if not ended and not region_blocked and not excluded and not region and not deadline:
+            if not email_blocked:
+                excluded, region = check_terms_conditions(page, url)
+                if excluded:
+                    emit(f"  Excluded: {', '.join(excluded)}")
+                if region:
+                    emit(f"  Region: {region}")
+
+        if not ended and not region_blocked and not excluded and not region and not deadline and not email_blocked:
             emit(f"  No restrictions or deadline found")
 
         return {
@@ -840,6 +963,7 @@ def _enrich_single_url(page, url, emit):
             "region": region,
             "ended": ended,
             "region_blocked": region_blocked,
+            "email_blocked": email_blocked,
         }
 
     except Exception as e:
@@ -851,6 +975,7 @@ def _enrich_single_url(page, url, emit):
             "region": None,
             "ended": False,
             "region_blocked": False,
+            "error": str(e),
         }
 
 
@@ -860,6 +985,10 @@ def _enrich_worker(worker_id, urls_chunk, total_urls, on_result, emit, counter, 
     Runs in a dedicated thread with its own ``sync_playwright()`` context
     so that each worker has an isolated browser instance (Playwright sync
     API is not thread-safe across shared objects).
+
+    If the page object becomes invalid (e.g. after a crash or accidental
+    navigation), the worker recreates it from the existing browser context
+    instead of losing all remaining URLs.
 
     Args:
         worker_id: integer identifier for log messages.
@@ -903,6 +1032,22 @@ def _enrich_worker(worker_id, urls_chunk, total_urls, on_result, emit, counter, 
                         idx = counter[0] + 1
                     emit(f"[W{worker_id}] [{idx}/{total_urls}] Enriching: {url}")
 
+                    # Check if the page is still usable; recreate if dead
+                    try:
+                        page.url  # quick health check
+                    except Exception:
+                        emit(f"[W{worker_id}] Page crashed, creating new tab...")
+                        try:
+                            page = context.new_page()
+                        except Exception:
+                            emit(f"[W{worker_id}] Context dead, recreating browser context...")
+                            try:
+                                context = browser.new_context()
+                                page = context.new_page()
+                            except Exception as ctx_err:
+                                emit(f"[W{worker_id}] Browser dead, cannot recover: {ctx_err}")
+                                break
+
                     entry = _enrich_single_url(page, url, emit)
                     results.append(entry)
 
@@ -910,6 +1055,21 @@ def _enrich_worker(worker_id, urls_chunk, total_urls, on_result, emit, counter, 
                         counter[0] += 1
                         if on_result:
                             on_result(entry)
+
+                    # Post-enrichment: verify page is still alive for next URL
+                    try:
+                        page.url
+                    except Exception:
+                        emit(f"[W{worker_id}] Page died after enriching {url}, will recreate for next URL")
+                        try:
+                            page = context.new_page()
+                        except Exception:
+                            try:
+                                context = browser.new_context()
+                                page = context.new_page()
+                            except Exception:
+                                emit(f"[W{worker_id}] Cannot recreate page, stopping worker")
+                                break
             finally:
                 try:
                     browser.close()
