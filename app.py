@@ -7,6 +7,7 @@ import time
 import os
 import sys
 import json
+import threading
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -30,6 +31,198 @@ if "api_server_started" not in st.session_state:
 
 # Expired giveaway cleanup runs on every page load in main() — it's a fast
 # indexed SQL DELETE so the overhead is negligible.
+
+
+# ---------------------------------------------------------------------------
+# Background enrichment worker
+# ---------------------------------------------------------------------------
+# Module-level singleton so the enrichment runs once across all Streamlit
+# sessions/reruns.  The UI polls the worker's state to show progress without
+# blocking the page.
+
+class EnrichmentWorker:
+    """Thread-safe enrichment state that can be polled by the Streamlit UI."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._running = False
+        self._done = False
+        self._step = ""          # e.g. "Fetching deadlines..."
+        self._progress = 0       # 0-100
+        self._detail = ""        # e.g. "[3/12] https://gleam.io/..."
+        self._error = ""
+        self._thread = None
+
+    # -- Public read API (thread-safe) --
+
+    @property
+    def running(self):
+        with self._lock:
+            return self._running
+
+    @property
+    def done(self):
+        with self._lock:
+            return self._done
+
+    def snapshot(self):
+        """Return a dict snapshot of the current state for UI rendering."""
+        with self._lock:
+            return {
+                "running": self._running,
+                "done": self._done,
+                "step": self._step,
+                "progress": self._progress,
+                "detail": self._detail,
+                "error": self._error,
+            }
+
+    # -- Internal write API (called from background thread) --
+
+    def _set_step(self, step, progress=None):
+        with self._lock:
+            self._step = step
+            if progress is not None:
+                self._progress = progress
+
+    def _set_detail(self, detail):
+        with self._lock:
+            self._detail = detail
+
+    def _set_progress(self, progress):
+        with self._lock:
+            self._progress = progress
+
+    def _set_error(self, error):
+        with self._lock:
+            self._error = error
+
+    # -- Start / run --
+
+    def reset(self):
+        """Reset the worker so it can be started again.
+
+        No-op if currently running.  Safe to call from any thread.
+        """
+        with self._lock:
+            if self._running:
+                return
+            self._done = False
+            self._step = ""
+            self._progress = 0
+            self._detail = ""
+            self._error = ""
+            self._thread = None
+
+    def start(self):
+        """Start the enrichment pipeline in a background thread.
+
+        Returns immediately.  No-op if already running or already done.
+        """
+        with self._lock:
+            if self._running or self._done:
+                return
+            self._running = True
+
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="enrichment-worker"
+        )
+        self._thread.start()
+
+    def _run(self):
+        try:
+            self._do_enrichment()
+        except Exception as e:
+            self._set_error(str(e))
+        finally:
+            with self._lock:
+                self._running = False
+                self._done = True
+            # Clear the cached display data so the next rerun picks up enriched data
+            _cached_giveaways_display.clear()
+
+    def _do_enrichment(self):
+        unenriched = get_unenriched_giveaways()
+        missing_dl = unenriched["missing_deadline"]
+        unchecked_tc = unenriched["unchecked_terms"]
+
+        if not missing_dl and not unchecked_tc:
+            self._set_step("Nothing to enrich", 100)
+            return
+
+        total_work = len(missing_dl) + len(unchecked_tc) + 1  # +1 for eligibility scan
+        completed = 0
+
+        # Step 1: Fetch missing deadlines
+        if missing_dl:
+            self._set_step(f"Fetching deadlines (0/{len(missing_dl)})...", 0)
+            urls = [g["url"] for g in missing_dl]
+            url_to_id = {g["url"]: g["id"] for g in missing_dl}
+            updated = 0
+
+            def _on_deadline(url, deadline_text):
+                nonlocal updated, completed
+                gid = url_to_id.get(url)
+                if gid and deadline_text:
+                    update_giveaway_deadline(gid, deadline_text)
+                    updated += 1
+                completed += 1
+                pct = int(completed / total_work * 100)
+                self._set_step(
+                    f"Fetching deadlines ({completed}/{len(missing_dl)})...",
+                    pct,
+                )
+                self._set_detail(f"{url}")
+
+            try:
+                fetch_giveaway_deadlines_batch(urls, on_result=_on_deadline)
+            except Exception as e:
+                self._set_error(f"Deadline fetch error: {e}")
+            # Ensure counter is correct even if some were skipped
+            completed = len(missing_dl)
+        else:
+            self._set_detail("All deadlines already populated")
+
+        # Step 2: Check T&C
+        if unchecked_tc:
+            self._set_step(f"Checking T&C (0/{len(unchecked_tc)})...",
+                           int(completed / total_work * 100))
+            urls = [g["url"] for g in unchecked_tc]
+            url_to_id = {g["url"]: g["id"] for g in unchecked_tc}
+            try:
+                results = check_giveaway_terms_batch(urls)
+                for url, excluded, detected_region in results:
+                    gid = url_to_id.get(url)
+                    if gid:
+                        excluded_str = ",".join(excluded) if excluded else ""
+                        update_terms_check(gid, True, excluded_str, detected_region)
+                    completed += 1
+                    pct = int(completed / total_work * 100)
+                    self._set_step(
+                        f"Checking T&C ({completed - len(missing_dl)}/{len(unchecked_tc)})...",
+                        pct,
+                    )
+                    self._set_detail(f"{url}")
+            except Exception as e:
+                self._set_error(f"T&C check error: {e}")
+            completed = len(missing_dl) + len(unchecked_tc)
+        else:
+            self._set_detail("All T&C already checked")
+
+        # Step 3: Scan eligibility (fast, pure DB)
+        self._set_step("Scanning eligibility...", int(completed / total_work * 100))
+        scan_existing_entries()
+        completed += 1
+
+        # Step 4: Remove expired
+        self._set_step("Removing expired giveaways...", 95)
+        remove_expired_giveaways()
+
+        self._set_step("Enrichment complete", 100)
+
+
+# Module-level singleton -- survives Streamlit reruns
+_enrichment_worker = EnrichmentWorker()
 
 
 @st.cache_data(ttl=5)
@@ -739,11 +932,25 @@ def scan_existing_entries():
 
 
 def run_enrichment_pipeline():
-    """Run the full enrichment pipeline: fetch deadlines, check T&C, scan eligibility.
+    """Dispatch the enrichment pipeline to the background worker.
 
-    This is called after import to ensure all giveaways have deadline and
-    eligibility data.  The browser extension may have already prefetched some
-    deadlines, so only entries still missing data are processed here.
+    Returns immediately -- the UI polls the worker's progress via
+    ``_enrichment_worker.snapshot()`` and shows a non-blocking indicator.
+    If a previous run already completed, the worker is reset first so
+    new imports get enriched.
+    """
+    _enrichment_worker.reset()
+    _enrichment_worker.start()
+    # Clear the notification flag so the UI shows a toast when this run finishes
+    if hasattr(st, "session_state"):
+        st.session_state["_enrich_notified"] = False
+
+
+def run_enrichment_pipeline_blocking():
+    """Run the full enrichment pipeline synchronously (blocks the UI).
+
+    Kept for the manual "Fetch Deadlines" / "Check T&C" buttons on the
+    Giveaways tab where the user expects to wait and see inline results.
     """
     unenriched = get_unenriched_giveaways()
     missing_dl = unenriched["missing_deadline"]
@@ -1022,6 +1229,26 @@ def main():
         <p class="subtitle">Discover, track, and auto-enter Gleam.io giveaways</p>
     </div>
     """, unsafe_allow_html=True)
+
+    # --- Background enrichment progress indicator ---
+    _enrich_snap = _enrichment_worker.snapshot()
+    if _enrich_snap["running"]:
+        _pct = _enrich_snap["progress"] / 100.0
+        _step_text = _enrich_snap["step"] or "Enriching..."
+        _detail_text = _enrich_snap["detail"]
+        st.progress(_pct, text=f"{_step_text}  {_detail_text}")
+        # Poll every 2 seconds while enrichment is running
+        time.sleep(2)
+        st.rerun()
+    elif _enrich_snap["done"] and not st.session_state.get("_enrich_notified"):
+        # Enrichment just finished — refresh data and notify once
+        _cached_giveaways_display.clear()
+        st.session_state["_enrich_notified"] = True
+        if _enrich_snap["error"]:
+            st.warning(f"Enrichment finished with errors: {_enrich_snap['error']}")
+        else:
+            st.toast("Background enrichment complete")
+        st.rerun()
 
     tab_dashboard, tab_giveaways, tab_autoenter, tab_settings = st.tabs([
         " 🎁 Dashboard",
@@ -1418,9 +1645,13 @@ def main():
         if giveaways:
             st.markdown('<hr class="section-divider">', unsafe_allow_html=True)
             st.markdown('<div class="section-title">Actions</div>', unsafe_allow_html=True)
+
+            # Disable Playwright-dependent buttons while background enrichment is active
+            _enrichment_busy = _enrichment_worker.running
+
             action_col1, action_col2, action_col3, action_col4 = st.columns(4)
             with action_col1:
-                if st.button("🔄 Check T&C", use_container_width=True):
+                if st.button("🔄 Check T&C", use_container_width=True, disabled=_enrichment_busy):
                     unchecked = [g for g in giveaways if not g.get("terms_checked")]
                     if not unchecked:
                         st.info("All giveaways already have T&C checked.")
@@ -1439,7 +1670,7 @@ def main():
                         _cached_giveaways_display.clear()
                         st.rerun()
             with action_col2:
-                if st.button("📅 Fetch Deadlines", use_container_width=True):
+                if st.button("📅 Fetch Deadlines", use_container_width=True, disabled=_enrichment_busy):
                     missing_dl = [g for g in giveaways if not g.get("deadline")]
                     if not missing_dl:
                         st.info("All giveaways already have deadlines.")
