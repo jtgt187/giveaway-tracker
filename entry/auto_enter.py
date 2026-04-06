@@ -424,34 +424,45 @@ def check_terms_conditions(page, url):
 
 
 def find_browser_profile():
+    """Return ``(profile_path, channel)`` for the first usable browser profile.
+
+    *channel* is the Playwright channel name (``"chrome"``, ``"msedge"``, or
+    ``"chromium"``) that corresponds to the discovered profile so that
+    ``launch_persistent_context`` uses the matching installed browser binary
+    instead of the bundled Chromium (which is incompatible with Chrome/Edge
+    profile formats).
+
+    Returns ``(None, None)`` when no profile is found.
+    """
     import platform
-    possible_paths = []
+    # Each entry is (path, playwright_channel).
+    candidates = []
     if os.name == "nt":
         appdata = os.environ.get("LOCALAPPDATA", "")
-        possible_paths.extend([
-            os.path.join(appdata, "Google", "Chrome", "User Data"),
-            os.path.join(appdata, "Microsoft", "Edge", "User Data"),
+        candidates.extend([
+            (os.path.join(appdata, "Google", "Chrome", "User Data"), "chrome"),
+            (os.path.join(appdata, "Microsoft", "Edge", "User Data"), "msedge"),
         ])
     elif platform.system() == "Darwin":
-        possible_paths.extend([
-            os.path.expanduser("~/Library/Application Support/Google/Chrome"),
-            os.path.expanduser("~/Library/Application Support/Microsoft Edge"),
-            os.path.expanduser("~/Library/Application Support/Chromium"),
+        candidates.extend([
+            (os.path.expanduser("~/Library/Application Support/Google/Chrome"), "chrome"),
+            (os.path.expanduser("~/Library/Application Support/Microsoft Edge"), "msedge"),
+            (os.path.expanduser("~/Library/Application Support/Chromium"), "chromium"),
         ])
     else:
-        possible_paths.extend([
-            os.path.expanduser("~/.config/google-chrome"),
-            os.path.expanduser("~/.config/chromium"),
+        candidates.extend([
+            (os.path.expanduser("~/.config/google-chrome"), "chrome"),
+            (os.path.expanduser("~/.config/chromium"), "chromium"),
         ])
 
-    for path in possible_paths:
+    for path, channel in candidates:
         if os.path.exists(path):
-            return path
-    return None
+            return path, channel
+    return None, None
 
 
 def auto_enter_giveaway(url, callback=None):
-    profile_path = find_browser_profile()
+    profile_path, browser_channel = find_browser_profile()
     log = []
 
     def emit(msg):
@@ -473,10 +484,9 @@ def auto_enter_giveaway(url, callback=None):
             }
 
             if profile_path:
-                launch_args["channel"] = "chrome"
-                launch_args["user_data_dir"] = profile_path
                 browser = p.chromium.launch_persistent_context(
                     user_data_dir=profile_path,
+                    channel=browser_channel,
                     headless=False,
                     args=launch_args["args"],
                 )
@@ -573,7 +583,7 @@ def check_giveaway_terms(url, callback=None):
         - detected_region: str or None
         - log: list of log messages
     """
-    profile_path = find_browser_profile()
+    profile_path, browser_channel = find_browser_profile()
     log = []
 
     def emit(msg):
@@ -596,10 +606,9 @@ def check_giveaway_terms(url, callback=None):
             }
 
             if profile_path:
-                launch_args["channel"] = "chrome"
-                launch_args["user_data_dir"] = profile_path
                 browser = p.chromium.launch_persistent_context(
                     user_data_dir=profile_path,
+                    channel=browser_channel,
                     headless=False,
                     args=launch_args["args"],
                 )
@@ -647,7 +656,7 @@ def check_giveaway_terms_batch(urls, callback=None):
     if not urls:
         return []
 
-    profile_path = find_browser_profile()
+    profile_path, browser_channel = find_browser_profile()
 
     def emit(msg):
         if callback:
@@ -667,9 +676,9 @@ def check_giveaway_terms_batch(urls, callback=None):
             }
 
             if profile_path:
-                launch_args["channel"] = "chrome"
                 browser = p.chromium.launch_persistent_context(
                     user_data_dir=profile_path,
+                    channel=browser_channel,
                     headless=False,
                     args=launch_args["args"],
                 )
@@ -786,8 +795,6 @@ def fetch_giveaway_deadlines_batch(urls, callback=None):
     if not urls:
         return []
 
-    profile_path = find_browser_profile()
-
     def emit(msg):
         if callback:
             callback(msg)
@@ -796,26 +803,16 @@ def fetch_giveaway_deadlines_batch(urls, callback=None):
         results = []
 
         with sync_playwright() as p:
-            launch_args = {
-                "headless": False,
-                "args": [
+            browser = p.chromium.launch(
+                headless=False,
+                args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-first-run",
                     "--no-default-browser-check",
                 ],
-            }
-
-            if profile_path:
-                browser = p.chromium.launch_persistent_context(
-                    user_data_dir=profile_path,
-                    headless=False,
-                    args=launch_args["args"],
-                )
-                page = browser.pages[0] if browser.pages else browser.new_page()
-            else:
-                browser = p.chromium.launch(headless=False, args=launch_args["args"])
-                context = browser.new_context()
-                page = context.new_page()
+            )
+            context = browser.new_context()
+            page = context.new_page()
 
             try:
                 for i, url in enumerate(urls, 1):
@@ -836,8 +833,7 @@ def fetch_giveaway_deadlines_batch(urls, callback=None):
                         results.append((url, ''))
             finally:
                 try:
-                    if hasattr(browser, 'close'):
-                        browser.close()
+                    browser.close()
                 except Exception:
                     pass
 

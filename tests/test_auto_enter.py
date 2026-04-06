@@ -214,7 +214,7 @@ class TestFindBrowserProfile:
     def test_no_profile_found(self, monkeypatch):
         from entry.auto_enter import find_browser_profile
         monkeypatch.setattr(os.path, "exists", lambda p: False)
-        assert find_browser_profile() is None
+        assert find_browser_profile() == (None, None)
 
     def test_chrome_profile_found_unix(self, monkeypatch):
         import platform
@@ -224,7 +224,7 @@ class TestFindBrowserProfile:
         chrome_path = os.path.expanduser("~/.config/google-chrome")
         monkeypatch.setattr(os.path, "exists", lambda p: p == chrome_path)
         result = find_browser_profile()
-        assert result == chrome_path
+        assert result == (chrome_path, "chrome")
 
     def test_chrome_profile_found_macos(self, monkeypatch):
         import platform
@@ -234,4 +234,4 @@ class TestFindBrowserProfile:
         chrome_path = os.path.expanduser("~/Library/Application Support/Google/Chrome")
         monkeypatch.setattr(os.path, "exists", lambda p: p == chrome_path)
         result = find_browser_profile()
-        assert result == chrome_path
+        assert result == (chrome_path, "chrome")
