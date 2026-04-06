@@ -1,9 +1,51 @@
+import logging
 import sqlite3
 import os
 import re
 import threading
 from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
 from urllib.parse import urlparse
+
+# ---------------------------------------------------------------------------
+# Logging setup (shared by all modules)
+# ---------------------------------------------------------------------------
+
+_LOG_DIR = os.path.dirname(__file__)
+_LOG_FILE = os.path.join(_LOG_DIR, "giveaway-tracker.log")
+
+def setup_logging():
+    """Configure root logger with file (rotating) + stderr handlers.
+
+    Safe to call multiple times -- will not add duplicate handlers.
+    """
+    root = logging.getLogger()
+    if root.handlers:
+        return  # already configured
+    root.setLevel(logging.DEBUG)
+
+    fmt = logging.Formatter(
+        "%(asctime)s %(levelname)-7s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    # File handler: 5 MB max, keep 3 backups
+    fh = RotatingFileHandler(_LOG_FILE, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    root.addHandler(fh)
+
+    # Console (stderr) handler
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt)
+    root.addHandler(ch)
+
+
+# Initialise logging as early as possible
+setup_logging()
+
+logger = logging.getLogger("database")
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "giveaways.db")
 
@@ -341,6 +383,7 @@ def add_giveaways_batch(giveaway_list):
     if not giveaway_list:
         return 0
     conn = get_connection()
+    skipped = 0
     try:
         cursor = conn.cursor()
         now = datetime.now().isoformat()
@@ -348,6 +391,7 @@ def add_giveaways_batch(giveaway_list):
         for g in giveaway_list:
             url = g.get("url", "")
             if not url or is_blacklisted(url) or not is_gleam_giveaway_url(url):
+                skipped += 1
                 continue
             try:
                 cursor.execute("""
@@ -372,6 +416,8 @@ def add_giveaways_batch(giveaway_list):
         conn.commit()
     finally:
         conn.close()
+    logger.info("add_giveaways_batch: inserted=%d, skipped=%d, total=%d",
+                new_count, skipped, len(giveaway_list))
     return new_count
 
 
@@ -447,6 +493,8 @@ def update_giveaway_deadline(giveaway_id, deadline):
         dt = _parse_countdown(deadline)
         if dt:
             stored = dt.strftime("%d %B %Y at %H:%M:%S")
+            logger.debug("update_giveaway_deadline: converted relative '%s' -> '%s' (id=%s)",
+                         deadline, stored, giveaway_id)
     conn = get_connection()
     try:
         cursor = conn.cursor()
@@ -454,6 +502,7 @@ def update_giveaway_deadline(giveaway_id, deadline):
         conn.commit()
     finally:
         conn.close()
+    logger.info("update_giveaway_deadline: id=%s, deadline='%s'", giveaway_id, stored)
 
 
 def get_giveaway_by_url(url):
@@ -497,7 +546,12 @@ def update_terms_check(giveaway_id, checked, excluded_countries="", detected_reg
 
 
 def get_giveaways_display(status=None, gleam_only=True, exclude_not_eligible=True):
-    """Optimized query that selects only the columns needed for table display."""
+    """Optimized query that selects only the columns needed for table display.
+
+    When *exclude_not_eligible* is True (the default) and no explicit *status*
+    filter is given, rows with status ``not_eligible`` or ``expired`` are
+    excluded.  Users can still view them via the explicit status filter.
+    """
     conn = get_connection()
     cursor = conn.cursor()
     cols = "id, title, url, status, win_probability, total_entries, deadline, country_restriction, terms_checked, terms_excluded, discovered_at"
@@ -509,7 +563,7 @@ def get_giveaways_display(status=None, gleam_only=True, exclude_not_eligible=Tru
         conditions.append("url LIKE 'https://gleam.io/%'")
 
     if exclude_not_eligible and not status:
-        conditions.append("status != 'not_eligible'")
+        conditions.append("status NOT IN ('not_eligible', 'expired')")
 
     if status:
         conditions.append("status = ?")
@@ -740,7 +794,7 @@ def remove_expired_giveaways():
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT id, deadline FROM giveaways WHERE deadline != ''")
+        cursor.execute("SELECT id, url, deadline FROM giveaways WHERE deadline != ''")
         rows = cursor.fetchall()
         now = datetime.now()
         expired_ids = []
@@ -757,12 +811,16 @@ def remove_expired_giveaways():
             dt = parse_deadline(dl)
             if dt and dt < now:
                 expired_ids.append(row["id"])
+                logger.debug("remove_expired_giveaways: expired id=%s, url=%s, deadline='%s'",
+                             row["id"], row["url"], dl)
         if expired_ids:
             placeholders = ",".join("?" for _ in expired_ids)
             cursor.execute(f"DELETE FROM giveaways WHERE id IN ({placeholders})", expired_ids)
         conn.commit()
     finally:
         conn.close()
+    if expired_ids:
+        logger.info("remove_expired_giveaways: deleted %d expired giveaways", len(expired_ids))
     return len(expired_ids)
 
 
@@ -975,6 +1033,8 @@ def expire_by_title_date():
                     dt = _parse_title_date(m.group(1))
                     if dt and dt < now:
                         expired_ids.append(row["id"])
+                        logger.debug("expire_by_title_date: id=%s title='%s' parsed_date=%s",
+                                     row["id"], title, dt.isoformat())
                     break  # only use the first matching pattern per title
         if expired_ids:
             placeholders = ",".join("?" for _ in expired_ids)
@@ -985,4 +1045,6 @@ def expire_by_title_date():
         conn.commit()
     finally:
         conn.close()
+    if expired_ids:
+        logger.info("expire_by_title_date: marked %d giveaways as expired", len(expired_ids))
     return len(expired_ids)

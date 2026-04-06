@@ -156,6 +156,36 @@ def test_get_giveaways_display_status_filter(tmp_db, sample_giveaways):
     assert participated[0]["status"] == "participated"
 
 
+def test_get_giveaways_display_excludes_expired_by_default(tmp_db, sample_giveaways):
+    """Default display should exclude expired giveaways (like not_eligible)."""
+    from database import add_giveaways_batch, update_giveaway_status, get_giveaways, get_giveaways_display
+
+    add_giveaways_batch(sample_giveaways)
+    rows = get_giveaways(gleam_only=False, exclude_not_eligible=False)
+    update_giveaway_status(rows[0]["id"], "expired")
+    update_giveaway_status(rows[1]["id"], "not_eligible")
+    # rows[2] and rows[3] remain "new"
+
+    # Default display should hide both expired and not_eligible
+    default_rows = get_giveaways_display(gleam_only=False)
+    statuses = {r["status"] for r in default_rows}
+    assert "expired" not in statuses
+    assert "not_eligible" not in statuses
+    assert len(default_rows) == 2
+
+    # Explicit "expired" filter should return only expired
+    expired_rows = get_giveaways_display(status="expired", gleam_only=False)
+    assert len(expired_rows) == 1
+    assert expired_rows[0]["status"] == "expired"
+
+    # exclude_not_eligible=False should still return not_eligible but NOT expired
+    # (expired exclusion is bundled with the exclude_not_eligible flag)
+    all_rows = get_giveaways_display(gleam_only=False, exclude_not_eligible=False)
+    statuses_all = {r["status"] for r in all_rows}
+    assert "not_eligible" in statuses_all
+    assert len(all_rows) == 4  # all giveaways including expired and not_eligible
+
+
 # ---------------------------------------------------------------------------
 # update_giveaway_status  (Enter, Skip buttons)
 # ---------------------------------------------------------------------------

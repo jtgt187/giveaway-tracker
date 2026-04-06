@@ -13,6 +13,7 @@ Endpoints:
 """
 
 import json
+import logging
 import re
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -25,6 +26,8 @@ from database import (
     get_connection,
     is_gleam_giveaway_url,
 )
+
+logger = logging.getLogger("api_server")
 
 # Relative countdowns: "11 days", "2d 3h", "Ends in 5 days", etc.
 # These become stale fast and should be overwritten by real dates.
@@ -46,8 +49,8 @@ class APIHandler(BaseHTTPRequestHandler):
     """Handle API requests from the Chrome extension."""
 
     def log_message(self, format, *args):
-        """Suppress default stderr logging."""
-        pass
+        """Route HTTP server log messages through the logging framework."""
+        logger.debug("http: " + format, *args)
 
     def _set_cors_headers(self):
         # Only allow the Chrome extension and localhost origins (not wildcard)
@@ -141,6 +144,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
         # Only accept valid gleam.io giveaway URLs (validates host + path pattern)
         if not is_gleam_giveaway_url(href):
+            logger.debug("api: rejected non-gleam URL: %s", href)
             self._send_json({'error': 'not a valid gleam.io giveaway URL'}, 400)
             return
 
@@ -155,6 +159,7 @@ class APIHandler(BaseHTTPRequestHandler):
             deadline=deadline,
         )
 
+        logger.info("api: add_link href=%s added=%s deadline='%s'", href, added, deadline)
         self._send_json({'added': added, 'url': href})
 
     def _handle_update_meta(self, data):
@@ -190,6 +195,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 if ended and existing.get('status') not in ('expired', 'participated'):
                     updates.append('status = ?')
                     params.append('expired')
+                    logger.info("api: marking expired id=%s (%s)", existing['id'], href)
 
                 # Update deadline if provided and current one is empty or relative
                 current_deadline = existing.get('deadline', '')
@@ -199,6 +205,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 ):
                     updates.append('deadline = ?')
                     params.append(deadline)
+                    logger.info("api: updating deadline id=%s '%s' -> '%s'",
+                                existing['id'], current_deadline, deadline)
 
                 # Update title if provided and better than current
                 cleaned = clean_title(title, href)
@@ -220,6 +228,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         params,
                     )
                     conn.commit()
+                    logger.debug("api: update_meta id=%s fields=%s", existing['id'], updates)
             finally:
                 conn.close()
             self._send_json({'updated': bool(updates), 'id': existing['id']})

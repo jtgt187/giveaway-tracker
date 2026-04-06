@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import subprocess
 import time
 import os
@@ -7,6 +8,8 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, Future
 from playwright.sync_api import sync_playwright
+
+logger = logging.getLogger("enrichment")
 
 
 def _run_in_thread(fn, *args, **kwargs):
@@ -849,9 +852,15 @@ _DEADLINE_SELECTORS = [
     '.ends-at',
     '.end-date',
     '.competition-ends',
+    '.gleam-countdown',
+    '.incentive-description',
+    '[data-ends]',
+    '[data-deadline]',
     '[class*="countdown"]',
     '[class*="timer"]',
     '[class*="deadline"]',
+    '[class*="end-date"]',
+    '[class*="expires"]',
 ]
 
 # Regex patterns for dates near end-related keywords in page text
@@ -867,6 +876,28 @@ _DEADLINE_DATE_NEAR_RE = re.compile(
     re.IGNORECASE,
 )
 
+# US month-first format: "Ends: April 6, 2026" / "Ends April 17, 2026 11:59 PM"
+_DEADLINE_US_DATE_RE = re.compile(
+    r'(?:ends?|closing|closes?|deadline|expires?)[:\s]+'
+    r'((?:January|February|March|April|May|June|July|August|September|October|November|December|'
+    r'Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},?\s+\d{4}'
+    r'(?:\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?)?)',
+    re.IGNORECASE,
+)
+
+# Numeric date formats: "Ends: 06/04/2026", "Closes: 2026-04-06"
+_DEADLINE_NUMERIC_DATE_RE = re.compile(
+    r'(?:ends?|closing|closes?|deadline|expires?).{0,30}?'
+    r'(\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{2,4})',
+    re.IGNORECASE,
+)
+
+# Relative countdown: "Ends in 11 days", "2d 3h 15m"
+_DEADLINE_RELATIVE_RE = re.compile(
+    r'(?:ends?\s+in\s+)?(\d+\s*(?:days?|d)\s*(?:\d+\s*(?:hours?|hrs?|h))?\s*(?:\d+\s*(?:minutes?|mins?|m))?)',
+    re.IGNORECASE,
+)
+
 
 def _extract_deadline_from_page(page):
     """Extract a deadline string from the current Playwright page.
@@ -874,29 +905,67 @@ def _extract_deadline_from_page(page):
     Tries Gleam-specific CSS selectors first, then falls back to regex
     scanning of the page body text.
     """
+    url = ""
+    try:
+        url = page.url
+    except Exception:
+        pass
+
+    # 1) CSS selector scan
     for sel in _DEADLINE_SELECTORS:
         try:
             el = page.query_selector(sel)
             if el:
                 text = (el.text_content() or '').strip()
                 if len(text) > 3 and re.search(r'\d', text):
+                    logger.info("deadline_extract: FOUND via selector '%s' -> '%s' [%s]",
+                                sel, text, url)
                     return text
+                elif text:
+                    logger.debug("deadline_extract: selector '%s' matched but text too short/no digits: '%s' [%s]",
+                                 sel, text[:80], url)
         except Exception:
             continue
 
-    # Fallback: regex scan of body text
+    logger.debug("deadline_extract: no CSS selectors matched, trying regex fallback [%s]", url)
+
+    # 2) Regex fallback on body text
     try:
         body_text = page.evaluate('document.body ? document.body.textContent : ""')
     except Exception:
         body_text = ''
 
-    m = _DEADLINE_TEXT_RE.search(body_text)
-    if m:
-        return m.group(1).strip()
+    if not body_text:
+        logger.warning("deadline_extract: empty body text, cannot extract deadline [%s]", url)
+        return ''
 
-    m = _DEADLINE_DATE_NEAR_RE.search(body_text)
-    if m:
-        return m.group(1).strip()
+    # Try each regex pattern in order of specificity
+    for label, pattern in [
+        ("primary", _DEADLINE_TEXT_RE),
+        ("date_near", _DEADLINE_DATE_NEAR_RE),
+        ("us_date", _DEADLINE_US_DATE_RE),
+        ("numeric", _DEADLINE_NUMERIC_DATE_RE),
+        ("relative", _DEADLINE_RELATIVE_RE),
+    ]:
+        m = pattern.search(body_text)
+        if m:
+            result = m.group(1).strip()
+            logger.info("deadline_extract: FOUND via regex '%s' -> '%s' [%s]",
+                        label, result, url)
+            return result
+
+    # Log a snippet around any end-related keywords for post-mortem debugging
+    end_kw_re = re.compile(r'(?:ends?|closing|closes?|deadline|expires?)', re.IGNORECASE)
+    snippets = []
+    for m in end_kw_re.finditer(body_text):
+        start = max(0, m.start() - 20)
+        end = min(len(body_text), m.end() + 80)
+        snippets.append(body_text[start:end].replace('\n', ' ').strip())
+    if snippets:
+        logger.warning("deadline_extract: NO deadline found. Keyword context snippets: %s [%s]",
+                       snippets[:3], url)
+    else:
+        logger.debug("deadline_extract: no end-related keywords found in body text [%s]", url)
 
     return ''
 
@@ -912,6 +981,7 @@ ENRICHMENT_WORKERS = 4
 def _enrich_single_url(page, url, emit):
     """Enrich one URL on an already-loaded *page*.  Returns a result dict."""
     try:
+        logger.info("enrich: starting %s", url)
         page.goto(url, wait_until="domcontentloaded", timeout=30000)
         time.sleep(3)  # let the Gleam widget render
 
@@ -921,8 +991,10 @@ def _enrich_single_url(page, url, emit):
 
         if ended:
             emit(f"  Ended")
+            logger.info("enrich: ENDED %s", url)
         if region_blocked:
             emit(f"  Region blocked")
+            logger.info("enrich: REGION_BLOCKED %s", url)
 
         # -- Deadline --
         deadline = ''
@@ -930,6 +1002,8 @@ def _enrich_single_url(page, url, emit):
             deadline = _extract_deadline_from_page(page)
             if deadline:
                 emit(f"  Deadline: {deadline}")
+            else:
+                logger.warning("enrich: no deadline extracted for %s", url)
 
         # -- T&C --
         excluded = []
@@ -939,24 +1013,29 @@ def _enrich_single_url(page, url, emit):
             # Check for email subscription blocking before T&C extraction
             if _detect_email_entry_blocking(page):
                 emit(f"  Email subscription entry detected, attempting to dismiss...")
+                logger.debug("enrich: email entry blocking detected, dismissing... %s", url)
                 _dismiss_expanded_entry_methods(page)
                 time.sleep(1)
                 # Re-check after dismissal attempt
                 if _detect_email_entry_blocking(page):
                     emit(f"  Email entry still blocking -- skipping T&C, flagging for review")
                     email_blocked = True
+                    logger.warning("enrich: email entry still blocking after dismiss %s", url)
 
             if not email_blocked:
                 excluded, region = check_terms_conditions(page, url)
                 if excluded:
                     emit(f"  Excluded: {', '.join(excluded)}")
+                    logger.info("enrich: excluded countries=%s for %s", excluded, url)
                 if region:
                     emit(f"  Region: {region}")
+                    logger.info("enrich: detected region=%s for %s", region, url)
 
         if not ended and not region_blocked and not excluded and not region and not deadline and not email_blocked:
             emit(f"  No restrictions or deadline found")
+            logger.info("enrich: no data extracted for %s", url)
 
-        return {
+        result = {
             "url": url,
             "deadline": deadline,
             "excluded": excluded,
@@ -965,9 +1044,12 @@ def _enrich_single_url(page, url, emit):
             "region_blocked": region_blocked,
             "email_blocked": email_blocked,
         }
+        logger.debug("enrich: result for %s -> %s", url, result)
+        return result
 
     except Exception as e:
         emit(f"  Error: {str(e)}")
+        logger.error("enrich: ERROR for %s: %s", url, e, exc_info=True)
         return {
             "url": url,
             "deadline": '',
@@ -1000,6 +1082,8 @@ def _enrich_worker(worker_id, urls_chunk, total_urls, on_result, emit, counter, 
         lock: ``threading.Lock`` protecting *counter* and *on_result*.
     """
     results = []
+    logger.info("[W%d] starting with %d URLs (total across workers: %d)",
+                worker_id, len(urls_chunk), total_urls)
 
     # Each worker needs its own event loop on Windows for Playwright
     _original_loop = None
@@ -1031,21 +1115,25 @@ def _enrich_worker(worker_id, urls_chunk, total_urls, on_result, emit, counter, 
                     with lock:
                         idx = counter[0] + 1
                     emit(f"[W{worker_id}] [{idx}/{total_urls}] Enriching: {url}")
+                    logger.info("[W%d] [%d/%d] enriching: %s", worker_id, idx, total_urls, url)
 
                     # Check if the page is still usable; recreate if dead
                     try:
                         page.url  # quick health check
                     except Exception:
                         emit(f"[W{worker_id}] Page crashed, creating new tab...")
+                        logger.warning("[W%d] page crashed, recreating...", worker_id)
                         try:
                             page = context.new_page()
                         except Exception:
                             emit(f"[W{worker_id}] Context dead, recreating browser context...")
+                            logger.warning("[W%d] context dead, recreating browser context...", worker_id)
                             try:
                                 context = browser.new_context()
                                 page = context.new_page()
                             except Exception as ctx_err:
                                 emit(f"[W{worker_id}] Browser dead, cannot recover: {ctx_err}")
+                                logger.error("[W%d] browser dead, stopping worker: %s", worker_id, ctx_err)
                                 break
 
                     entry = _enrich_single_url(page, url, emit)
@@ -1061,6 +1149,7 @@ def _enrich_worker(worker_id, urls_chunk, total_urls, on_result, emit, counter, 
                         page.url
                     except Exception:
                         emit(f"[W{worker_id}] Page died after enriching {url}, will recreate for next URL")
+                        logger.warning("[W%d] page died after %s, recreating", worker_id, url)
                         try:
                             page = context.new_page()
                         except Exception:
@@ -1069,6 +1158,7 @@ def _enrich_worker(worker_id, urls_chunk, total_urls, on_result, emit, counter, 
                                 page = context.new_page()
                             except Exception:
                                 emit(f"[W{worker_id}] Cannot recreate page, stopping worker")
+                                logger.error("[W%d] cannot recreate page, stopping worker", worker_id)
                                 break
             finally:
                 try:
@@ -1082,6 +1172,7 @@ def _enrich_worker(worker_id, urls_chunk, total_urls, on_result, emit, counter, 
             if _original_loop is not None:
                 asyncio.set_event_loop(_original_loop)
 
+    logger.info("[W%d] finished, processed %d URLs", worker_id, len(results))
     return results
 
 
@@ -1135,6 +1226,7 @@ def enrich_giveaways_batch(urls, on_result=None, callback=None):
     lock = threading.Lock()
     total = len(urls)
 
+    logger.info("enrich_batch: starting %d URLs across %d workers", total, n_workers)
     emit(f"Starting enrichment: {total} URLs across {n_workers} parallel workers")
 
     def _run_all_workers():
@@ -1157,7 +1249,14 @@ def enrich_giveaways_batch(urls, on_result=None, callback=None):
                     all_results.extend(worker_results)
                 except Exception as e:
                     emit(f"Worker error: {e}")
+                    logger.error("enrich_batch: worker error: %s", e, exc_info=True)
 
+        # Summarise results
+        ended_count = sum(1 for r in all_results if r.get("ended"))
+        deadline_count = sum(1 for r in all_results if r.get("deadline"))
+        error_count = sum(1 for r in all_results if r.get("error"))
+        logger.info("enrich_batch: finished %d URLs -- deadlines=%d, ended=%d, errors=%d",
+                     len(all_results), deadline_count, ended_count, error_count)
         return all_results
 
     return _run_in_thread(_run_all_workers)

@@ -11,3 +11,4 @@ __pycache__/
 *.db
 config.json
 gleam-links.ndjson
+*.log

@@ -1,3 +1,4 @@
+import logging
 import streamlit as st
 import pandas as pd
 from datetime import datetime
@@ -17,12 +18,14 @@ from entry.auto_enter import auto_enter_giveaway, check_giveaway_terms, enrich_g
 from utils.country_check import is_eligible_for_country, is_region_blocked, is_ended
 from utils.probability import format_probability
 
+logger = logging.getLogger("app")
+
 try:
     init_db()
+    logger.info("Database initialized successfully")
 except Exception as _init_err:
     import traceback
-    print(f"[giveaway-tracker] Database initialization failed: {_init_err}", file=sys.stderr)
-    traceback.print_exc()
+    logger.critical("Database initialization failed: %s", _init_err, exc_info=True)
 
 # Start the local API server for live Chrome extension sync (port 7778)
 from api_server import start_api_server as _start_api_server
@@ -162,12 +165,14 @@ class EnrichmentWorker:
 
         if not unenriched:
             self._set_step("Nothing to enrich", 100)
+            logger.info("enrichment: nothing to enrich")
             return
 
         total = len(unenriched)
         total_work = total + 1  # +1 for eligibility scan
         completed = [0]  # mutable counter for callback (thread-safe via worker lock)
 
+        logger.info("enrichment: starting pipeline with %d unenriched giveaways", total)
         self._set_step(f"Enriching (0/{total})...", 0)
         urls = [g["url"] for g in unenriched]
         url_to_id = {g["url"]: g["id"] for g in unenriched}
@@ -175,12 +180,17 @@ class EnrichmentWorker:
         def _on_result(entry):
             gid = url_to_id.get(entry["url"])
             if not gid:
+                logger.warning("enrichment: no giveaway ID found for URL %s", entry["url"])
                 completed[0] += 1
                 return
 
             # Persist deadline
             if entry.get("deadline"):
                 update_giveaway_deadline(gid, entry["deadline"])
+                logger.info("enrichment: saved deadline='%s' for id=%s (%s)",
+                            entry["deadline"], gid, entry["url"])
+            else:
+                logger.debug("enrichment: no deadline returned for id=%s (%s)", gid, entry["url"])
 
             # Persist T&C results (only if we actually checked T&C)
             if not entry.get("email_blocked") and not entry.get("error"):
@@ -190,12 +200,17 @@ class EnrichmentWorker:
             # Auto-mark ended / region-blocked / needs_review
             if entry.get("ended"):
                 update_giveaway_status(gid, "expired")
+                logger.info("enrichment: marked EXPIRED id=%s (%s)", gid, entry["url"])
             elif entry.get("region_blocked"):
                 update_giveaway_status(gid, "not_eligible")
+                logger.info("enrichment: marked NOT_ELIGIBLE (region blocked) id=%s (%s)", gid, entry["url"])
             elif entry.get("email_blocked"):
                 update_giveaway_status(gid, "needs_review", notes="enrichment_blocked:email_subscribe")
+                logger.info("enrichment: marked NEEDS_REVIEW (email blocked) id=%s (%s)", gid, entry["url"])
             elif entry.get("error"):
                 update_giveaway_status(gid, "needs_review", notes=f"enrichment_error:{entry['error'][:200]}")
+                logger.warning("enrichment: marked NEEDS_REVIEW (error) id=%s (%s): %s",
+                               gid, entry["url"], entry["error"][:200])
 
             completed[0] += 1
             pct = int(completed[0] / total_work * 100)
@@ -206,18 +221,23 @@ class EnrichmentWorker:
             enrich_giveaways_batch(urls, on_result=_on_result)
         except Exception as e:
             self._set_error(f"Enrichment error: {e}")
+            logger.error("enrichment: batch enrichment failed: %s", e, exc_info=True)
 
         # Step 2: Scan eligibility (fast, pure DB)
         self._set_step("Scanning eligibility...", 95)
+        logger.info("enrichment: scanning eligibility...")
         scan_existing_entries()
 
         # Step 3: Remove expired and clean up invalid entries
         self._set_step("Removing expired giveaways...", 97)
-        remove_expired_giveaways()
-        expire_by_title_date()
-        remove_non_giveaway_gleam_paths()
+        removed = remove_expired_giveaways()
+        title_expired = expire_by_title_date()
+        non_giveaway = remove_non_giveaway_gleam_paths()
+        logger.info("enrichment: cleanup done -- removed=%d, title_expired=%d, non_giveaway=%d",
+                     removed, title_expired, non_giveaway)
 
         self._set_step("Enrichment complete", 100)
+        logger.info("enrichment: pipeline complete")
 
 
 # Module-level singleton -- survives Streamlit reruns
@@ -1248,6 +1268,8 @@ def main():
     # Also expire giveaways whose title contains a past date (e.g. "Ends April 5th")
     title_expired = expire_by_title_date()
     if removed or title_expired:
+        logger.info("page_load: cleaned up expired giveaways -- removed=%d, title_expired=%d",
+                     removed, title_expired)
         _cached_giveaways_display.clear()
 
     # Auto-import links from the browser extension NDJSON file
@@ -1532,6 +1554,12 @@ def main():
                 return
 
             df = pd.DataFrame(giveaways)
+
+            # In the "all" view, hide expired giveaways (they stay in the DB
+            # to prevent re-import, but should not clutter the main view).
+            # Users can still view them via the "expired" status filter.
+            if status_filter == "all":
+                df = df[df["status"] != "expired"]
 
             # Optimistic removal: hide rows the user already clicked X on,
             # even if the cached query still contains them.
