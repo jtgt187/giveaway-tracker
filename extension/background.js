@@ -12,6 +12,10 @@ let entryStats = {
   total: 0,
 };
 
+// -- Local API sync ---------------------------------------------------
+const LOCAL_API_URL = 'http://localhost:7778';
+let localApiAvailable = false;
+
 // -- Deadline prefetch queue ------------------------------------------
 let deadlineQueue = [];
 let deadlinePrefetchRunning = false;
@@ -69,6 +73,12 @@ function updateBadge() {
 }
 
 // -- Restore state on startup -----------------------------------------
+// The ready promise ensures message handlers wait for state restoration
+// before responding. This prevents the "click twice" popup bug where
+// the service worker wakes up but hasn't loaded chrome.storage yet.
+
+let _resolveReady;
+const stateReady = new Promise(resolve => { _resolveReady = resolve; });
 
 chrome.storage.local.get(
   ['gleam_links', 'gleam_last_export', 'gleam_auto_threshold', 'gleam_prefetch_deadlines', 'gleam_entry_stats'],
@@ -79,8 +89,77 @@ chrome.storage.local.get(
     if (typeof result.gleam_prefetch_deadlines === 'boolean') prefetchDeadlines = result.gleam_prefetch_deadlines;
     if (result.gleam_entry_stats) entryStats = result.gleam_entry_stats;
     updateBadge();
+    // Ping the local API to check availability
+    checkLocalApi();
+    _resolveReady();
   }
 );
+
+// -- Local API sync ---------------------------------------------------
+
+/**
+ * Check if the local API server is running.
+ * Returns a promise so callers can await it.
+ */
+function checkLocalApi() {
+  return fetch(LOCAL_API_URL + '/health', { method: 'GET' })
+    .then(r => {
+      localApiAvailable = r.ok;
+      return localApiAvailable;
+    })
+    .catch(() => {
+      localApiAvailable = false;
+      return false;
+    });
+}
+
+// Re-check API availability every 30 seconds (best-effort; MV3 service
+// workers may sleep and kill this interval, so sync functions also
+// re-check inline when localApiAvailable is false).
+setInterval(checkLocalApi, 30000);
+
+/**
+ * Push a new or updated link to the local database via the API.
+ * Fire-and-forget: failures are silently ignored (data is still in chrome.storage).
+ * If localApiAvailable is false, attempts a health check first (recovers
+ * from stale state after service worker sleep).
+ */
+function syncToLocalApi(entry) {
+  if (localApiAvailable) {
+    _postToApi('/api/link', entry);
+  } else {
+    // Service worker may have slept and lost the setInterval;
+    // re-check now and sync if the API is actually up.
+    checkLocalApi().then(ok => {
+      if (ok) _postToApi('/api/link', entry);
+    });
+  }
+}
+
+/**
+ * Push a deadline/title update to the local database via the API.
+ */
+function syncMetaToLocalApi(href, title, deadline) {
+  const payload = { href, title, deadline };
+  if (localApiAvailable) {
+    _postToApi('/api/meta', payload);
+  } else {
+    checkLocalApi().then(ok => {
+      if (ok) _postToApi('/api/meta', payload);
+    });
+  }
+}
+
+/** Internal: POST JSON to a local API path. */
+function _postToApi(path, data) {
+  fetch(LOCAL_API_URL + path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  }).catch(() => {
+    localApiAvailable = false;
+  });
+}
 
 // -- Auto-export download (background-only, fire-and-forget) ---------
 // Service workers lack Blob/URL.createObjectURL, so use a data URI.
@@ -333,8 +412,17 @@ function sleep(ms) {
 }
 
 // -- Message handler --------------------------------------------------
+// All handlers await stateReady so the popup never sees empty data
+// when the service worker is freshly woken.
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+
+  // Wrap handler in stateReady to fix the "click twice" popup bug
+  stateReady.then(() => handleMessage(msg, sender, sendResponse));
+  return true; // Keep channel open for async response
+});
+
+function handleMessage(msg, sender, sendResponse) {
 
   // -- Append a newly found link --
   if (msg.type === 'append') {
@@ -343,7 +431,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const u = new URL(msg.href);
       if (u.hostname !== 'gleam.io' && !u.hostname.endsWith('.gleam.io')) {
         sendResponse({ count: links.length });
-        return true;
+        return;
       }
       // Only store giveaway/competition URLs, not FAQ/about/docs etc.
       const path = u.pathname.replace(/\/+$/, '');
@@ -352,33 +440,36 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         /^\/[A-Za-z0-9]{4,6}\/[^/]+$/.test(path);
       if (!isGiveaway) {
         sendResponse({ count: links.length });
-        return true;
+        return;
       }
       // Reject truncated URLs (containing ellipsis character or trailing dots)
       if (u.href.includes('\u2026') || /\.{2,}$/.test(u.pathname)) {
         sendResponse({ count: links.length });
-        return true;
+        return;
       }
     } catch (e) {
       sendResponse({ count: links.length });
-      return true;
+      return;
     }
 
     const exists = links.some(l => l.href === msg.href);
     if (!exists) {
-      links.push({
+      const entry = {
         href: msg.href,
         text: msg.text || '',
         t: new Date().toISOString()
-      });
+      };
+      links.push(entry);
       persist();
       updateBadge();
       checkAutoExport();
+      // Sync to local DB immediately
+      syncToLocalApi(entry);
       // Queue for background deadline prefetch
       queueDeadlinePrefetch(msg.href);
     }
     sendResponse({ count: links.length });
-    return true;
+    return;
   }
 
   // -- Update giveaway metadata (title + deadline) from gleam-entry.js --
@@ -391,39 +482,44 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     } else {
       // The link might not have been collected yet (e.g. user navigated directly).
       // Store it as a new entry with metadata.
-      links.push({
+      const entry = {
         href: msg.href,
         text: msg.title || '',
         deadline: msg.deadline || '',
         t: new Date().toISOString()
-      });
+      };
+      links.push(entry);
       persist();
       updateBadge();
       checkAutoExport();
+      syncToLocalApi(entry);
     }
+    // Always sync the metadata update to the local DB
+    syncMetaToLocalApi(msg.href, msg.title || '', msg.deadline || '');
     sendResponse({ ok: true });
-    return true;
+    return;
   }
 
   // -- Get counts --
   if (msg.type === 'get-count') {
     sendResponse({
       count: links.length,
-      unexported: links.length - lastExportIndex
+      unexported: links.length - lastExportIndex,
+      apiConnected: localApiAvailable
     });
-    return true;
+    return;
   }
 
   // -- Get full link list --
   if (msg.type === 'get-links') {
     sendResponse({ links });
-    return true;
+    return;
   }
 
   // -- Get export data (links + index so popup can build the file) --
   if (msg.type === 'get-export-data') {
     sendResponse({ links, lastExportIndex });
-    return true;
+    return;
   }
 
   // -- Mark links as exported (called by popup after successful download) --
@@ -434,7 +530,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       persist();
     }
     sendResponse({ ok: true, lastExportIndex });
-    return true;
+    return;
   }
 
   // -- Clear everything --
@@ -444,33 +540,33 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     persist();
     updateBadge();
     sendResponse({ ok: true });
-    return true;
+    return;
   }
 
   // -- Get / set auto-export threshold --
   if (msg.type === 'get-settings') {
     sendResponse({ autoExportThreshold });
-    return true;
+    return;
   }
 
   if (msg.type === 'set-auto-threshold') {
     autoExportThreshold = parseInt(msg.value, 10) || 0;
     persist();
     sendResponse({ ok: true, autoExportThreshold });
-    return true;
+    return;
   }
 
   // -- Get / set deadline prefetch setting --
   if (msg.type === 'get-prefetch-setting') {
     sendResponse({ prefetchDeadlines });
-    return true;
+    return;
   }
 
   if (msg.type === 'set-prefetch-setting') {
     prefetchDeadlines = !!msg.value;
     persist();
     sendResponse({ ok: true, prefetchDeadlines });
-    return true;
+    return;
   }
 
   // -- Perform social action (follow/subscribe) in a background tab --
@@ -488,7 +584,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ success: false, error: err.message });
       });
 
-    return true; // Keep message channel open for async response
+    return;
   }
 
   // -- Perform visit action (open URL briefly) --
@@ -501,13 +597,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         sendResponse({ success: false, error: err.message });
       });
 
-    return true;
+    return;
   }
 
   // -- Get entry stats --
   if (msg.type === 'get-entry-stats') {
     sendResponse({ entryStats });
-    return true;
+    return;
   }
 
   // -- Reset entry stats --
@@ -515,8 +611,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     entryStats = { lastUrl: '', lastTime: '', completed: 0, failed: 0, total: 0 };
     persist();
     sendResponse({ ok: true });
-    return true;
+    return;
   }
 
-  return false;
-});
+  sendResponse(null);
+}

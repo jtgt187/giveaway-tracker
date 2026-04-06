@@ -785,8 +785,16 @@ def _extract_deadline_from_page(page):
     return ''
 
 
-def fetch_giveaway_deadlines_batch(urls, callback=None):
+def fetch_giveaway_deadlines_batch(urls, callback=None, on_result=None):
     """Fetch deadlines for multiple giveaway URLs using a single browser.
+
+    Args:
+        urls: list of giveaway URLs to fetch deadlines for.
+        callback: optional callable receiving log messages (str).
+        on_result: optional callable invoked after each URL with
+            ``(url, deadline_text)`` so the caller can persist results
+            incrementally (e.g. write to the DB while the batch is
+            still running).
 
     Returns:
         list of (url, deadline_text) tuples.
@@ -831,6 +839,9 @@ def fetch_giveaway_deadlines_batch(urls, callback=None):
                     except Exception as e:
                         emit(f"  Error: {str(e)}")
                         results.append((url, ''))
+
+                    if on_result:
+                        on_result(*results[-1])
             finally:
                 try:
                     browser.close()

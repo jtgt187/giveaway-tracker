@@ -17,6 +17,17 @@ from utils.country_check import is_eligible_for_country, is_region_blocked, is_e
 from utils.probability import format_probability
 
 init_db()
+
+# Start the local API server for live Chrome extension sync (port 7778)
+from api_server import start_api_server as _start_api_server
+if "api_server_started" not in st.session_state:
+    try:
+        _start_api_server(port=7778)
+        st.session_state.api_server_started = True
+    except OSError:
+        # Port already in use (another Streamlit worker or standalone server)
+        st.session_state.api_server_started = True
+
 # Expired giveaway cleanup runs on every page load in main() — it's a fast
 # indexed SQL DELETE so the overhead is negligible.
 
@@ -747,17 +758,22 @@ def run_enrichment_pipeline():
             st.write(f"Fetching deadlines for {len(missing_dl)} giveaways...")
             urls = [g["url"] for g in missing_dl]
             url_to_id = {g["url"]: g["id"] for g in missing_dl}
+            updated = 0
+
+            def _save_deadline(url, deadline_text):
+                nonlocal updated
+                gid = url_to_id.get(url)
+                if gid and deadline_text:
+                    update_giveaway_deadline(gid, deadline_text)
+                    updated += 1
+
             try:
-                results = fetch_giveaway_deadlines_batch(urls)
-                updated = 0
-                for url, deadline_text in results:
-                    gid = url_to_id.get(url)
-                    if gid and deadline_text:
-                        update_giveaway_deadline(gid, deadline_text)
-                        updated += 1
+                fetch_giveaway_deadlines_batch(urls, on_result=_save_deadline)
                 st.write(f"Fetched {updated} deadline(s).")
             except Exception as e:
                 st.write(f"Deadline fetch error: {e}")
+                if updated:
+                    st.write(f"({updated} deadline(s) were saved before the error.)")
         else:
             st.write("All deadlines already populated (extension prefetch).")
 
@@ -1428,17 +1444,29 @@ def main():
                     if not missing_dl:
                         st.info("All giveaways already have deadlines.")
                     else:
-                        st.info(f"Fetching deadlines for {len(missing_dl)} giveaways...")
+                        total = len(missing_dl)
                         missing_urls = [g["url"] for g in missing_dl]
                         url_to_id = {g["url"]: g["id"] for g in missing_dl}
-                        results = fetch_giveaway_deadlines_batch(missing_urls)
-                        updated = 0
-                        for url, deadline_text in results:
+                        processed = [0]   # mutable counter for the callback
+                        found = [0]
+                        progress = st.progress(0, text=f"Fetching deadlines: 0/{total}...")
+
+                        def _save_deadline_live(url, deadline_text):
                             gid = url_to_id.get(url)
                             if gid and deadline_text:
                                 update_giveaway_deadline(gid, deadline_text)
-                                updated += 1
-                        st.success(f"Found deadlines for {updated}/{len(results)} giveaways!")
+                                found[0] += 1
+                            processed[0] += 1
+                            progress.progress(
+                                processed[0] / total,
+                                text=f"Fetching deadlines: {processed[0]}/{total} checked, {found[0]} found...",
+                            )
+
+                        results = fetch_giveaway_deadlines_batch(
+                            missing_urls, on_result=_save_deadline_live,
+                        )
+                        progress.empty()
+                        st.success(f"Found deadlines for {found[0]}/{total} giveaways!")
                         _cached_giveaways_display.clear()
                         st.rerun()
             with action_col3:

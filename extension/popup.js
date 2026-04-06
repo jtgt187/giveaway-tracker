@@ -52,6 +52,14 @@ function updateCount() {
     } else {
       document.getElementById('unexported').textContent = '';
     }
+
+    // Update live DB sync indicator
+    var syncEl = document.getElementById('syncStatus');
+    if (response.apiConnected) {
+      syncEl.innerHTML = '<span class="sync-dot connected"></span><span style="color:#10b981">Live sync to DB</span>';
+    } else {
+      syncEl.innerHTML = '<span class="sync-dot disconnected"></span><span style="color:#666">DB offline</span>';
+    }
   });
 }
 

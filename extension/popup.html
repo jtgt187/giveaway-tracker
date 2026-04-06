@@ -107,6 +107,23 @@
 
       /* ── Status ── */
       #status { margin-top: 10px; font-size: 12px; color: #888; text-align: center; min-height: 16px; }
+
+      /* ── Sync indicator ── */
+      .sync-status {
+        font-size: 11px;
+        margin-top: 6px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 5px;
+      }
+      .sync-dot {
+        width: 7px; height: 7px;
+        border-radius: 50%;
+        display: inline-block;
+      }
+      .sync-dot.connected { background: #10b981; }
+      .sync-dot.disconnected { background: #ef4444; }
     </style>
   </head>
   <body>
@@ -116,6 +133,7 @@
       <div class="number" id="count">0</div>
       <div class="label">entries collected</div>
       <div class="sub" id="unexported"></div>
+      <div class="sync-status" id="syncStatus"></div>
     </div>
 
     <div class="btn-row">

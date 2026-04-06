@@ -79,7 +79,7 @@ def clean_title(title, url=""):
 
 
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -87,6 +87,9 @@ def get_connection():
 def init_db():
     conn = get_connection()
     cursor = conn.cursor()
+    # Enable WAL mode for concurrent read/write from multiple threads
+    # (API server thread + Streamlit main thread)
+    cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS giveaways (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
