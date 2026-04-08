@@ -161,7 +161,7 @@ def detect_country_restriction(html_text):
                 for ckw in country_kws:
                     # Use simpler keywords (the first 1-2 words of each phrase)
                     base_word = ckw.split(" ")[0]
-                    if len(base_word) >= 4 and base_word in context:
+                    if len(base_word) >= 2 and base_word in context:
                         return country
             return "restricted"
 

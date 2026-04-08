@@ -710,7 +710,7 @@ def auto_enter_giveaway(url, callback=None):
                     solved = wait_for_captcha_solve(page, timeout=120)
                     if not solved:
                         emit("CAPTCHA timeout after entry")
-                        return False, log
+                        return ("failed", log)
 
                 emit("Looking for simple entry methods...")
                 simple_methods = page.locator(
@@ -894,7 +894,7 @@ _DEADLINE_NUMERIC_DATE_RE = re.compile(
 
 # Relative countdown: "Ends in 11 days", "2d 3h 15m"
 _DEADLINE_RELATIVE_RE = re.compile(
-    r'(?:ends?\s+in\s+)?(\d+\s*(?:days?|d)\s*(?:\d+\s*(?:hours?|hrs?|h))?\s*(?:\d+\s*(?:minutes?|mins?|m))?)',
+    r'(?:ends?\s+in\s+)(\d+\s*(?:days?|d)\s*(?:\d+\s*(?:hours?|hrs?|h))?\s*(?:\d+\s*(?:minutes?|mins?|m))?)',
     re.IGNORECASE,
 )
 

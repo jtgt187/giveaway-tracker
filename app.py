@@ -26,6 +26,8 @@ try:
 except Exception as _init_err:
     import traceback
     logger.critical("Database initialization failed: %s", _init_err, exc_info=True)
+    st.error(f"Database initialization failed: {_init_err}")
+    st.stop()
 
 # Start the local API server for live Chrome extension sync (port 7778)
 from api_server import start_api_server as _start_api_server
@@ -33,8 +35,8 @@ if "api_server_started" not in st.session_state:
     try:
         _start_api_server(port=7778)
         st.session_state.api_server_started = True
-    except OSError:
-        # Port already in use (another Streamlit worker or standalone server)
+    except Exception:
+        # Port already in use or other startup error — not critical
         st.session_state.api_server_started = True
 
 # Expired giveaway cleanup runs on every page load in main() — it's a fast
@@ -1029,16 +1031,22 @@ def run_enrichment_pipeline_blocking():
             gid = url_to_id.get(entry["url"])
             if not gid:
                 return
-            if entry["deadline"]:
+            if entry.get("deadline"):
                 update_giveaway_deadline(gid, entry["deadline"])
-            excluded_str = ",".join(entry["excluded"]) if entry["excluded"] else ""
-            update_terms_check(gid, True, excluded_str, entry["region"])
-            if entry["ended"]:
+            # Only persist T&C if we actually checked (skip errors and email-blocked)
+            if not entry.get("email_blocked") and not entry.get("error"):
+                excluded_str = ",".join(entry["excluded"]) if entry.get("excluded") else ""
+                update_terms_check(gid, True, excluded_str, entry.get("region"))
+            if entry.get("ended"):
                 update_giveaway_status(gid, "expired")
                 ended_count[0] += 1
-            elif entry["region_blocked"]:
+            elif entry.get("region_blocked"):
                 update_giveaway_status(gid, "not_eligible")
                 blocked_count[0] += 1
+            elif entry.get("email_blocked"):
+                update_giveaway_status(gid, "needs_review", notes="enrichment_blocked:email_subscribe")
+            elif entry.get("error"):
+                update_giveaway_status(gid, "needs_review", notes=f"enrichment_error:{entry['error'][:200]}")
             enriched[0] += 1
 
         try:
@@ -1754,16 +1762,22 @@ def main():
                             gid = url_to_id.get(entry["url"])
                             if not gid:
                                 return
-                            if entry["deadline"]:
+                            if entry.get("deadline"):
                                 update_giveaway_deadline(gid, entry["deadline"])
-                            excluded_str = ",".join(entry["excluded"]) if entry["excluded"] else ""
-                            update_terms_check(gid, True, excluded_str, entry["region"])
-                            if entry["ended"]:
+                            # Only persist T&C if we actually checked (skip errors and email-blocked)
+                            if not entry.get("email_blocked") and not entry.get("error"):
+                                excluded_str = ",".join(entry["excluded"]) if entry.get("excluded") else ""
+                                update_terms_check(gid, True, excluded_str, entry.get("region"))
+                            if entry.get("ended"):
                                 update_giveaway_status(gid, "expired")
                                 ended_count[0] += 1
-                            elif entry["region_blocked"]:
+                            elif entry.get("region_blocked"):
                                 update_giveaway_status(gid, "not_eligible")
                                 blocked_count[0] += 1
+                            elif entry.get("email_blocked"):
+                                update_giveaway_status(gid, "needs_review", notes="enrichment_blocked:email_subscribe")
+                            elif entry.get("error"):
+                                update_giveaway_status(gid, "needs_review", notes=f"enrichment_error:{entry['error'][:200]}")
 
                         try:
                             enrich_giveaways_batch(enrich_urls, on_result=_save_enrich)

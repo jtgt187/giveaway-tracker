@@ -7,6 +7,24 @@ from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from urllib.parse import urlparse
 
+
+def _sanitize(value):
+    """Replace lone UTF-16 surrogates in *value* with U+FFFD.
+
+    Browser extensions occasionally emit broken surrogate pairs when
+    serialising emoji.  SQLite's Python driver raises
+    ``UnicodeEncodeError`` if these slip through, so we scrub them here.
+    """
+    if not isinstance(value, str):
+        return value
+    try:
+        value.encode("utf-8")          # fast path: already valid
+        return value
+    except UnicodeEncodeError:
+        return value.encode("utf-8", errors="surrogatepass") \
+                     .decode("utf-8", errors="replace")
+
+
 # ---------------------------------------------------------------------------
 # Logging setup (shared by all modules)
 # ---------------------------------------------------------------------------
@@ -239,44 +257,46 @@ def get_connection():
 
 def init_db():
     conn = get_connection()
-    cursor = conn.cursor()
-    # Enable WAL mode for concurrent read/write from multiple threads
-    # (API server thread + Streamlit main thread)
-    cursor.execute("PRAGMA journal_mode=WAL")
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS giveaways (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            url TEXT UNIQUE NOT NULL,
-            source TEXT NOT NULL,
-            description TEXT DEFAULT '',
-            deadline TEXT DEFAULT '',
-            country_restriction TEXT DEFAULT 'worldwide',
-            terms_checked BOOLEAN DEFAULT 0,
-            terms_excluded TEXT DEFAULT '',
-            status TEXT DEFAULT 'new',
-            total_entries INTEGER DEFAULT 0,
-            your_entries INTEGER DEFAULT 0,
-            win_probability REAL DEFAULT 0.0,
-            entered_at TEXT DEFAULT '',
-            discovered_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            notes TEXT DEFAULT ''
-        )
-    """)
     try:
-        cursor.execute("ALTER TABLE giveaways ADD COLUMN terms_checked BOOLEAN DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        cursor.execute("ALTER TABLE giveaways ADD COLUMN terms_excluded TEXT DEFAULT ''")
-    except sqlite3.OperationalError:
-        pass
-    # Indexes for common query patterns
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_giveaways_status ON giveaways(status)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_giveaways_discovered ON giveaways(discovered_at DESC)")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_giveaways_deadline ON giveaways(deadline)")
-    conn.commit()
-    conn.close()
+        cursor = conn.cursor()
+        # Enable WAL mode for concurrent read/write from multiple threads
+        # (API server thread + Streamlit main thread)
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS giveaways (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                url TEXT UNIQUE NOT NULL,
+                source TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                deadline TEXT DEFAULT '',
+                country_restriction TEXT DEFAULT 'worldwide',
+                terms_checked BOOLEAN DEFAULT 0,
+                terms_excluded TEXT DEFAULT '',
+                status TEXT DEFAULT 'new',
+                total_entries INTEGER DEFAULT 0,
+                your_entries INTEGER DEFAULT 0,
+                win_probability REAL DEFAULT 0.0,
+                entered_at TEXT DEFAULT '',
+                discovered_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                notes TEXT DEFAULT ''
+            )
+        """)
+        try:
+            cursor.execute("ALTER TABLE giveaways ADD COLUMN terms_checked BOOLEAN DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            cursor.execute("ALTER TABLE giveaways ADD COLUMN terms_excluded TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
+        # Indexes for common query patterns
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_giveaways_status ON giveaways(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_giveaways_discovered ON giveaways(discovered_at DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_giveaways_deadline ON giveaways(deadline)")
+        conn.commit()
+    finally:
+        conn.close()
     _init_blacklist_file()
     # Warm the blacklist cache at startup
     _load_blacklist()
@@ -365,10 +385,13 @@ def add_giveaway(title, url, source, description="", deadline="", country_restri
         cursor.execute("""
             INSERT OR IGNORE INTO giveaways (title, url, source, description, deadline, country_restriction, terms_checked, terms_excluded, discovered_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (title, url, source, description, deadline, country_restriction, terms_checked, terms_excluded, datetime.now().isoformat()))
+        """, (_sanitize(title), _sanitize(url), _sanitize(source), _sanitize(description),
+              _sanitize(deadline), _sanitize(country_restriction), terms_checked,
+              _sanitize(terms_excluded), datetime.now().isoformat()))
         conn.commit()
         return cursor.rowcount > 0
-    except Exception:
+    except Exception as e:
+        logger.error("add_giveaway failed for url=%s: %s", url, e, exc_info=True)
         return False
     finally:
         conn.close()
@@ -400,14 +423,14 @@ def add_giveaways_batch(giveaway_list):
                          terms_checked, terms_excluded, discovered_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    g.get("title", ""),
-                    url,
-                    g.get("source", ""),
-                    g.get("description", ""),
-                    g.get("deadline", ""),
-                    g.get("country_restriction", "worldwide"),
+                    _sanitize(g.get("title", "")),
+                    _sanitize(url),
+                    _sanitize(g.get("source", "")),
+                    _sanitize(g.get("description", "")),
+                    _sanitize(g.get("deadline", "")),
+                    _sanitize(g.get("country_restriction", "worldwide")),
                     g.get("terms_checked", False),
-                    g.get("terms_excluded", ""),
+                    _sanitize(g.get("terms_excluded", "")),
                     now,
                 ))
                 new_count += cursor.rowcount
@@ -423,61 +446,67 @@ def add_giveaways_batch(giveaway_list):
 
 def get_giveaways(status=None, gleam_only=True, exclude_not_eligible=True):
     conn = get_connection()
-    cursor = conn.cursor()
-    base_query = "SELECT * FROM giveaways"
-    conditions = []
-    params = []
-    
-    if gleam_only:
-        conditions.append("url LIKE 'https://gleam.io/%'")
-    
-    if exclude_not_eligible and not status:
-        conditions.append("status != 'not_eligible'")
-    
-    if status:
-        conditions.append("status = ?")
-        params.append(status)
-    
-    if conditions:
-        base_query += " WHERE " + " AND ".join(conditions)
-    
-    base_query += " ORDER BY discovered_at DESC"
-    
-    cursor.execute(base_query, params)
-    rows = cursor.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    try:
+        cursor = conn.cursor()
+        base_query = "SELECT * FROM giveaways"
+        conditions = []
+        params = []
+        
+        if gleam_only:
+            conditions.append("url LIKE 'https://gleam.io/%'")
+        
+        if exclude_not_eligible and not status:
+            conditions.append("status NOT IN ('not_eligible', 'expired')")
+        
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        
+        if conditions:
+            base_query += " WHERE " + " AND ".join(conditions)
+        
+        base_query += " ORDER BY discovered_at DESC"
+        
+        cursor.execute(base_query, params)
+        rows = cursor.fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 def update_giveaway_status(giveaway_id, status, notes=""):
     conn = get_connection()
-    cursor = conn.cursor()
-    if status == "participated":
-        cursor.execute("""
-            UPDATE giveaways SET status = :status, entered_at = :entered_at, notes = :notes WHERE id = :id
-        """, {"status": status, "entered_at": datetime.now().isoformat(), "notes": notes, "id": giveaway_id})
-    elif notes:
-        cursor.execute("""
-            UPDATE giveaways SET status = :status, notes = :notes WHERE id = :id
-        """, {"status": status, "notes": notes, "id": giveaway_id})
-    else:
-        cursor.execute("""
-            UPDATE giveaways SET status = :status WHERE id = :id
-        """, {"status": status, "id": giveaway_id})
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        if status == "participated":
+            cursor.execute("""
+                UPDATE giveaways SET status = :status, entered_at = :entered_at, notes = :notes WHERE id = :id
+            """, {"status": status, "entered_at": datetime.now().isoformat(), "notes": notes, "id": giveaway_id})
+        elif notes:
+            cursor.execute("""
+                UPDATE giveaways SET status = :status, notes = :notes WHERE id = :id
+            """, {"status": status, "notes": notes, "id": giveaway_id})
+        else:
+            cursor.execute("""
+                UPDATE giveaways SET status = :status WHERE id = :id
+            """, {"status": status, "id": giveaway_id})
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def update_giveaway_entries(giveaway_id, total_entries, your_entries):
     from utils.probability import calculate_win_probability
     conn = get_connection()
-    cursor = conn.cursor()
-    prob = calculate_win_probability(your_entries, total_entries)
-    cursor.execute("""
-        UPDATE giveaways SET total_entries = ?, your_entries = ?, win_probability = ? WHERE id = ?
-    """, (total_entries, your_entries, prob, giveaway_id))
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        prob = calculate_win_probability(your_entries, total_entries)
+        cursor.execute("""
+            UPDATE giveaways SET total_entries = ?, your_entries = ?, win_probability = ? WHERE id = ?
+        """, (total_entries, your_entries, prob, giveaway_id))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def update_giveaway_deadline(giveaway_id, deadline):
@@ -507,11 +536,13 @@ def update_giveaway_deadline(giveaway_id, deadline):
 
 def get_giveaway_by_url(url):
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM giveaways WHERE url = ?", (url,))
-    row = cursor.fetchone()
-    conn.close()
-    return dict(row) if row else None
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM giveaways WHERE url = ?", (url,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
 
 
 def get_known_urls():
@@ -520,29 +551,33 @@ def get_known_urls():
     Useful for bulk dedup during import so we don't query one-by-one.
     """
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT url FROM giveaways")
-    urls = {row["url"] for row in cursor.fetchall()}
-    conn.close()
-    return urls
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT url FROM giveaways")
+        urls = {row["url"] for row in cursor.fetchall()}
+        return urls
+    finally:
+        conn.close()
 
 
 def update_terms_check(giveaway_id, checked, excluded_countries="", detected_region=None):
     conn = get_connection()
-    cursor = conn.cursor()
-    if detected_region:
-        # Always update country_restriction when a region was detected from
-        # T&C analysis -- including "restricted" (e.g. state-level US
-        # restrictions like "residents of California only").
-        cursor.execute("""
-            UPDATE giveaways SET terms_checked = ?, terms_excluded = ?, country_restriction = ? WHERE id = ?
-        """, (checked, excluded_countries, detected_region, giveaway_id))
-    else:
-        cursor.execute("""
-            UPDATE giveaways SET terms_checked = ?, terms_excluded = ? WHERE id = ?
-        """, (checked, excluded_countries, giveaway_id))
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        if detected_region:
+            # Always update country_restriction when a region was detected from
+            # T&C analysis -- including "restricted" (e.g. state-level US
+            # restrictions like "residents of California only").
+            cursor.execute("""
+                UPDATE giveaways SET terms_checked = ?, terms_excluded = ?, country_restriction = ? WHERE id = ?
+            """, (checked, excluded_countries, detected_region, giveaway_id))
+        else:
+            cursor.execute("""
+                UPDATE giveaways SET terms_checked = ?, terms_excluded = ? WHERE id = ?
+            """, (checked, excluded_countries, giveaway_id))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_giveaways_display(status=None, gleam_only=True, exclude_not_eligible=True):
@@ -553,59 +588,63 @@ def get_giveaways_display(status=None, gleam_only=True, exclude_not_eligible=Tru
     excluded.  Users can still view them via the explicit status filter.
     """
     conn = get_connection()
-    cursor = conn.cursor()
-    cols = "id, title, url, status, win_probability, total_entries, deadline, country_restriction, terms_checked, terms_excluded, discovered_at"
-    base_query = f"SELECT {cols} FROM giveaways"
-    conditions = []
-    params = []
+    try:
+        cursor = conn.cursor()
+        cols = "id, title, url, status, win_probability, total_entries, deadline, country_restriction, terms_checked, terms_excluded, discovered_at"
+        base_query = f"SELECT {cols} FROM giveaways"
+        conditions = []
+        params = []
 
-    if gleam_only:
-        conditions.append("url LIKE 'https://gleam.io/%'")
+        if gleam_only:
+            conditions.append("url LIKE 'https://gleam.io/%'")
 
-    if exclude_not_eligible and not status:
-        conditions.append("status NOT IN ('not_eligible', 'expired')")
+        if exclude_not_eligible and not status:
+            conditions.append("status NOT IN ('not_eligible', 'expired')")
 
-    if status:
-        conditions.append("status = ?")
-        params.append(status)
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
 
-    if conditions:
-        base_query += " WHERE " + " AND ".join(conditions)
+        if conditions:
+            base_query += " WHERE " + " AND ".join(conditions)
 
-    base_query += " ORDER BY discovered_at DESC"
+        base_query += " ORDER BY discovered_at DESC"
 
-    cursor.execute(base_query, params)
-    rows = cursor.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+        cursor.execute(base_query, params)
+        rows = cursor.fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
 
 
 def get_stats(gleam_only=True):
     conn = get_connection()
-    cursor = conn.cursor()
-    gleam_condition = "url LIKE 'https://gleam.io/%'" if gleam_only else "1=1"
+    try:
+        cursor = conn.cursor()
+        gleam_condition = "url LIKE 'https://gleam.io/%'" if gleam_only else "1=1"
 
-    cursor.execute(f"""
-        SELECT
-            COUNT(*) as total,
-            SUM(CASE WHEN status = 'participated' THEN 1 ELSE 0 END) as participated,
-            SUM(CASE WHEN status = 'eligible' THEN 1 ELSE 0 END) as eligible,
-            SUM(CASE WHEN status = 'not_eligible' THEN 1 ELSE 0 END) as not_eligible,
-            SUM(CASE WHEN status = 'new' THEN 1 ELSE 0 END) as new_count,
-            AVG(CASE WHEN total_entries > 0 AND status != 'not_eligible'
-                THEN win_probability END) as avg_prob
-        FROM giveaways WHERE {gleam_condition}
-    """)
-    row = cursor.fetchone()
-    conn.close()
-    return {
-        "total": row["total"] or 0,
-        "participated": row["participated"] or 0,
-        "eligible": row["eligible"] or 0,
-        "not_eligible": row["not_eligible"] or 0,
-        "new": row["new_count"] or 0,
-        "avg_win_probability": round(row["avg_prob"], 4) if row["avg_prob"] else 0,
-    }
+        cursor.execute(f"""
+            SELECT
+                COUNT(*) as total,
+                SUM(CASE WHEN status = 'participated' THEN 1 ELSE 0 END) as participated,
+                SUM(CASE WHEN status = 'eligible' THEN 1 ELSE 0 END) as eligible,
+                SUM(CASE WHEN status = 'not_eligible' THEN 1 ELSE 0 END) as not_eligible,
+                SUM(CASE WHEN status = 'new' THEN 1 ELSE 0 END) as new_count,
+                AVG(CASE WHEN total_entries > 0 AND status != 'not_eligible'
+                    THEN win_probability END) as avg_prob
+            FROM giveaways WHERE {gleam_condition}
+        """)
+        row = cursor.fetchone()
+        return {
+            "total": row["total"] or 0,
+            "participated": row["participated"] or 0,
+            "eligible": row["eligible"] or 0,
+            "not_eligible": row["not_eligible"] or 0,
+            "new": row["new_count"] or 0,
+            "avg_win_probability": round(row["avg_prob"], 4) if row["avg_prob"] else 0,
+        }
+    finally:
+        conn.close()
 
 
 def mark_duplicate_or_skip(giveaway_id, reason=""):
@@ -614,12 +653,14 @@ def mark_duplicate_or_skip(giveaway_id, reason=""):
 
 def delete_not_eligible():
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM giveaways WHERE status = 'not_eligible'")
-    deleted = cursor.rowcount
-    conn.commit()
-    conn.close()
-    return deleted
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM giveaways WHERE status = 'not_eligible'")
+        deleted = cursor.rowcount
+        conn.commit()
+        return deleted
+    finally:
+        conn.close()
 
 
 def get_unenriched_giveaways():
@@ -632,17 +673,19 @@ def get_unenriched_giveaways():
     Only includes giveaways that haven't been marked as not_eligible or expired.
     """
     conn = get_connection()
-    cursor = conn.cursor()
-    active_filter = "status NOT IN ('not_eligible', 'expired', 'skipped')"
+    try:
+        cursor = conn.cursor()
+        active_filter = "status NOT IN ('not_eligible', 'expired', 'skipped')"
 
-    cursor.execute(
-        f"SELECT id, url FROM giveaways "
-        f"WHERE ((deadline = '' OR deadline IS NULL) OR terms_checked = 0) "
-        f"AND {active_filter}"
-    )
-    rows = [dict(r) for r in cursor.fetchall()]
-    conn.close()
-    return rows
+        cursor.execute(
+            f"SELECT id, url FROM giveaways "
+            f"WHERE ((deadline = '' OR deadline IS NULL) OR terms_checked = 0) "
+            f"AND {active_filter}"
+        )
+        rows = [dict(r) for r in cursor.fetchall()]
+        return rows
+    finally:
+        conn.close()
 
 
 def parse_deadline(deadline_text):
@@ -791,6 +834,7 @@ def remove_expired_giveaways():
     would produce incorrect results -- they should have been converted to
     absolute dates at import/enrichment time.
     """
+    expired_ids = []
     conn = get_connection()
     try:
         cursor = conn.cursor()
@@ -835,19 +879,21 @@ def cleanup_titles():
     Returns the count of updated rows.
     """
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, title, url FROM giveaways")
-    rows = cursor.fetchall()
-    updated = 0
-    for row in rows:
-        old_title = row["title"]
-        new_title = clean_title(old_title, row["url"])
-        if new_title != old_title:
-            cursor.execute("UPDATE giveaways SET title = ? WHERE id = ?", (new_title, row["id"]))
-            updated += 1
-    conn.commit()
-    conn.close()
-    return updated
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, title, url FROM giveaways")
+        rows = cursor.fetchall()
+        updated = 0
+        for row in rows:
+            old_title = row["title"]
+            new_title = clean_title(old_title, row["url"])
+            if new_title != old_title:
+                cursor.execute("UPDATE giveaways SET title = ? WHERE id = ?", (new_title, row["id"]))
+                updated += 1
+        conn.commit()
+        return updated
+    finally:
+        conn.close()
 
 
 def remove_non_gleam_giveaways():
@@ -857,12 +903,14 @@ def remove_non_gleam_giveaways():
     so they linger forever.  Returns the count of removed rows.
     """
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM giveaways WHERE url NOT LIKE 'https://gleam.io/%'")
-    removed = cursor.rowcount
-    conn.commit()
-    conn.close()
-    return removed
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM giveaways WHERE url NOT LIKE 'https://gleam.io/%'")
+        removed = cursor.rowcount
+        conn.commit()
+        return removed
+    finally:
+        conn.close()
 
 
 def remove_truncated_giveaways():
@@ -873,15 +921,17 @@ def remove_truncated_giveaways():
     broken links in the UI.  Returns the count of removed rows.
     """
     conn = get_connection()
-    cursor = conn.cursor()
-    # U+2026 is stored as the literal character in SQLite text
-    cursor.execute(
-        "DELETE FROM giveaways WHERE url LIKE '%\u2026%' OR url LIKE '%...'"
-    )
-    removed = cursor.rowcount
-    conn.commit()
-    conn.close()
-    return removed
+    try:
+        cursor = conn.cursor()
+        # U+2026 is stored as the literal character in SQLite text
+        cursor.execute(
+            "DELETE FROM giveaways WHERE url LIKE '%\u2026%' OR url LIKE '%...'"
+        )
+        removed = cursor.rowcount
+        conn.commit()
+        return removed
+    finally:
+        conn.close()
 
 
 def remove_non_giveaway_gleam_paths():
@@ -892,19 +942,21 @@ def remove_non_giveaway_gleam_paths():
     removed rows.
     """
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, url FROM giveaways WHERE url LIKE 'https://gleam.io/%'")
-    rows = cursor.fetchall()
-    bad_ids = []
-    for row in rows:
-        if not is_gleam_giveaway_url(row["url"]):
-            bad_ids.append(row["id"])
-    if bad_ids:
-        placeholders = ",".join("?" for _ in bad_ids)
-        cursor.execute(f"DELETE FROM giveaways WHERE id IN ({placeholders})", bad_ids)
-    conn.commit()
-    conn.close()
-    return len(bad_ids)
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, url FROM giveaways WHERE url LIKE 'https://gleam.io/%'")
+        rows = cursor.fetchall()
+        bad_ids = []
+        for row in rows:
+            if not is_gleam_giveaway_url(row["url"]):
+                bad_ids.append(row["id"])
+        if bad_ids:
+            placeholders = ",".join("?" for _ in bad_ids)
+            cursor.execute(f"DELETE FROM giveaways WHERE id IN ({placeholders})", bad_ids)
+        conn.commit()
+        return len(bad_ids)
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1016,6 +1068,7 @@ def expire_by_title_date():
 
     Returns the count of newly expired rows.
     """
+    expired_ids = []
     conn = get_connection()
     try:
         cursor = conn.cursor()
