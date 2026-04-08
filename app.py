@@ -1198,12 +1198,17 @@ def import_ndjson_links():
     successfully_read = []
     for filepath in files:
         try:
-            with open(filepath, "r", encoding="utf-8") as f:
+            with open(filepath, "r", encoding="utf-8", errors="surrogateescape") as f:
                 for line in f:
                     line = line.strip()
                     if not line:
                         continue
                     try:
+                        # Re-encode with surrogatepass then decode with
+                        # replace so lone surrogates become U+FFFD instead
+                        # of crashing downstream (SQLite, Streamlit, etc.).
+                        line = line.encode("utf-8", errors="surrogatepass") \
+                                   .decode("utf-8", errors="replace")
                         entry = json.loads(line)
                         if not isinstance(entry, dict):
                             continue
@@ -1669,7 +1674,10 @@ def main():
                         if st.button("✗", key=f"{key_prefix}bl_{gid}", help="Remove & blacklist"):
                             st.session_state.removed_giveaway_ids.add(gid)
                             add_to_blacklist(url, "Manually blacklisted")
-                            st.rerun(scope="fragment")
+                            try:
+                                st.rerun(scope="fragment")
+                            except st.errors.StreamlitAPIException:
+                                st.rerun()
                     with col_title:
                         st.markdown(f'<a class="ga-title ga-clickable" href="{html_escape(url, quote=True)}" target="_blank" rel="noopener">{html_escape(title)}</a>', unsafe_allow_html=True)
                     with col_status:
@@ -1710,7 +1718,10 @@ def main():
                         deleted = delete_not_eligible()
                         _cached_giveaways_display.clear()
                         st.success(f"Deleted {deleted} not-eligible giveaways.")
-                        st.rerun(scope="fragment")
+                        try:
+                            st.rerun(scope="fragment")
+                        except st.errors.StreamlitAPIException:
+                            st.rerun()
                 with st.expander("Review not-eligible giveaways", expanded=False):
                     _render_giveaway_rows(df_not_eligible, key_prefix="ne_")
 

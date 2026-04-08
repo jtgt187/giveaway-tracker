@@ -281,12 +281,27 @@ function onPrefetchToggle() {
   });
 }
 
+// -- Update DB total from local API -----------------------------------
+
+function updateDbTotal() {
+  fetch('http://127.0.0.1:7778/api/stats')
+    .then(function(r) { return r.json(); })
+    .then(function(stats) {
+      var el = document.getElementById('dbTotal');
+      el.innerHTML = '<span class="db-num">' + (stats.total || 0) + '</span> giveaways in DB';
+    })
+    .catch(function() {
+      document.getElementById('dbTotal').textContent = '';
+    });
+}
+
 // -- Init --------------------------------------------------------------
 
 document.addEventListener('DOMContentLoaded', function() {
   updateCount();
   updateRecentLinks();
   updateEntryStats();
+  updateDbTotal();
   loadSettings();
 
   // Poll for updates every 3 seconds while popup is open
@@ -294,6 +309,7 @@ document.addEventListener('DOMContentLoaded', function() {
     updateCount();
     updateRecentLinks();
     updateEntryStats();
+    updateDbTotal();
   }, 3000);
 
   document.getElementById('exportNewBtn').addEventListener('click', exportNew);

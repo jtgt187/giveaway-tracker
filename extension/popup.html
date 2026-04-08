@@ -124,6 +124,15 @@
       }
       .sync-dot.connected { background: #10b981; }
       .sync-dot.disconnected { background: #ef4444; }
+
+      /* ── DB total ── */
+      .db-total {
+        text-align: center;
+        font-size: 12px;
+        color: #888;
+        margin-top: 4px;
+      }
+      .db-total .db-num { color: #7c3aed; font-weight: 700; }
     </style>
   </head>
   <body>
@@ -134,6 +143,7 @@
       <div class="label">entries collected</div>
       <div class="sub" id="unexported"></div>
       <div class="sync-status" id="syncStatus"></div>
+      <div class="db-total" id="dbTotal"></div>
     </div>
 
     <div class="btn-row">

@@ -24,6 +24,7 @@ from database import (
     get_giveaway_by_url,
     get_giveaways_display,
     get_connection,
+    get_stats,
     is_gleam_giveaway_url,
 )
 
@@ -105,6 +106,11 @@ class APIHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/health':
             self._send_json({'status': 'ok'})
+            return
+
+        if self.path == '/api/stats':
+            stats = get_stats()
+            self._send_json(stats)
             return
 
         if self.path == '/api/giveaways':
