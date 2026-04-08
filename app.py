@@ -12,7 +12,7 @@ import threading
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from database import init_db, add_giveaway, add_giveaways_batch, get_giveaways, get_giveaways_display, update_giveaway_status, get_stats, update_giveaway_entries, get_giveaway_by_url, delete_not_eligible, update_terms_check, add_to_blacklist, get_blacklist, remove_from_blacklist, remove_expired_giveaways, get_connection, update_giveaway_deadline, get_unenriched_giveaways, clean_title, cleanup_titles, remove_non_gleam_giveaways, remove_truncated_giveaways, is_gleam_giveaway_url, remove_non_giveaway_gleam_paths, expire_by_title_date
+from database import init_db, add_giveaway, add_giveaways_batch, get_giveaways, get_giveaways_display, update_giveaway_status, get_stats, update_giveaway_entries, get_giveaway_by_url, delete_not_eligible, update_terms_check, add_to_blacklist, get_blacklist, remove_from_blacklist, remove_expired_giveaways, get_connection, update_giveaway_deadline, get_unenriched_giveaways, clean_title, cleanup_titles, remove_non_gleam_giveaways, remove_truncated_giveaways, is_gleam_giveaway_url, remove_non_giveaway_gleam_paths, expire_by_title_date, mark_deadline_checked, cleanup_deadline_blobs
 from config import load_config, save_config
 from entry.auto_enter import auto_enter_giveaway, check_giveaway_terms, enrich_giveaways_batch
 from utils.country_check import is_eligible_for_country, is_region_blocked, is_ended
@@ -194,6 +194,11 @@ class EnrichmentWorker:
             else:
                 logger.debug("enrichment: no deadline returned for id=%s (%s)", gid, entry["url"])
 
+            # Mark deadline as checked so this URL isn't re-enriched just
+            # because its deadline column is still empty.
+            if not entry.get("error"):
+                mark_deadline_checked(gid)
+
             # Persist T&C results (only if we actually checked T&C)
             if not entry.get("email_blocked") and not entry.get("error"):
                 excluded_str = ",".join(entry["excluded"]) if entry.get("excluded") else ""
@@ -235,8 +240,9 @@ class EnrichmentWorker:
         removed = remove_expired_giveaways()
         title_expired = expire_by_title_date()
         non_giveaway = remove_non_giveaway_gleam_paths()
-        logger.info("enrichment: cleanup done -- removed=%d, title_expired=%d, non_giveaway=%d",
-                     removed, title_expired, non_giveaway)
+        blob_fixed = cleanup_deadline_blobs()
+        logger.info("enrichment: cleanup done -- removed=%d, title_expired=%d, non_giveaway=%d, blob_fixed=%d",
+                     removed, title_expired, non_giveaway, blob_fixed)
 
         self._set_step("Enrichment complete", 100)
         logger.info("enrichment: pipeline complete")
@@ -1266,14 +1272,15 @@ def main():
         st.session_state.removed_giveaway_ids = set()
 
     # One-time cleanup on first load: remove non-gleam URLs, truncated URLs,
-    # non-giveaway paths (e.g. /terms, /privacy), and fix titles
+    # non-giveaway paths (e.g. /terms, /privacy), fix titles, and fix deadline blobs
     if "db_cleaned" not in st.session_state:
         non_gleam = remove_non_gleam_giveaways()
         truncated = remove_truncated_giveaways()
         non_giveaway = remove_non_giveaway_gleam_paths()
         title_fixes = cleanup_titles()
+        blob_fixed = cleanup_deadline_blobs()
         st.session_state.db_cleaned = True
-        if non_gleam or truncated or non_giveaway or title_fixes:
+        if non_gleam or truncated or non_giveaway or title_fixes or blob_fixed:
             _cached_giveaways_display.clear()
 
     # Remove expired giveaways on every page load (fast indexed SQL query)
@@ -1313,9 +1320,10 @@ def main():
         _step_text = _enrich_snap["step"] or "Enriching..."
         _detail_text = _enrich_snap["detail"]
         st.progress(_pct, text=f"{_step_text}  {_detail_text}")
-        # Poll every 2 seconds while enrichment is running
-        time.sleep(2)
-        st.rerun()
+        # Auto-refresh via Streamlit's built-in mechanism (non-blocking)
+        st.empty()
+        import streamlit.components.v1 as _components
+        _components.html('<script>setTimeout(function(){window.parent.postMessage({isStreamlitMessage:true,type:"streamlit:rerun"},"*")},2000)</script>', height=0)
     elif _enrich_snap["done"] and not st.session_state.get("_enrich_notified"):
         # Enrichment just finished — refresh data and notify once
         _cached_giveaways_display.clear()
@@ -1324,6 +1332,7 @@ def main():
             st.warning(f"Enrichment finished with errors: {_enrich_snap['error']}")
         else:
             st.toast("Background enrichment complete")
+            time.sleep(0.5)
         st.rerun()
 
     tab_dashboard, tab_giveaways, tab_autoenter, tab_settings = st.tabs([
@@ -1510,7 +1519,11 @@ def main():
                 entered = 0
                 for g in eligible:
                     with st.spinner(f"Entering: {g['title'][:50]}..."):
-                        result, log = auto_enter_giveaway(g["url"])
+                        try:
+                            result, log = auto_enter_giveaway(g["url"])
+                        except Exception as e:
+                            st.error(f"Entry crashed for {g['title'][:50]}: {e}")
+                            continue
                         if result == "success":
                             update_giveaway_status(g["id"], "participated")
                             entered += 1
@@ -1798,7 +1811,7 @@ def main():
                     st.warning("This will delete all giveaway data. Are you sure?")
                     confirm_col1, confirm_col2 = st.columns(2)
                     with confirm_col1:
-                        if st.button("Yes, delete everything", type="primary", use_container_width=True):
+                        if st.button("Yes, delete everything", type="primary", use_container_width=True, key="confirm_delete_all"):
                             conn = get_connection()
                             conn.execute("DELETE FROM giveaways")
                             conn.commit()
@@ -1808,7 +1821,7 @@ def main():
                             st.success("All data cleared!")
                             st.rerun()
                     with confirm_col2:
-                        if st.button("Cancel", use_container_width=True):
+                        if st.button("Cancel", use_container_width=True, key="cancel_delete_all"):
                             st.session_state["confirm_clear_all"] = False
                             st.rerun()
                 else:
@@ -1892,7 +1905,10 @@ def main():
                             if "entry_stats" not in st.session_state:
                                 st.session_state.entry_stats = {"entered": 0, "failed": 0, "skipped": 0}
                             with st.spinner("Auto-entering..."):
-                                result, log = auto_enter_giveaway(g["url"])
+                                try:
+                                    result, log = auto_enter_giveaway(g["url"])
+                                except Exception as e:
+                                    result, log = "failed", [f"Entry crashed: {e}"]
                                 if result == "region_restricted":
                                     update_giveaway_status(g["id"], "not_eligible")
                                     st.session_state.entry_stats["failed"] += 1
@@ -1920,9 +1936,14 @@ def main():
                 if st.button("⚡ Auto-Enter ALL Eligible", type="primary", use_container_width=True):
                     if "entry_stats" not in st.session_state:
                         st.session_state.entry_stats = {"entered": 0, "failed": 0, "skipped": 0}
+                    all_logs = []
                     for g in eligible:
                         with st.spinner(f"Entering: {g['title'][:60]}..."):
-                            result, log = auto_enter_giveaway(g["url"])
+                            try:
+                                result, log = auto_enter_giveaway(g["url"])
+                            except Exception as e:
+                                result, log = "failed", [f"Entry crashed: {e}"]
+                            all_logs.extend(log)
                             if result == "region_restricted":
                                 update_giveaway_status(g["id"], "not_eligible")
                                 st.session_state.entry_stats["failed"] += 1
@@ -1938,6 +1959,7 @@ def main():
                             else:
                                 st.session_state.entry_stats["failed"] += 1
                                 st.warning(f"Failed: {g['title'][:60]}")
+                    st.session_state.entry_log = all_logs
                     st.rerun()
             else:
                 st.markdown(f"""
@@ -1984,7 +2006,7 @@ def main():
             format_func=lambda x: countries[x],
             index=country_keys.index(tc) if tc in countries else 0
         )
-        if selected_country != config.get("target_country"):
+        if selected_country != config.get("target_country", "germany"):
             config["target_country"] = selected_country
             save_config(config)
             # Re-evaluate eligibility for all giveaways with the new country

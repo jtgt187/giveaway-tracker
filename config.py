@@ -44,8 +44,6 @@ def load_config():
 
 def save_config(config):
     global _config_cache
-    with _config_lock:
-        _config_cache = config.copy()
     # Atomic write: write to temp file then rename, so a crash during
     # json.dump can't leave a truncated/corrupt config.json.
     config_dir = os.path.dirname(CONFIG_PATH) or "."
@@ -60,6 +58,9 @@ def save_config(config):
         except OSError:
             pass
         raise
+    # Only update in-memory cache after successful disk write
+    with _config_lock:
+        _config_cache = config.copy()
 
 
 def get_custom_sites():

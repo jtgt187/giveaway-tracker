@@ -90,6 +90,8 @@ _GLEAM_SKIP_PATHS = {
     '/giveaways', '/login', '/signup', '/account', '/settings',
     '/privacy', '/terms', '/about', '/contact', '/faq', '/help',
     '/docs', '/api', '/embed',
+    '/guides', '/blog', '/templates', '/pricing', '/updates',
+    '/features', '/gallery', '/examples',
 }
 
 
@@ -147,6 +149,8 @@ BAD_TITLES = {
 
 def _is_bad_title(title):
     """Return True if *title* is a known status/placeholder message."""
+    if not title:
+        return False
     return title.strip().lower() in BAD_TITLES
 
 
@@ -290,6 +294,10 @@ def init_db():
             cursor.execute("ALTER TABLE giveaways ADD COLUMN terms_excluded TEXT DEFAULT ''")
         except sqlite3.OperationalError:
             pass
+        try:
+            cursor.execute("ALTER TABLE giveaways ADD COLUMN deadline_checked BOOLEAN DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
         # Indexes for common query patterns
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_giveaways_status ON giveaways(status)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_giveaways_discovered ON giveaways(discovered_at DESC)")
@@ -309,7 +317,7 @@ def _get_blacklist_path():
 def _init_blacklist_file():
     path = _get_blacklist_path()
     if not os.path.exists(path):
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             pass
 
 
@@ -319,7 +327,7 @@ def _load_blacklist():
     if not os.path.exists(path):
         _blacklist_cache = set()
         return _blacklist_cache
-    with open(path, "r") as f:
+    with open(path, "r", encoding="utf-8") as f:
         _blacklist_cache = set(line.strip() for line in f if line.strip())
     return _blacklist_cache
 
@@ -327,7 +335,7 @@ def _load_blacklist():
 def _save_blacklist(urls):
     global _blacklist_cache
     path = _get_blacklist_path()
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         for url in urls:
             f.write(url + "\n")
     _blacklist_cache = set(urls)
@@ -343,7 +351,7 @@ def add_to_blacklist(url, reason=""):
             _blacklist_cache.add(url)
             # Append-only write: O(1) instead of rewriting the entire file
             path = _get_blacklist_path()
-            with open(path, "a") as f:
+            with open(path, "a", encoding="utf-8") as f:
                 f.write(url + "\n")
     conn = get_connection()
     try:
@@ -534,6 +542,21 @@ def update_giveaway_deadline(giveaway_id, deadline):
     logger.info("update_giveaway_deadline: id=%s, deadline='%s'", giveaway_id, stored)
 
 
+def mark_deadline_checked(giveaway_id):
+    """Mark that deadline extraction has been attempted for this giveaway.
+
+    Prevents re-enriching pages that genuinely have no deadline (e.g. some
+    giveaways simply don't show one).
+    """
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("UPDATE giveaways SET deadline_checked = 1 WHERE id = ?", (giveaway_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def get_giveaway_by_url(url):
     conn = get_connection()
     try:
@@ -667,8 +690,9 @@ def get_unenriched_giveaways():
     """Return giveaways that still need enrichment (missing deadline or unchecked T&C).
 
     Returns a list of dicts with ``id`` and ``url`` for every active giveaway
-    that is missing a deadline OR has unchecked T&C.  The combined function
-    ``enrich_giveaways_batch`` visits each URL once and extracts everything.
+    that is missing a deadline (and hasn't already been checked for one) OR
+    has unchecked T&C.  The combined function ``enrich_giveaways_batch``
+    visits each URL once and extracts everything.
 
     Only includes giveaways that haven't been marked as not_eligible or expired.
     """
@@ -679,7 +703,8 @@ def get_unenriched_giveaways():
 
         cursor.execute(
             f"SELECT id, url FROM giveaways "
-            f"WHERE ((deadline = '' OR deadline IS NULL) OR terms_checked = 0) "
+            f"WHERE (((deadline = '' OR deadline IS NULL) AND (deadline_checked = 0 OR deadline_checked IS NULL)) "
+            f"       OR terms_checked = 0) "
             f"AND {active_filter}"
         )
         rows = [dict(r) for r in cursor.fetchall()]
@@ -955,6 +980,43 @@ def remove_non_giveaway_gleam_paths():
             cursor.execute(f"DELETE FROM giveaways WHERE id IN ({placeholders})", bad_ids)
         conn.commit()
         return len(bad_ids)
+    finally:
+        conn.close()
+
+
+def cleanup_deadline_blobs():
+    """Fix deadline entries that contain full description blobs instead of dates.
+
+    Scans for deadline values longer than 80 chars (clearly not a date string),
+    tries to extract a proper date with regex, and updates or clears the field.
+    Returns the count of fixed rows.
+    """
+    # Import here to avoid circular import at module level
+    from entry.auto_enter import _extract_date_from_text
+
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, url, deadline FROM giveaways WHERE length(deadline) > 80")
+        rows = cursor.fetchall()
+        fixed = 0
+        for row in rows:
+            gid, url, blob = row["id"], row["url"], row["deadline"]
+            extracted = _extract_date_from_text(blob, url)
+            if extracted:
+                cursor.execute("UPDATE giveaways SET deadline = ? WHERE id = ?",
+                               (extracted, gid))
+                logger.info("cleanup_deadline_blobs: fixed id=%s -> '%s' (was %d chars)",
+                            gid, extracted, len(blob))
+            else:
+                # No date found in the blob -- clear it and mark as checked
+                cursor.execute("UPDATE giveaways SET deadline = '', deadline_checked = 1 WHERE id = ?",
+                               (gid,))
+                logger.info("cleanup_deadline_blobs: cleared id=%s (no date in %d-char blob)",
+                            gid, len(blob))
+            fixed += 1
+        conn.commit()
+        return fixed
     finally:
         conn.close()
 

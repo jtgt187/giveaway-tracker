@@ -180,7 +180,7 @@ class APIHandler(BaseHTTPRequestHandler):
         href = data['href']
 
         # Only accept gleam.io URLs
-        if not href.startswith('https://gleam.io/'):
+        if not is_gleam_giveaway_url(href):
             self._send_json({'error': 'not a gleam.io URL'}, 400)
             return
 

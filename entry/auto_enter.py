@@ -641,6 +641,8 @@ def auto_enter_giveaway(url, callback=None):
         nonlocal profile_path
 
         with sync_playwright() as p:
+            browser = None
+            page = None
             launch_args = {
                 "headless": False,
                 "args": [
@@ -745,7 +747,7 @@ def auto_enter_giveaway(url, callback=None):
                 return ("failed", log)
             finally:
                 try:
-                    if hasattr(browser, 'close'):
+                    if browser is not None and hasattr(browser, 'close'):
                         browser.close()
                 except Exception:
                     pass
@@ -776,6 +778,8 @@ def check_giveaway_terms(url, callback=None):
         detected_region = None
 
         with sync_playwright() as p:
+            browser = None
+            page = None
             launch_args = {
                 "headless": False,
                 "args": [
@@ -831,7 +835,7 @@ def check_giveaway_terms(url, callback=None):
                 return [], None, log
             finally:
                 try:
-                    if hasattr(browser, 'close'):
+                    if browser is not None and hasattr(browser, 'close'):
                         browser.close()
                 except Exception:
                     pass
@@ -843,8 +847,11 @@ def check_giveaway_terms(url, callback=None):
 # Deadline extraction
 # ---------------------------------------------------------------------------
 
-# CSS selectors where Gleam typically renders countdown/end-date info
-_DEADLINE_SELECTORS = [
+# CSS selectors where Gleam typically renders countdown/end-date info.
+# "short" selectors: text content is just the deadline (return verbatim).
+# "long" selectors: text may be a full description containing a deadline
+#   (needs regex extraction before returning).
+_DEADLINE_SELECTORS_SHORT = [
     '.countdown',
     '.competition-countdown',
     '.incentive-timer',
@@ -853,7 +860,6 @@ _DEADLINE_SELECTORS = [
     '.end-date',
     '.competition-ends',
     '.gleam-countdown',
-    '.incentive-description',
     '[data-ends]',
     '[data-deadline]',
     '[class*="countdown"]',
@@ -861,6 +867,10 @@ _DEADLINE_SELECTORS = [
     '[class*="deadline"]',
     '[class*="end-date"]',
     '[class*="expires"]',
+]
+
+_DEADLINE_SELECTORS_LONG = [
+    '.incentive-description',
 ]
 
 # Regex patterns for dates near end-related keywords in page text
@@ -899,11 +909,80 @@ _DEADLINE_RELATIVE_RE = re.compile(
 )
 
 
+# Ordered list of (label, pattern) for date extraction from text.
+_DEADLINE_REGEX_PATTERNS = [
+    ("primary", _DEADLINE_TEXT_RE),
+    ("date_near", _DEADLINE_DATE_NEAR_RE),
+    ("us_date", _DEADLINE_US_DATE_RE),
+    ("numeric", _DEADLINE_NUMERIC_DATE_RE),
+    ("relative", _DEADLINE_RELATIVE_RE),
+]
+
+
+# ISO-style date pattern for standalone extraction (no keyword prefix needed).
+# Matches: "2023-05-28 11:59:59", "2023-05-28", "2023-05-20 5:00:00pm CEST"
+_DEADLINE_ISO_STANDALONE_RE = re.compile(
+    r'(\d{4}-\d{2}-\d{2}\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?\s*[A-Z]{0,4})',
+    re.IGNORECASE,
+)
+
+# "April 14, 2026, 8 AM PT" / "October 14th, 10 PM EDT" (no keyword prefix)
+_DEADLINE_US_STANDALONE_RE = re.compile(
+    r'((?:January|February|March|April|May|June|July|August|September|October|November|December|'
+    r'Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}(?:st|nd|rd|th)?,?\s+(?:\d{4})?,?\s*'
+    r'(?:\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?\s*[A-Z]{0,4})?)',
+    re.IGNORECASE,
+)
+
+# "20/04/2026" standalone
+_DEADLINE_NUMERIC_STANDALONE_RE = re.compile(
+    r'(\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{2,4})',
+)
+
+
+def _extract_date_from_text(text, url=''):
+    """Try to extract a clean date string from *text* using deadline regex patterns.
+
+    First tries keyword-anchored patterns (e.g. "Ends April 14, 2026"),
+    then falls back to standalone date patterns.
+    Returns the matched date string or '' if nothing found.
+    """
+    # 1) Keyword-anchored patterns (highest confidence)
+    for label, pattern in _DEADLINE_REGEX_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            result = m.group(1).strip()
+            logger.debug("_extract_date_from_text: matched '%s' -> '%s' [%s]",
+                         label, result, url)
+            return result
+
+    # 2) Standalone date patterns (for text that contains dates without keywords)
+    for label, pattern in [
+        ("iso_standalone", _DEADLINE_ISO_STANDALONE_RE),
+        ("us_standalone", _DEADLINE_US_STANDALONE_RE),
+        ("numeric_standalone", _DEADLINE_NUMERIC_STANDALONE_RE),
+    ]:
+        m = pattern.search(text)
+        if m:
+            result = m.group(1).strip()
+            # Reject very short or obviously non-date matches
+            if len(result) >= 6 and re.search(r'\d', result):
+                logger.debug("_extract_date_from_text: matched standalone '%s' -> '%s' [%s]",
+                             label, result, url)
+                return result
+
+    return ''
+
+
 def _extract_deadline_from_page(page):
     """Extract a deadline string from the current Playwright page.
 
     Tries Gleam-specific CSS selectors first, then falls back to regex
     scanning of the page body text.
+
+    "Short" selectors (countdown widgets) return their text verbatim.
+    "Long" selectors (description blocks) have regex applied to extract
+    just the date portion, avoiding storing entire description blobs.
     """
     url = ""
     try:
@@ -911,8 +990,8 @@ def _extract_deadline_from_page(page):
     except Exception:
         pass
 
-    # 1) CSS selector scan
-    for sel in _DEADLINE_SELECTORS:
+    # 1a) Short CSS selectors -- return text as-is (these are countdown widgets)
+    for sel in _DEADLINE_SELECTORS_SHORT:
         try:
             el = page.query_selector(sel)
             if el:
@@ -924,6 +1003,31 @@ def _extract_deadline_from_page(page):
                 elif text:
                     logger.debug("deadline_extract: selector '%s' matched but text too short/no digits: '%s' [%s]",
                                  sel, text[:80], url)
+        except Exception:
+            continue
+
+    # 1b) Long CSS selectors -- extract date via regex from the matched text
+    for sel in _DEADLINE_SELECTORS_LONG:
+        try:
+            el = page.query_selector(sel)
+            if el:
+                text = (el.text_content() or '').strip()
+                if not text or len(text) <= 3 or not re.search(r'\d', text):
+                    continue
+                # If text is short enough to be just a date, return as-is
+                if len(text) <= 80:
+                    logger.info("deadline_extract: FOUND via selector '%s' -> '%s' [%s]",
+                                sel, text, url)
+                    return text
+                # Long text: extract date portion with regex
+                extracted = _extract_date_from_text(text, url)
+                if extracted:
+                    logger.info("deadline_extract: FOUND via selector '%s' + regex -> '%s' [%s]",
+                                sel, extracted, url)
+                    return extracted
+                else:
+                    logger.debug("deadline_extract: selector '%s' matched long text (%d chars) "
+                                 "but no date regex matched [%s]", sel, len(text), url)
         except Exception:
             continue
 
@@ -940,13 +1044,7 @@ def _extract_deadline_from_page(page):
         return ''
 
     # Try each regex pattern in order of specificity
-    for label, pattern in [
-        ("primary", _DEADLINE_TEXT_RE),
-        ("date_near", _DEADLINE_DATE_NEAR_RE),
-        ("us_date", _DEADLINE_US_DATE_RE),
-        ("numeric", _DEADLINE_NUMERIC_DATE_RE),
-        ("relative", _DEADLINE_RELATIVE_RE),
-    ]:
+    for label, pattern in _DEADLINE_REGEX_PATTERNS:
         m = pattern.search(body_text)
         if m:
             result = m.group(1).strip()
@@ -1124,10 +1222,18 @@ def _enrich_worker(worker_id, urls_chunk, total_urls, on_result, emit, counter, 
                         emit(f"[W{worker_id}] Page crashed, creating new tab...")
                         logger.warning("[W%d] page crashed, recreating...", worker_id)
                         try:
+                            page.close()
+                        except Exception:
+                            pass
+                        try:
                             page = context.new_page()
                         except Exception:
                             emit(f"[W{worker_id}] Context dead, recreating browser context...")
                             logger.warning("[W%d] context dead, recreating browser context...", worker_id)
+                            try:
+                                context.close()
+                            except Exception:
+                                pass
                             try:
                                 context = browser.new_context()
                                 page = context.new_page()
@@ -1151,8 +1257,16 @@ def _enrich_worker(worker_id, urls_chunk, total_urls, on_result, emit, counter, 
                         emit(f"[W{worker_id}] Page died after enriching {url}, will recreate for next URL")
                         logger.warning("[W%d] page died after %s, recreating", worker_id, url)
                         try:
+                            page.close()
+                        except Exception:
+                            pass
+                        try:
                             page = context.new_page()
                         except Exception:
+                            try:
+                                context.close()
+                            except Exception:
+                                pass
                             try:
                                 context = browser.new_context()
                                 page = context.new_page()
