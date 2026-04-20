@@ -53,7 +53,7 @@ def sample_giveaway():
         "url": "https://gleam.io/abc123/win-ps5",
         "source": "gleamfinder",
         "description": "Enter to win a PS5 console",
-        "deadline": "Friday 10 April 2026 at 23:59:59",
+        "deadline": "Friday 10 April 2099 at 23:59:59",
         "country_restriction": "worldwide",
     }
 
@@ -67,7 +67,7 @@ def sample_giveaways():
             "url": "https://gleam.io/abc123/win-ps5",
             "source": "gleamfinder",
             "description": "",
-            "deadline": "Friday 10 April 2026 at 23:59:59",
+            "deadline": "Friday 10 April 2099 at 23:59:59",
             "country_restriction": "worldwide",
         },
         {
@@ -75,7 +75,7 @@ def sample_giveaways():
             "url": "https://gleam.io/def456/win-xbox",
             "source": "bestofgleam",
             "description": "",
-            "deadline": "Saturday 11 April 2026 at 22:00:00",
+            "deadline": "Saturday 11 April 2099 at 22:00:00",
             "country_restriction": "germany",
         },
         {
@@ -83,7 +83,7 @@ def sample_giveaways():
             "url": "https://gleam.io/ghi789/win-switch",
             "source": "gleamdb",
             "description": "",
-            "deadline": "Sunday 12 April 2026 at 20:00:00",
+            "deadline": "Sunday 12 April 2099 at 20:00:00",
             "country_restriction": "us",
         },
         {

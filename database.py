@@ -603,12 +603,43 @@ def update_terms_check(giveaway_id, checked, excluded_countries="", detected_reg
         conn.close()
 
 
-def get_giveaways_display(status=None, gleam_only=True, exclude_not_eligible=True):
+def _is_past_deadline(deadline_text, now=None):
+    """Return True if *deadline_text* parses to a datetime strictly in the past.
+
+    Rows with empty, unparseable, or relative-countdown deadlines are treated
+    as *unknown* (returns False) so they remain visible until the next
+    enrichment pass resolves them.
+    """
+    if not deadline_text:
+        return False
+    # Skip relative countdowns -- they can't be meaningfully re-evaluated
+    # without knowing when they were captured (same rule as
+    # remove_expired_giveaways).
+    if re.search(
+        r'^\s*(?:ends?\s+in\s+)?\d+\s*(?:days?|d|hours?|hrs?|h|minutes?|mins?|m)\b',
+        deadline_text,
+        re.IGNORECASE,
+    ):
+        return False
+    dt = parse_deadline(deadline_text)
+    if dt is None:
+        return False
+    return dt < (now or datetime.now())
+
+
+def get_giveaways_display(status=None, gleam_only=True, exclude_not_eligible=True,
+                           include_expired=False):
     """Optimized query that selects only the columns needed for table display.
 
     When *exclude_not_eligible* is True (the default) and no explicit *status*
     filter is given, rows with status ``not_eligible`` or ``expired`` are
     excluded.  Users can still view them via the explicit status filter.
+
+    When *include_expired* is False (the default), rows whose ``deadline``
+    has already passed are filtered out regardless of their status.  This
+    provides correctness independent of whether the background
+    ``remove_expired_giveaways`` cleanup has run recently.  Pass
+    ``include_expired=True`` or ``status='expired'`` to view them.
     """
     conn = get_connection()
     try:
@@ -634,8 +665,17 @@ def get_giveaways_display(status=None, gleam_only=True, exclude_not_eligible=Tru
         base_query += " ORDER BY discovered_at DESC"
 
         cursor.execute(base_query, params)
-        rows = cursor.fetchall()
-        return [dict(r) for r in rows]
+        rows = [dict(r) for r in cursor.fetchall()]
+
+        # Post-fetch filter for past deadlines. SQLite can't parse the free-form
+        # deadline strings natively, and the dataset is small enough that
+        # Python-side filtering is cheap. Skipped when the caller explicitly
+        # asked for expired rows (include_expired=True or status='expired').
+        if not include_expired and status != 'expired':
+            now = datetime.now()
+            rows = [r for r in rows if not _is_past_deadline(r.get("deadline"), now)]
+
+        return rows
     finally:
         conn.close()
 

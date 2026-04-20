@@ -186,6 +186,59 @@ def test_get_giveaways_display_excludes_expired_by_default(tmp_db, sample_giveaw
     assert len(all_rows) == 4  # all giveaways including expired and not_eligible
 
 
+def test_get_giveaways_display_hides_past_deadlines(tmp_db):
+    """Rows with a past deadline must be hidden even when status is 'eligible'.
+
+    This guards against the bug where DB cleanup (`remove_expired_giveaways`)
+    had not yet run and stale rows were served to the dashboard / API.
+    """
+    from database import add_giveaway, get_giveaways_display
+
+    # Past deadline, still marked eligible (simulates pre-cleanup state)
+    add_giveaway(
+        "Stale Eligible", "https://gleam.io/stale1/test", "test",
+        deadline="Friday 01 January 2021 at 00:00:00",
+    )
+    # Future deadline, eligible
+    add_giveaway(
+        "Live Eligible", "https://gleam.io/live1/test", "test",
+        deadline="Friday 01 January 2099 at 00:00:00",
+    )
+    # Empty deadline -> treated as unknown, kept visible
+    add_giveaway(
+        "Unknown Deadline", "https://gleam.io/unk1/test", "test",
+        deadline="",
+    )
+
+    default_rows = get_giveaways_display()
+    titles = {r["title"] for r in default_rows}
+    assert "Stale Eligible" not in titles
+    assert "Live Eligible" in titles
+    assert "Unknown Deadline" in titles
+
+    # Opting in must surface the stale row again
+    all_rows = get_giveaways_display(include_expired=True)
+    titles_all = {r["title"] for r in all_rows}
+    assert "Stale Eligible" in titles_all
+
+
+def test_get_giveaways_display_keeps_relative_countdown(tmp_db):
+    """Relative countdown deadlines must not be treated as expired.
+
+    They can't be meaningfully re-evaluated without the capture timestamp,
+    so the display filter keeps them visible until re-enrichment converts
+    them to an absolute date.
+    """
+    from database import add_giveaway, get_giveaways_display
+
+    add_giveaway(
+        "Countdown", "https://gleam.io/cd1/test", "test",
+        deadline="11 days",
+    )
+    rows = get_giveaways_display()
+    assert any(r["title"] == "Countdown" for r in rows)
+
+
 # ---------------------------------------------------------------------------
 # update_giveaway_status  (Enter, Skip buttons)
 # ---------------------------------------------------------------------------

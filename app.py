@@ -1584,8 +1584,15 @@ def main():
             # In the "all" view, hide expired giveaways (they stay in the DB
             # to prevent re-import, but should not clutter the main view).
             # Users can still view them via the "expired" status filter.
-            if status_filter == "all":
+            # Belt-and-braces: also hide rows whose deadline has passed even
+            # if the DB cleanup hasn't run yet, and even if status is still
+            # 'eligible'/'new'.
+            if status_filter != "expired":
+                from database import _is_past_deadline
                 df = df[df["status"] != "expired"]
+                if not df.empty:
+                    past_mask = df["deadline"].apply(_is_past_deadline)
+                    df = df[~past_mask]
 
             # Optimistic removal: hide rows the user already clicked X on,
             # even if the cached query still contains them.
