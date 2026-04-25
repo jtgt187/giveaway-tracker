@@ -2,9 +2,21 @@
   // Don't collect links from local development pages (e.g. Streamlit dashboard)
   if (['localhost', '127.0.0.1', '[::1]'].includes(location.hostname)) return;
 
+  // Cap on dedup Set to prevent unbounded growth on long-lived SPA tabs
+  // (Gmail, Reddit infinite-scroll, Discord, etc.).
+  const SEEN_HREF_CAP = 5000;
   let seenHref = new Set();
   let pageCount = 0;
   let hidden = false;
+
+  function rememberHref(h) {
+    if (seenHref.size >= SEEN_HREF_CAP) {
+      // FIFO eviction: drop the oldest insertion (Set preserves insertion order)
+      const first = seenHref.values().next().value;
+      if (first !== undefined) seenHref.delete(first);
+    }
+    seenHref.add(h);
+  }
 
   // Only accept URLs actually hosted on gleam.io (not reddit.com/search?q=gleam.io etc.)
   function isGleamUrl(href) {
@@ -100,7 +112,7 @@
     // extractFromHTML() trusts a.href which can still carry an ellipsis when
     // Google renders truncated cite text as a link.
     if (isTruncatedUrl(normalized)) return;
-    seenHref.add(normalized);
+    rememberHref(normalized);
     pageCount++;
 
     // Update banner immediately with page-local count
@@ -318,11 +330,21 @@
   function initObserver() {
     let debounceTimer = null;
     let checkInterval = null;
-    const observer = new MutationObserver(() => {
-      // Debounce: wait 300ms after last mutation before scanning
-      // to avoid excessive scanning during rapid DOM updates
+    const observer = new MutationObserver((mutations) => {
+      // Only re-scan if mutations actually added DOM nodes (most mutations
+      // on heavy SPAs are attribute/character data changes that cannot
+      // introduce new gleam links).
+      let addedNodes = false;
+      for (let i = 0; i < mutations.length; i++) {
+        if (mutations[i].addedNodes && mutations[i].addedNodes.length > 0) {
+          addedNodes = true;
+          break;
+        }
+      }
+      if (!addedNodes) return;
+      // Debounce: 1s coalescing window (was 300ms — too aggressive on heavy SPAs)
       if (debounceTimer) clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(scanMutations, 300);
+      debounceTimer = setTimeout(scanMutations, 1000);
     });
 
     if (document.body) {
@@ -357,18 +379,42 @@
   // Track deferred rescans so they can be cancelled on pagehide
   const deferredRescans = [];
 
+  // Heuristic: this page is "interesting" enough to warrant a live
+  // MutationObserver + deferred rescans. We avoid both on totally
+  // unrelated pages to save CPU/battery.
+  function isInterestingPage() {
+    if (pageCount > 0) return true;
+    const host = location.hostname;
+    // Search engines & aggregators where gleam links commonly appear in
+    // dynamically-loaded results.
+    if (/^(?:www\.)?(?:google|bing|duckduckgo|yahoo|yandex|ecosia|brave)\./.test(host)) return true;
+    if (host.includes('reddit.com') || host.includes('twitter.com') || host.includes('x.com')) return true;
+    if (host.includes('discord.com') || host.includes('telegram.')) return true;
+    // Page text mentions gleam.io anywhere — observer might catch a future load
+    try {
+      if ((document.body && document.body.textContent || '').indexOf('gleam.io') !== -1) return true;
+    } catch (e) {}
+    return false;
+  }
+
+  function startBackgroundScans() {
+    // Skip observer + deferred rescans on uninteresting pages — saves
+    // CPU on the long tail of unrelated tabs that never contain gleam links.
+    if (!isInterestingPage()) return;
+    initObserver();
+    deferredRescans.push(setTimeout(scanMutations, 1000));
+    deferredRescans.push(setTimeout(scanMutations, 3000));
+    deferredRescans.push(setTimeout(scanMutations, 5000));
+  }
+
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {
       appendIndicator();
       extractFromHTML();
-      initObserver();
+      startBackgroundScans();
     });
   } else {
     extractFromHTML();
-    initObserver();
+    startBackgroundScans();
   }
-
-  deferredRescans.push(setTimeout(scanMutations, 1000));
-  deferredRescans.push(setTimeout(scanMutations, 3000));
-  deferredRescans.push(setTimeout(scanMutations, 5000));
 })();

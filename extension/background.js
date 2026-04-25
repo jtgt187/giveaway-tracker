@@ -118,13 +118,30 @@ function notifyQuotaTrim(trimmed) {
   } catch (e) {}
 }
 
+// Debounced persist: append() can fire many times per second when a
+// noisy tab dumps links via mutation observer. Coalescing into a single
+// storage.local.set within a 1s window cuts wasteful disk writes by
+// ~50-100x without risking data loss (we flush on important boundaries
+// like quota-recovery and on chrome.alarms tick).
+let _persistTimer = null;
+const PERSIST_DEBOUNCE_MS = 1000;
+
 function persist() {
+  if (_persistTimer) return; // a write is already scheduled
+  _persistTimer = setTimeout(() => {
+    _persistTimer = null;
+    _persistNow();
+  }, PERSIST_DEBOUNCE_MS);
+}
+
+function _persistNow() {
   chrome.storage.local.set({
     gleam_links: links,
     gleam_last_export: lastExportIndex,
     gleam_auto_threshold: autoExportThreshold,
     gleam_prefetch_deadlines: prefetchDeadlines,
-    gleam_entry_stats: entryStats
+    gleam_entry_stats: entryStats,
+    gleam_deadline_queue: deadlineQueue
   }, () => {
     if (chrome.runtime.lastError) {
       console.error('[GleamMonitor] Storage persist error:', chrome.runtime.lastError.message);
@@ -143,7 +160,8 @@ function persist() {
           gleam_last_export: lastExportIndex,
           gleam_auto_threshold: autoExportThreshold,
           gleam_prefetch_deadlines: prefetchDeadlines,
-          gleam_entry_stats: entryStats
+          gleam_entry_stats: entryStats,
+          gleam_deadline_queue: deadlineQueue
         });
       }
     }
@@ -173,7 +191,7 @@ setTimeout(() => {
 
 try {
   chrome.storage.local.get(
-    ['gleam_links', 'gleam_last_export', 'gleam_auto_threshold', 'gleam_prefetch_deadlines', 'gleam_entry_stats'],
+    ['gleam_links', 'gleam_last_export', 'gleam_auto_threshold', 'gleam_prefetch_deadlines', 'gleam_entry_stats', 'gleam_deadline_queue'],
     (result) => {
       try {
         if (chrome.runtime.lastError) {
@@ -184,6 +202,15 @@ try {
         if (result && typeof result.gleam_auto_threshold === 'number') autoExportThreshold = result.gleam_auto_threshold;
         if (result && typeof result.gleam_prefetch_deadlines === 'boolean') prefetchDeadlines = result.gleam_prefetch_deadlines;
         if (result && result.gleam_entry_stats) entryStats = result.gleam_entry_stats;
+        if (result && Array.isArray(result.gleam_deadline_queue)) {
+          // Restore queue and re-cap in case it grew before a stale write
+          deadlineQueue = result.gleam_deadline_queue.slice(0, MAX_DEADLINE_QUEUE_LEN);
+          // Resume prefetching if there's pending work and the feature is on
+          if (prefetchDeadlines && deadlineQueue.length > 0) {
+            // Defer slightly so checkLocalApi can probe first
+            setTimeout(processDeadlineQueue, 2000);
+          }
+        }
         rebuildHrefIndex();
         updateBadge();
         // Ping the local API to check availability
@@ -208,6 +235,11 @@ function checkLocalApi() {
   return fetch(LOCAL_API_URL + '/health', { method: 'GET' })
     .then(r => {
       localApiAvailable = r.ok;
+      if (r.ok) {
+        // Reset post-backoff state so queued writes resume immediately
+        _apiFailures = 0;
+        _apiBackoffUntil = 0;
+      }
       return localApiAvailable;
     })
     .catch(() => {
@@ -259,15 +291,49 @@ function syncMetaToLocalApi(href, title, deadline, ended) {
   }
 }
 
-/** Internal: POST JSON to a local API path. */
+/**
+ * Internal: POST JSON to a local API path.
+ *
+ * Failure handling: after 3 consecutive failures we suspend posts for
+ * an exponentially-growing backoff window (max 5 min). This prevents
+ * a 30-call-per-second flood when the local API is down — every
+ * append() / meta-update was previously triggering an immediate
+ * unconditional fetch even though `localApiAvailable` was false (the
+ * caller path through `checkLocalApi()` would also retry on every
+ * call). The chrome.alarms periodic checkLocalApi() will reset this
+ * once the API recovers.
+ */
+let _apiFailures = 0;
+let _apiBackoffUntil = 0;
+const MAX_API_BACKOFF_MS = 5 * 60 * 1000;
+
 function _postToApi(path, data) {
+  const now = Date.now();
+  if (now < _apiBackoffUntil) return; // suspended
   fetch(LOCAL_API_URL + path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(data),
+  }).then(r => {
+    if (r.ok) {
+      _apiFailures = 0;
+      _apiBackoffUntil = 0;
+    } else {
+      _registerApiFailure();
+    }
   }).catch(() => {
     localApiAvailable = false;
+    _registerApiFailure();
   });
+}
+
+function _registerApiFailure() {
+  _apiFailures++;
+  if (_apiFailures >= 3) {
+    // 3rd fail → 5s, 4th → 10s, 5th → 20s, ... cap 5 min
+    const delay = Math.min(MAX_API_BACKOFF_MS, 5000 * Math.pow(2, _apiFailures - 3));
+    _apiBackoffUntil = Date.now() + delay;
+  }
 }
 
 // -- Auto-export download (background-only, fire-and-forget) ---------
