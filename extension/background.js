@@ -250,13 +250,30 @@ function checkLocalApi() {
 
 // Re-check API availability every 30 seconds using chrome.alarms
 // (survives service worker sleep, unlike setInterval which dies).
-chrome.alarms.create('check-local-api', { periodInMinutes: 0.5 });
-
-chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === 'check-local-api') {
-    checkLocalApi();
+//
+// Defensive guard: chrome.alarms is undefined unless the "alarms"
+// permission is in the manifest. If a user has an older install where
+// the permission wasn't granted yet, accessing .create on undefined
+// would crash the entire service worker init. Fall back to a no-op
+// + warning so the rest of the extension still functions.
+if (chrome.alarms && typeof chrome.alarms.create === 'function') {
+  try {
+    chrome.alarms.create('check-local-api', { periodInMinutes: 0.5 });
+    chrome.alarms.onAlarm.addListener((alarm) => {
+      if (alarm.name === 'check-local-api') {
+        checkLocalApi();
+      }
+    });
+  } catch (e) {
+    console.warn('[GleamMonitor] chrome.alarms init failed:', e);
   }
-});
+} else {
+  console.warn(
+    '[GleamMonitor] chrome.alarms unavailable — local API health checks ' +
+    'will only run on service-worker wake. Reload the extension after ' +
+    'updating to pick up the "alarms" permission.'
+  );
+}
 
 /**
  * Push a new or updated link to the local database via the API.
