@@ -109,7 +109,7 @@
       return { success: true, alreadyFollowing: false, platform: 'twitch' };
     }
 
-    return { success: true, alreadyFollowing: false, platform: 'twitch', note: 'clicked but could not verify' };
+    return { success: false, attempted: true, platform: 'twitch', note: 'clicked but could not verify' };
 
   } catch (e) {
     return { success: false, error: e.message, platform: 'twitch' };

@@ -1,14 +1,15 @@
 {
   "manifest_version": 3,
   "name": "Gleam Link Monitor",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Collect Gleam.io links while browsing and auto-enter giveaways.",
   "permissions": [
     "storage",
     "downloads",
-    "tabs",
     "scripting",
-    "activeTab"
+    "activeTab",
+    "alarms",
+    "notifications"
   ],
   "host_permissions": [
     "<all_urls>"

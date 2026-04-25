@@ -17,13 +17,36 @@
     return false;
   }
 
+  /**
+   * Find the article element matching the current tweet URL (path).
+   * Avoids liking a reply that happens to render before the target tweet.
+   */
+  function getTargetArticle() {
+    var path = location.pathname; // e.g. /user/status/123
+    var articles = document.querySelectorAll('article');
+    for (var i = 0; i < articles.length; i++) {
+      var links = articles[i].querySelectorAll('a[href*="/status/"]');
+      for (var j = 0; j < links.length; j++) {
+        try {
+          var hrefPath = new URL(links[j].href).pathname;
+          if (hrefPath === path || hrefPath.startsWith(path + '/')) {
+            return articles[i];
+          }
+        } catch (e) {}
+      }
+    }
+    // Fallback: first article
+    return articles[0] || document.body;
+  }
+
   function isAlreadyLiked() {
+    var scope = getTargetArticle();
     // X uses data-testid="unlike" when the tweet is already liked
-    var unlikeBtn = document.querySelector('article [data-testid="unlike"]');
+    var unlikeBtn = scope.querySelector('[data-testid="unlike"]');
     if (unlikeBtn) return true;
 
     // Check aria-label
-    var buttons = document.querySelectorAll('article [role="button"]');
+    var buttons = scope.querySelectorAll('[role="button"]');
     for (var i = 0; i < buttons.length; i++) {
       var label = (buttons[i].getAttribute('aria-label') || '').toLowerCase();
       if (label.includes('unlike') || (label.includes('liked') && label.includes('@'))) return true;
@@ -48,12 +71,13 @@
     var start = Date.now();
 
     while (Date.now() - start < TIMEOUT) {
+      var scope = getTargetArticle();
       // Strategy 1: data-testid
-      likeBtn = document.querySelector('article [data-testid="like"]');
+      likeBtn = scope.querySelector('[data-testid="like"]');
       if (likeBtn) break;
 
       // Strategy 2: aria-label
-      var buttons = document.querySelectorAll('article [role="button"]');
+      var buttons = scope.querySelectorAll('[role="button"]');
       for (var i = 0; i < buttons.length; i++) {
         var label = (buttons[i].getAttribute('aria-label') || '').toLowerCase();
         if (label.includes('like') && !label.includes('unlike') && !label.includes('liked')) {
@@ -84,7 +108,7 @@
       return { success: true, alreadyDone: false, platform: 'x', action: 'like' };
     }
 
-    return { success: true, alreadyDone: false, platform: 'x', action: 'like', note: 'clicked but could not verify' };
+    return { success: false, attempted: true, platform: 'x', action: 'like', note: 'clicked but could not verify' };
 
   } catch (e) {
     return { success: false, error: e.message, platform: 'x', action: 'like' };

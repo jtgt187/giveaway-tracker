@@ -77,14 +77,37 @@
     return new Promise(r => setTimeout(r, ms));
   }
 
+  // Cap on log entries kept in DOM to prevent unbounded growth on long sessions
+  const MAX_LOG_ENTRIES = 100;
+
+  // Track active timers/intervals so they can be cleaned up on pagehide
+  const _activeIntervals = new Set();
+  const _activeTimeouts = new Set();
+  function _trackInterval(id) { _activeIntervals.add(id); return id; }
+  function _trackTimeout(id) { _activeTimeouts.add(id); return id; }
+  function _clearAllTimers() {
+    _activeIntervals.forEach(id => { try { clearInterval(id); } catch (e) {} });
+    _activeTimeouts.forEach(id => { try { clearTimeout(id); } catch (e) {} });
+    _activeIntervals.clear();
+    _activeTimeouts.clear();
+  }
+  window.addEventListener('pagehide', _clearAllTimers, { once: true });
+
   function log(msg, level) {
     const logEl = document.querySelector('.gae-log');
-    if (!logEl) return;
+    if (!logEl) {
+      console.log('[GleamAutoEntry]', msg);
+      return;
+    }
     logEl.classList.add('active');
     const entry = document.createElement('div');
     entry.className = 'gae-log-entry ' + (level || '');
     entry.textContent = '[' + new Date().toLocaleTimeString() + '] ' + msg;
     logEl.appendChild(entry);
+    // Trim oldest log entries to prevent unbounded DOM growth
+    while (logEl.childNodes.length > MAX_LOG_ENTRIES) {
+      logEl.removeChild(logEl.firstChild);
+    }
     logEl.scrollTop = logEl.scrollHeight;
     console.log('[GleamAutoEntry]', msg);
   }
@@ -104,15 +127,18 @@
 
         if (widget) {
           clearInterval(timer);
+          _activeIntervals.delete(timer);
           resolve(widget);
           return;
         }
 
         if (Date.now() - start > WIDGET_POLL_TIMEOUT) {
           clearInterval(timer);
+          _activeIntervals.delete(timer);
           resolve(null);
         }
       }, WIDGET_POLL_INTERVAL);
+      _trackInterval(timer);
     });
   }
 
@@ -1042,5 +1068,12 @@
     }
   }
 
-  init();
+  // Wrap init in a guard so an unexpected throw doesn't leave the user
+  // on a gleam page with no overlay and no diagnostic.
+  Promise.resolve()
+    .then(init)
+    .catch(function (err) {
+      console.error('[GleamAutoEntry] init failed:', err);
+      try { log('Init error: ' + (err && err.message), 'error'); } catch (e) {}
+    });
 })();

@@ -109,19 +109,20 @@
     var start = Date.now();
 
     while (Date.now() - start < TIMEOUT) {
-      // Strategy 1: Find button with follow text in the header/profile area (localized)
+      // Always restrict to the profile header / main area to avoid clicking
+      // the wrong account from "Suggested for you" sidebars.
       var header = document.querySelector('header') || document.querySelector('main');
-      if (header) {
-        followBtn = findButtonByText(FOLLOW_TEXTS, header);
-        if (followBtn) break;
+      if (!header) {
+        await sleep(POLL_INTERVAL);
+        continue;
       }
 
-      // Strategy 2: Search entire page for follow button (localized)
-      followBtn = findButtonByText(FOLLOW_TEXTS);
+      // Strategy 1: Find button with follow text in the header/profile area (localized)
+      followBtn = findButtonByText(FOLLOW_TEXTS, header);
       if (followBtn) break;
 
-      // Strategy 3: Try aria-label based search (localized)
-      var ariaButtons = document.querySelectorAll('button[aria-label], [role="button"][aria-label]');
+      // Strategy 2: aria-label based search, scoped to header
+      var ariaButtons = header.querySelectorAll('button[aria-label], [role="button"][aria-label]');
       for (var i = 0; i < ariaButtons.length; i++) {
         var ariaLabel = (ariaButtons[i].getAttribute('aria-label') || '').toLowerCase();
         // Check if aria-label starts with any localized follow text
@@ -169,7 +170,9 @@
       return { success: true, alreadyFollowing: false, platform: 'instagram' };
     }
 
-    return { success: true, alreadyFollowing: false, platform: 'instagram', note: 'clicked but could not verify' };
+    // Click happened but follow state could not be confirmed — do NOT
+    // claim success; let the caller retry or count as failed.
+    return { success: false, attempted: true, platform: 'instagram', note: 'clicked but could not verify' };
 
   } catch (e) {
     return { success: false, error: e.message, platform: 'instagram' };

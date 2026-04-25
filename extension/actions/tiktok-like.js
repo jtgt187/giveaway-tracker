@@ -123,7 +123,7 @@
       return { success: true, alreadyDone: false, platform: 'tiktok', action: 'like' };
     }
 
-    return { success: true, alreadyDone: false, platform: 'tiktok', action: 'like', note: 'clicked but could not verify' };
+    return { success: false, attempted: true, platform: 'tiktok', action: 'like', note: 'clicked but could not verify' };
 
   } catch (e) {
     return { success: false, error: e.message, platform: 'tiktok', action: 'like' };

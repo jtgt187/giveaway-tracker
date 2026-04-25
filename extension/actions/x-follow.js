@@ -29,11 +29,21 @@
   }
 
   /**
-   * Find a visible button by text content.
+   * Get the primary content area (excludes "Who to follow" sidebar etc).
    */
-  function findButtonByText(text) {
+  function getPrimaryRoot() {
+    return document.querySelector('[data-testid="primaryColumn"]')
+        || document.querySelector('main')
+        || document.body;
+  }
+
+  /**
+   * Find a visible button by text content, scoped to a root element.
+   */
+  function findButtonByText(text, root) {
     var lower = text.toLowerCase();
-    var buttons = document.querySelectorAll('button, [role="button"]');
+    var scope = root || getPrimaryRoot();
+    var buttons = scope.querySelectorAll('button, [role="button"]');
     for (var i = 0; i < buttons.length; i++) {
       var spans = buttons[i].querySelectorAll('span');
       for (var j = 0; j < spans.length; j++) {
@@ -49,26 +59,27 @@
 
   // Check if we're already following this account
   function isAlreadyFollowing() {
-    // data-testid based detection (most reliable on X)
-    var unfollowBtn = document.querySelector('[data-testid$="-unfollow"]');
+    var scope = getPrimaryRoot();
+    // data-testid based detection (most reliable on X) — scoped
+    var unfollowBtn = scope.querySelector('[data-testid$="-unfollow"]');
     if (unfollowBtn) return true;
 
     // Check for "Following" button via data-testid in placement tracking area
-    var placementBtns = document.querySelectorAll('[data-testid="placementTracking"] [role="button"]');
+    var placementBtns = scope.querySelectorAll('[data-testid="placementTracking"] [role="button"]');
     for (var i = 0; i < placementBtns.length; i++) {
       var txt = (placementBtns[i].textContent || '').trim().toLowerCase();
       if (txt === 'following') return true;
     }
 
-    // Check aria-labels
-    var allBtns = document.querySelectorAll('[role="button"]');
+    // Check aria-labels — scoped
+    var allBtns = scope.querySelectorAll('[role="button"]');
     for (var j = 0; j < allBtns.length; j++) {
       var label = (allBtns[j].getAttribute('aria-label') || '').toLowerCase();
       if (label.includes('following') && !label.includes('followers') && !label.includes('not following')) return true;
     }
 
     // Text-based fallback
-    if (findButtonByText('following')) return true;
+    if (findButtonByText('following', scope)) return true;
 
     return false;
   }
@@ -92,9 +103,11 @@
     var start = Date.now();
 
     while (Date.now() - start < TIMEOUT) {
-      // Strategy 1: data-testid selectors (most reliable)
+      var scope = getPrimaryRoot();
+
+      // Strategy 1: data-testid selectors (most reliable) — scoped to primary column
       // Use :not to exclude unfollow buttons (since $="-follow" also matches $="-unfollow")
-      followBtn = document.querySelector('[data-testid$="-follow"]:not([data-testid$="-unfollow"])');
+      followBtn = scope.querySelector('[data-testid$="-follow"]:not([data-testid$="-unfollow"])');
       if (followBtn) {
         var btnText = (followBtn.textContent || '').trim().toLowerCase();
         if (btnText === 'following' || btnText === 'unfollow') {
@@ -104,7 +117,7 @@
       }
 
       // Strategy 2: Placement tracking area
-      var placementBtns = document.querySelectorAll('[data-testid="placementTracking"] [role="button"]');
+      var placementBtns = scope.querySelectorAll('[data-testid="placementTracking"] [role="button"]');
       for (var i = 0; i < placementBtns.length; i++) {
         var ptxt = (placementBtns[i].textContent || '').trim().toLowerCase();
         if (ptxt === 'follow') {
@@ -115,7 +128,7 @@
       if (followBtn) break;
 
       // Strategy 3: aria-label based (use starts-with ^= to avoid matching "Following @")
-      var ariaButtons = document.querySelectorAll('[role="button"][aria-label^="Follow @"]');
+      var ariaButtons = scope.querySelectorAll('[role="button"][aria-label^="Follow @"]');
       for (var ai = 0; ai < ariaButtons.length; ai++) {
         var ariaLabel = (ariaButtons[ai].getAttribute('aria-label') || '');
         // Exclude "Following @" which also starts with "Follow"
@@ -126,8 +139,8 @@
       }
       if (followBtn) break;
 
-      // Strategy 4: Text-based fallback
-      followBtn = findButtonByText('follow');
+      // Strategy 4: Text-based fallback (scoped to primary column)
+      followBtn = findButtonByText('follow', scope);
       if (followBtn) break;
 
       // Re-check following state
@@ -170,8 +183,8 @@
       return { success: true, alreadyFollowing: false, platform: 'x' };
     }
 
-    // Even if we can't verify, the click happened
-    return { success: true, alreadyFollowing: false, platform: 'x', note: 'clicked but could not verify' };
+    // Click happened but follow state could not be confirmed
+    return { success: false, attempted: true, platform: 'x', note: 'clicked but could not verify' };
 
   } catch (e) {
     return { success: false, error: e.message, platform: 'x' };

@@ -179,7 +179,7 @@
       return { success: true, alreadyFollowing: false, platform: 'tiktok' };
     }
 
-    return { success: true, alreadyFollowing: false, platform: 'tiktok', note: 'clicked but could not verify' };
+    return { success: false, attempted: true, platform: 'tiktok', note: 'clicked but could not verify' };
 
   } catch (e) {
     return { success: false, error: e.message, platform: 'tiktok' };

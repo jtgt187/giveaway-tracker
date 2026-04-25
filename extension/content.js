@@ -317,6 +317,7 @@
 
   function initObserver() {
     let debounceTimer = null;
+    let checkInterval = null;
     const observer = new MutationObserver(() => {
       // Debounce: wait 300ms after last mutation before scanning
       // to avoid excessive scanning during rapid DOM updates
@@ -328,26 +329,33 @@
       observer.observe(document.body, { childList: true, subtree: true });
     }
 
+    function cleanup() {
+      try { observer.disconnect(); } catch (e) {}
+      if (debounceTimer) { clearTimeout(debounceTimer); debounceTimer = null; }
+      if (checkInterval) { clearInterval(checkInterval); checkInterval = null; }
+      // Also clear the deferred rescan timers
+      deferredRescans.forEach(t => clearTimeout(t));
+      deferredRescans.length = 0;
+    }
+
     // Disconnect observer when page unloads to prevent leaks
-    window.addEventListener('pagehide', () => {
-      observer.disconnect();
-      if (debounceTimer) clearTimeout(debounceTimer);
-    });
+    window.addEventListener('pagehide', cleanup, { once: true });
 
     // Also disconnect if extension context is invalidated (extension updated/reloaded)
     if (chrome.runtime && chrome.runtime.id) {
-      const checkInterval = setInterval(() => {
+      checkInterval = setInterval(() => {
         try {
           // Accessing chrome.runtime.id throws if context is invalidated
           void chrome.runtime.id;
         } catch (e) {
-          observer.disconnect();
-          if (debounceTimer) clearTimeout(debounceTimer);
-          clearInterval(checkInterval);
+          cleanup();
         }
       }, 10000);
     }
   }
+
+  // Track deferred rescans so they can be cancelled on pagehide
+  const deferredRescans = [];
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {
@@ -360,7 +368,7 @@
     initObserver();
   }
 
-  setTimeout(scanMutations, 1000);
-  setTimeout(scanMutations, 3000);
-  setTimeout(scanMutations, 5000);
+  deferredRescans.push(setTimeout(scanMutations, 1000));
+  deferredRescans.push(setTimeout(scanMutations, 3000));
+  deferredRescans.push(setTimeout(scanMutations, 5000));
 })();

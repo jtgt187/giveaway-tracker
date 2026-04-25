@@ -284,7 +284,11 @@ function onPrefetchToggle() {
 // -- Update DB total from local API -----------------------------------
 
 function updateDbTotal() {
-  fetch('http://127.0.0.1:7778/api/stats')
+  // Abort if request takes longer than 2s — popup polls every 3s and a
+  // hung localhost call must not pile up.
+  var ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  var timer = ctl ? setTimeout(function() { try { ctl.abort(); } catch (e) {} }, 2000) : null;
+  fetch('http://127.0.0.1:7778/api/stats', ctl ? { signal: ctl.signal } : {})
     .then(function(r) { return r.json(); })
     .then(function(stats) {
       var el = document.getElementById('dbTotal');
@@ -292,10 +296,13 @@ function updateDbTotal() {
     })
     .catch(function() {
       document.getElementById('dbTotal').textContent = '';
-    });
+    })
+    .finally(function() { if (timer) clearTimeout(timer); });
 }
 
 // -- Init --------------------------------------------------------------
+
+let _pollInterval = null;
 
 document.addEventListener('DOMContentLoaded', function() {
   updateCount();
@@ -305,7 +312,7 @@ document.addEventListener('DOMContentLoaded', function() {
   loadSettings();
 
   // Poll for updates every 3 seconds while popup is open
-  setInterval(function() {
+  _pollInterval = setInterval(function() {
     updateCount();
     updateRecentLinks();
     updateEntryStats();
@@ -318,4 +325,10 @@ document.addEventListener('DOMContentLoaded', function() {
   document.getElementById('thresholdInput').addEventListener('change', onThresholdChange);
   document.getElementById('prefetchToggle').addEventListener('change', onPrefetchToggle);
   document.getElementById('resetStats').addEventListener('click', resetEntryStats);
+});
+
+// Clean up the polling interval when the popup closes — otherwise the
+// browser may keep waking the service worker every 3s for a moment.
+window.addEventListener('pagehide', function() {
+  if (_pollInterval) { clearInterval(_pollInterval); _pollInterval = null; }
 });

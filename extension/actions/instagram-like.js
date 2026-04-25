@@ -53,11 +53,13 @@
 
     // Check for filled heart SVG (liked state) - localized aria-label
     for (var j = 0; j < UNLIKE_TEXTS.length; j++) {
-      var svgs = document.querySelectorAll('article svg[aria-label="' + UNLIKE_TEXTS[j] + '"], section svg[aria-label="' + UNLIKE_TEXTS[j] + '"]');
+      var esc = (window.CSS && CSS.escape) ? CSS.escape(UNLIKE_TEXTS[j]) : UNLIKE_TEXTS[j].replace(/"/g, '\\"');
+      var svgs = document.querySelectorAll('article svg[aria-label="' + esc + '"], section svg[aria-label="' + esc + '"]');
       if (svgs.length > 0) return true;
       // Also try capitalized
       var cap = UNLIKE_TEXTS[j].charAt(0).toUpperCase() + UNLIKE_TEXTS[j].slice(1);
-      svgs = document.querySelectorAll('article svg[aria-label="' + cap + '"], section svg[aria-label="' + cap + '"]');
+      var capEsc = (window.CSS && CSS.escape) ? CSS.escape(cap) : cap.replace(/"/g, '\\"');
+      svgs = document.querySelectorAll('article svg[aria-label="' + capEsc + '"], section svg[aria-label="' + capEsc + '"]');
       if (svgs.length > 0) return true;
     }
 
@@ -96,8 +98,11 @@
 
       // Strategy 2: SVG with localized aria-label "Like"
       for (var li = 0; li < LIKE_TEXTS.length; li++) {
-        var svgLike = document.querySelector('svg[aria-label="' + LIKE_TEXTS[li] + '"]') ||
-                      document.querySelector('svg[aria-label="' + LIKE_TEXTS[li].charAt(0).toUpperCase() + LIKE_TEXTS[li].slice(1) + '"]');
+        var likeEsc = (window.CSS && CSS.escape) ? CSS.escape(LIKE_TEXTS[li]) : LIKE_TEXTS[li].replace(/"/g, '\\"');
+        var likeCap = LIKE_TEXTS[li].charAt(0).toUpperCase() + LIKE_TEXTS[li].slice(1);
+        var likeCapEsc = (window.CSS && CSS.escape) ? CSS.escape(likeCap) : likeCap.replace(/"/g, '\\"');
+        var svgLike = document.querySelector('svg[aria-label="' + likeEsc + '"]') ||
+                      document.querySelector('svg[aria-label="' + likeCapEsc + '"]');
         if (svgLike) {
           var parent = svgLike.closest('button') || svgLike.closest('[role="button"]');
           if (parent) {
@@ -112,8 +117,11 @@
       var articleBtns = document.querySelectorAll('article section button, article button');
       for (var j = 0; j < articleBtns.length; j++) {
         for (var lj = 0; lj < LIKE_TEXTS.length; lj++) {
-          var svg = articleBtns[j].querySelector('svg[aria-label="' + LIKE_TEXTS[lj] + '"]') ||
-                    articleBtns[j].querySelector('svg[aria-label="' + LIKE_TEXTS[lj].charAt(0).toUpperCase() + LIKE_TEXTS[lj].slice(1) + '"]');
+          var lEsc = (window.CSS && CSS.escape) ? CSS.escape(LIKE_TEXTS[lj]) : LIKE_TEXTS[lj].replace(/"/g, '\\"');
+          var lCap = LIKE_TEXTS[lj].charAt(0).toUpperCase() + LIKE_TEXTS[lj].slice(1);
+          var lCapEsc = (window.CSS && CSS.escape) ? CSS.escape(lCap) : lCap.replace(/"/g, '\\"');
+          var svg = articleBtns[j].querySelector('svg[aria-label="' + lEsc + '"]') ||
+                    articleBtns[j].querySelector('svg[aria-label="' + lCapEsc + '"]');
           if (svg) {
             likeBtn = articleBtns[j];
             break;
@@ -144,7 +152,7 @@
       return { success: true, alreadyDone: false, platform: 'instagram', action: 'like' };
     }
 
-    return { success: true, alreadyDone: false, platform: 'instagram', action: 'like', note: 'clicked but could not verify' };
+    return { success: false, attempted: true, platform: 'instagram', action: 'like', note: 'clicked but could not verify' };
 
   } catch (e) {
     return { success: false, error: e.message, platform: 'instagram', action: 'like' };

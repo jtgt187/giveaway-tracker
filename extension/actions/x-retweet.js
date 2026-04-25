@@ -17,19 +17,53 @@
     return false;
   }
 
+  function getTargetArticle() {
+    var path = location.pathname; // e.g. /user/status/123
+    var articles = document.querySelectorAll('article');
+    for (var i = 0; i < articles.length; i++) {
+      var links = articles[i].querySelectorAll('a[href*="/status/"]');
+      for (var j = 0; j < links.length; j++) {
+        try {
+          var hrefPath = new URL(links[j].href).pathname;
+          if (hrefPath === path || hrefPath.startsWith(path + '/')) {
+            return articles[i];
+          }
+        } catch (e) {}
+      }
+    }
+    return articles[0] || document.body;
+  }
+
   function isAlreadyReposted() {
+    var scope = getTargetArticle();
     // X shows a green retweet icon / "Undo repost" when already reposted
-    var retweetBtn = document.querySelector('article [data-testid="unretweet"]');
+    var retweetBtn = scope.querySelector('[data-testid="unretweet"]');
     if (retweetBtn) return true;
 
     // Check aria-label
-    var buttons = document.querySelectorAll('article [role="button"]');
+    var buttons = scope.querySelectorAll('[role="button"]');
     for (var i = 0; i < buttons.length; i++) {
       var label = (buttons[i].getAttribute('aria-label') || '').toLowerCase();
       if (label.includes('undo repost') || label.includes('unretweet')) return true;
     }
 
     return false;
+  }
+
+  /**
+   * Wait for an element matching `selector` to appear, up to `timeout` ms.
+   */
+  async function waitForSelector(selector, timeout) {
+    var deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      var el = document.querySelector(selector);
+      if (el) {
+        var rect = el.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) return el;
+      }
+      await sleep(150);
+    }
+    return null;
   }
 
   try {
@@ -48,12 +82,13 @@
     var start = Date.now();
 
     while (Date.now() - start < TIMEOUT) {
+      var scope = getTargetArticle();
       // Strategy 1: data-testid
-      retweetBtn = document.querySelector('article [data-testid="retweet"]');
+      retweetBtn = scope.querySelector('[data-testid="retweet"]');
       if (retweetBtn) break;
 
       // Strategy 2: aria-label
-      var buttons = document.querySelectorAll('article [role="button"]');
+      var buttons = scope.querySelectorAll('[role="button"]');
       for (var i = 0; i < buttons.length; i++) {
         var label = (buttons[i].getAttribute('aria-label') || '').toLowerCase();
         if ((label.includes('repost') || label.includes('retweet')) && !label.includes('undo') && !label.includes('un-')) {
@@ -79,35 +114,27 @@
 
     // Click the repost button (opens a menu)
     retweetBtn.click();
-    await sleep(1500);
 
-    // Click "Repost" in the dropdown menu or confirmation sheet
-    var menuItems = document.querySelectorAll('[role="menuitem"], [data-testid="retweetConfirm"], [data-testid="confirmationSheetConfirm"]');
-    var repostMenuItem = null;
-    for (var j = 0; j < menuItems.length; j++) {
-      var txt = (menuItems[j].textContent || '').trim().toLowerCase();
-      if (txt === 'repost' || txt === 'retweet' || txt.startsWith('repost') || txt.startsWith('retweet')) {
-        repostMenuItem = menuItems[j];
-        break;
-      }
-    }
-
-    if (repostMenuItem) {
-      repostMenuItem.click();
+    // Prefer the dedicated confirm-action testid over text matching, which
+    // would otherwise also match "Repost with comment" (Quote Tweet).
+    var confirmEl = await waitForSelector('[data-testid="retweetConfirm"], [data-testid="confirmationSheetConfirm"]', 2500);
+    if (confirmEl) {
+      confirmEl.click();
       await sleep(2000);
     } else {
-      // Check for confirmation sheet as a separate step (sometimes appears after a delay)
-      await sleep(500);
-      var confirmBtn = document.querySelector('[data-testid="confirmationSheetConfirm"]');
-      if (confirmBtn) {
-        var confirmRect = confirmBtn.getBoundingClientRect();
-        if (confirmRect.width > 0 && confirmRect.height > 0) {
-          confirmBtn.click();
-          await sleep(2000);
+      // Strict text-match fallback (NEVER match "Repost with comment")
+      var menuItems = document.querySelectorAll('[role="menuitem"]');
+      var repostMenuItem = null;
+      for (var j = 0; j < menuItems.length; j++) {
+        var txt = (menuItems[j].textContent || '').trim().toLowerCase();
+        if (txt === 'repost' || txt === 'retweet') {
+          repostMenuItem = menuItems[j];
+          break;
         }
-      } else {
-        // Menu might not have appeared; the button click alone might have toggled repost
-        await sleep(1000);
+      }
+      if (repostMenuItem) {
+        repostMenuItem.click();
+        await sleep(2000);
       }
     }
 
@@ -115,7 +142,7 @@
       return { success: true, alreadyDone: false, platform: 'x', action: 'retweet' };
     }
 
-    return { success: true, alreadyDone: false, platform: 'x', action: 'retweet', note: 'clicked but could not verify' };
+    return { success: false, attempted: true, platform: 'x', action: 'retweet', note: 'clicked but could not verify' };
 
   } catch (e) {
     return { success: false, error: e.message, platform: 'x', action: 'retweet' };

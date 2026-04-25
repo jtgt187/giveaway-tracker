@@ -119,7 +119,7 @@
       return { success: true, alreadyFollowing: false, platform: 'youtube' };
     }
 
-    return { success: true, alreadyFollowing: false, platform: 'youtube', note: 'clicked but could not verify' };
+    return { success: false, attempted: true, platform: 'youtube', note: 'clicked but could not verify' };
 
   } catch (e) {
     return { success: false, error: e.message, platform: 'youtube' };

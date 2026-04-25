@@ -3,6 +3,55 @@ let lastExportIndex = 0;       // tracks how many links have been exported
 let autoExportThreshold = 0;   // 0 = disabled
 let prefetchDeadlines = true;  // auto-fetch deadlines in background tabs
 
+// O(1) dedup for `append` — kept in sync with `links` array
+let hrefIndex = new Set();
+
+// Hard caps to prevent storage quota exhaustion / attacker-driven data loss
+const MAX_LINKS                  = 5000;   // hard cap on stored links
+const MAX_TITLE_LEN              = 200;
+const MAX_HREF_LEN               = 500;
+const MAX_DEADLINE_LEN           = 100;
+const MAX_DEADLINE_QUEUE_LEN     = 50;
+
+// Allow-listed hostnames for `performSocialActionInTab` per platform.
+// Prevents an attacker-controlled message from injecting an action script
+// into an arbitrary URL (the action scripts call `.click()` on text-matched
+// buttons, which is dangerous on attacker DOM).
+const PLATFORM_HOST_ALLOWLIST = {
+  twitter:   ['x.com', 'twitter.com', 'mobile.twitter.com'],
+  instagram: ['instagram.com', 'www.instagram.com'],
+  tiktok:    ['tiktok.com', 'www.tiktok.com', 'm.tiktok.com'],
+  twitch:    ['twitch.tv', 'www.twitch.tv', 'm.twitch.tv'],
+  youtube:   ['youtube.com', 'www.youtube.com', 'm.youtube.com', 'youtu.be'],
+};
+
+// Shared giveaway-path regex (also inlined in content.js and gleam-entry.js;
+// keep in sync — see "GLEAM_GIVEAWAY_PATH" comment marker).
+// GLEAM_GIVEAWAY_PATH:
+const GLEAM_GIVEAWAY_PATH_RE_A = /^\/(?:giveaways|competitions)\/[A-Za-z0-9]{4,8}$/;
+const GLEAM_GIVEAWAY_PATH_RE_B = /^\/[A-Za-z0-9]{4,8}\/[^/]+$/;
+
+function isGleamGiveawayUrl(href) {
+  try {
+    const u = new URL(href);
+    if (u.hostname !== 'gleam.io' && !u.hostname.endsWith('.gleam.io')) return false;
+    const path = u.pathname.replace(/\/+$/, '');
+    return GLEAM_GIVEAWAY_PATH_RE_A.test(path) || GLEAM_GIVEAWAY_PATH_RE_B.test(path);
+  } catch (e) {
+    return false;
+  }
+}
+
+function clampStr(v, max) {
+  if (typeof v !== 'string') return '';
+  return v.length > max ? v.substring(0, max) : v;
+}
+
+function rebuildHrefIndex() {
+  hrefIndex = new Set();
+  for (const l of links) hrefIndex.add(l.href);
+}
+
 // -- Auto-entry session stats ----------------------------------------
 let entryStats = {
   lastUrl: '',
@@ -56,6 +105,19 @@ const DEFAULT_RENDER_DELAY = 2000;
 
 // -- Persistence helpers ----------------------------------------------
 
+function notifyQuotaTrim(trimmed) {
+  try {
+    if (chrome.notifications && chrome.notifications.create) {
+      chrome.notifications.create('gleam-quota-' + Date.now(), {
+        type: 'basic',
+        iconUrl: chrome.runtime.getURL('icon.png'),
+        title: 'Gleam Monitor: storage full',
+        message: 'Trimmed ' + trimmed + ' oldest links to recover storage space. Consider exporting and clearing.'
+      }, () => { void chrome.runtime.lastError; });
+    }
+  } catch (e) {}
+}
+
 function persist() {
   chrome.storage.local.set({
     gleam_links: links,
@@ -66,12 +128,15 @@ function persist() {
   }, () => {
     if (chrome.runtime.lastError) {
       console.error('[GleamMonitor] Storage persist error:', chrome.runtime.lastError.message);
-      // If quota exceeded, try to trim old links to free space
+      // Last-resort recovery if quota exceeded despite the MAX_LINKS cap
+      // (e.g. titles bloated). Trim and notify the user (no silent data loss).
       if (chrome.runtime.lastError.message.includes('QUOTA')) {
         const trimCount = Math.floor(links.length * 0.1) || 10;
         console.warn('[GleamMonitor] Trimming', trimCount, 'oldest links to free storage');
         links.splice(0, trimCount);
+        rebuildHrefIndex();
         if (lastExportIndex > links.length) lastExportIndex = links.length;
+        notifyQuotaTrim(trimCount);
         // Retry once without the callback to avoid infinite loop
         chrome.storage.local.set({
           gleam_links: links,
@@ -99,20 +164,39 @@ function updateBadge() {
 let _resolveReady;
 const stateReady = new Promise(resolve => { _resolveReady = resolve; });
 
-chrome.storage.local.get(
-  ['gleam_links', 'gleam_last_export', 'gleam_auto_threshold', 'gleam_prefetch_deadlines', 'gleam_entry_stats'],
-  (result) => {
-    if (result.gleam_links) links = result.gleam_links;
-    if (typeof result.gleam_last_export === 'number') lastExportIndex = result.gleam_last_export;
-    if (typeof result.gleam_auto_threshold === 'number') autoExportThreshold = result.gleam_auto_threshold;
-    if (typeof result.gleam_prefetch_deadlines === 'boolean') prefetchDeadlines = result.gleam_prefetch_deadlines;
-    if (result.gleam_entry_stats) entryStats = result.gleam_entry_stats;
-    updateBadge();
-    // Ping the local API to check availability
-    checkLocalApi();
-    _resolveReady();
-  }
-);
+// Safety net: never let the message handler deadlock if the storage callback
+// never fires (e.g. browser shutdown / profile error). After 5s, resolve
+// anyway with whatever in-memory state we have (defaults).
+setTimeout(() => {
+  try { _resolveReady(); } catch (e) {}
+}, 5000);
+
+try {
+  chrome.storage.local.get(
+    ['gleam_links', 'gleam_last_export', 'gleam_auto_threshold', 'gleam_prefetch_deadlines', 'gleam_entry_stats'],
+    (result) => {
+      try {
+        if (chrome.runtime.lastError) {
+          console.error('[GleamMonitor] Storage restore error:', chrome.runtime.lastError.message);
+        }
+        if (result && result.gleam_links) links = result.gleam_links;
+        if (result && typeof result.gleam_last_export === 'number') lastExportIndex = result.gleam_last_export;
+        if (result && typeof result.gleam_auto_threshold === 'number') autoExportThreshold = result.gleam_auto_threshold;
+        if (result && typeof result.gleam_prefetch_deadlines === 'boolean') prefetchDeadlines = result.gleam_prefetch_deadlines;
+        if (result && result.gleam_entry_stats) entryStats = result.gleam_entry_stats;
+        rebuildHrefIndex();
+        updateBadge();
+        // Ping the local API to check availability
+        checkLocalApi();
+      } finally {
+        _resolveReady();
+      }
+    }
+  );
+} catch (e) {
+  console.error('[GleamMonitor] Storage get threw:', e);
+  _resolveReady();
+}
 
 // -- Local API sync ---------------------------------------------------
 
@@ -244,6 +328,8 @@ function queueDeadlinePrefetch(href) {
   if (entry && entry.deadline) return;
   // Don't queue duplicates
   if (deadlineQueue.includes(href)) return;
+  // Cap queue to prevent unbounded background-tab work
+  if (deadlineQueue.length >= MAX_DEADLINE_QUEUE_LEN) return;
   deadlineQueue.push(href);
   processDeadlineQueue();
 }
@@ -318,6 +404,29 @@ async function performSocialActionInTab(platform, targetUrl, actionType) {
     return { success: false, error: 'Unknown platform: ' + platform };
   }
 
+  // Allow-list the targetUrl hostname against the requested platform.
+  // Without this, an attacker-controlled message could load attacker.com
+  // and have the action script click random buttons there.
+  const allowedHosts = PLATFORM_HOST_ALLOWLIST[platform];
+  if (!allowedHosts) {
+    return { success: false, error: 'No allow-list for platform: ' + platform };
+  }
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(targetUrl);
+  } catch (e) {
+    return { success: false, error: 'Invalid targetUrl' };
+  }
+  if (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') {
+    return { success: false, error: 'Disallowed protocol: ' + parsedUrl.protocol };
+  }
+  const host = parsedUrl.hostname.toLowerCase();
+  const hostAllowed = allowedHosts.some(h => host === h || host.endsWith('.' + h));
+  if (!hostAllowed) {
+    console.warn('[GleamMonitor] Rejected social action for', platform, '→', host, '(not in allow-list)');
+    return { success: false, error: 'Host not allowed for platform: ' + host };
+  }
+
   let tabId = null;
 
   try {
@@ -382,6 +491,16 @@ async function performSocialActionInTab(platform, targetUrl, actionType) {
 async function performVisitAction(targetUrl) {
   let tabId = null;
 
+  // Defense in depth: only allow http(s)
+  try {
+    const u = new URL(targetUrl);
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') {
+      return { success: false, error: 'Disallowed protocol: ' + u.protocol };
+    }
+  } catch (e) {
+    return { success: false, error: 'Invalid URL' };
+  }
+
   try {
     const tab = await chrome.tabs.create({
       url: targetUrl,
@@ -407,7 +526,7 @@ async function performVisitAction(targetUrl) {
 }
 
 /**
- * Wait for a tab to finish loading.
+ * Wait for a tab to finish loading. Rejects on timeout or tab-gone.
  */
 function waitForTabLoad(tabId, timeout) {
   return new Promise((resolve, reject) => {
@@ -415,17 +534,17 @@ function waitForTabLoad(tabId, timeout) {
 
     function check() {
       if (Date.now() - start > timeout) {
-        resolve(); // Resolve anyway on timeout, let the script try
+        reject(new Error('tab_load_timeout'));
         return;
       }
 
       chrome.tabs.get(tabId, (tab) => {
         if (chrome.runtime.lastError) {
-          reject(new Error('Tab not found'));
+          reject(new Error('Tab not found: ' + chrome.runtime.lastError.message));
           return;
         }
 
-        if (tab.status === 'complete') {
+        if (tab && tab.status === 'complete') {
           resolve();
         } else {
           setTimeout(check, 500);
@@ -445,10 +564,64 @@ function sleep(ms) {
 // All handlers await stateReady so the popup never sees empty data
 // when the service worker is freshly woken.
 
+// Messages that any web page (via content.js on <all_urls>) is allowed
+// to send. Everything else requires either the popup (no sender.tab) or
+// a sender on gleam.io (where gleam-entry.js runs).
+const PUBLIC_MESSAGE_TYPES = new Set([
+  'append',          // content.js found a gleam URL
+  'get-count',       // benign read
+]);
+
+// Messages that only gleam.io content scripts may send.
+const GLEAM_ONLY_MESSAGE_TYPES = new Set([
+  'update-giveaway-meta',
+  'perform-social-action',
+  'perform-visit-action',
+]);
+
+function isAllowedSender(msg, sender) {
+  // All extension contexts must come from this extension
+  if (sender && sender.id && sender.id !== chrome.runtime.id) return false;
+
+  const type = msg && msg.type;
+  if (!type) return false;
+
+  // Public — accepted from any tab
+  if (PUBLIC_MESSAGE_TYPES.has(type)) return true;
+
+  // Popup / extension-page contexts have no sender.tab
+  const fromExtensionPage = !sender || !sender.tab;
+  if (fromExtensionPage) return true;
+
+  // Gleam-only — must originate from a gleam.io tab
+  if (GLEAM_ONLY_MESSAGE_TYPES.has(type)) {
+    try {
+      const u = new URL(sender.url || sender.tab.url || '');
+      return u.hostname === 'gleam.io' || u.hostname.endsWith('.gleam.io');
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // Everything else (settings, clear, stats…) — popup only
+  return false;
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
-  // Wrap handler in stateReady to fix the "click twice" popup bug
-  stateReady.then(() => handleMessage(msg, sender, sendResponse));
+  if (!isAllowedSender(msg, sender)) {
+    try { sendResponse({ error: 'forbidden' }); } catch (e) {}
+    return false;
+  }
+
+  // Wrap handler in stateReady to fix the "click twice" popup bug,
+  // and ensure no rejection ever leaves the channel hanging.
+  stateReady
+    .then(() => handleMessage(msg, sender, sendResponse))
+    .catch(err => {
+      console.error('[GleamMonitor] handleMessage error:', err);
+      try { sendResponse({ error: (err && err.message) || 'handler_error' }); } catch (e) {}
+    });
   return true; // Keep channel open for async response
 });
 
@@ -456,6 +629,11 @@ function handleMessage(msg, sender, sendResponse) {
 
   // -- Append a newly found link --
   if (msg.type === 'append') {
+    // Defensive type/length checks (msg may come from any web page)
+    if (typeof msg.href !== 'string' || msg.href.length === 0 || msg.href.length > MAX_HREF_LEN) {
+      sendResponse({ count: links.length });
+      return;
+    }
     // Only store actual gleam.io URLs (defense-in-depth)
     try {
       const u = new URL(msg.href);
@@ -466,8 +644,8 @@ function handleMessage(msg, sender, sendResponse) {
       // Only store giveaway/competition URLs, not FAQ/about/docs etc.
       const path = u.pathname.replace(/\/+$/, '');
       const isGiveaway =
-        /^\/(?:giveaways|competitions)\/[A-Za-z0-9]{4,8}$/.test(path) ||
-        /^\/[A-Za-z0-9]{4,8}\/[^/]+$/.test(path);
+        GLEAM_GIVEAWAY_PATH_RE_A.test(path) ||
+        GLEAM_GIVEAWAY_PATH_RE_B.test(path);
       if (!isGiveaway) {
         sendResponse({ count: links.length });
         return;
@@ -482,14 +660,20 @@ function handleMessage(msg, sender, sendResponse) {
       return;
     }
 
-    const exists = links.some(l => l.href === msg.href);
-    if (!exists) {
+    if (!hrefIndex.has(msg.href)) {
       const entry = {
         href: msg.href,
-        text: msg.text || '',
+        text: clampStr(msg.text, MAX_TITLE_LEN),
         t: new Date().toISOString()
       };
       links.push(entry);
+      hrefIndex.add(entry.href);
+      // Hard cap to prevent attacker-driven storage exhaustion
+      while (links.length > MAX_LINKS) {
+        const dropped = links.shift();
+        if (dropped) hrefIndex.delete(dropped.href);
+        if (lastExportIndex > 0) lastExportIndex--;
+      }
       persist();
       updateBadge();
       checkAutoExport();
@@ -504,6 +688,11 @@ function handleMessage(msg, sender, sendResponse) {
 
   // -- Update giveaway metadata (title + deadline) from gleam-entry.js --
   if (msg.type === 'update-giveaway-meta') {
+    if (typeof msg.href !== 'string' || msg.href.length > MAX_HREF_LEN) {
+      sendResponse({ ok: false, error: 'invalid_url' });
+      return;
+    }
+
     // Validate the URL before processing
     let isValidGleamUrl = false;
     try {
@@ -518,31 +707,33 @@ function handleMessage(msg, sender, sendResponse) {
       return;
     }
 
+    // Sanitize and clamp untrusted fields
+    const title    = clampStr(msg.title, MAX_TITLE_LEN);
+    const deadline = clampStr(msg.deadline, MAX_DEADLINE_LEN);
+    const ended    = !!msg.ended;
+
     const idx = links.findIndex(l => l.href === msg.href);
     if (idx !== -1) {
-      if (msg.deadline) links[idx].deadline = msg.deadline;
-      if (msg.title && msg.title.length > 3) links[idx].text = msg.title;
+      if (deadline) links[idx].deadline = deadline;
+      if (title && title.length > 3) links[idx].text = title;
       persist();
     } else {
       // The link might not have been collected yet (e.g. user navigated directly).
       // Validate it's a giveaway path before storing.
-      let isGiveawayPath = false;
-      try {
-        const u = new URL(msg.href);
-        const path = u.pathname.replace(/\/+$/, '');
-        isGiveawayPath =
-          /^\/(?:giveaways|competitions)\/[A-Za-z0-9]{4,8}$/.test(path) ||
-          /^\/[A-Za-z0-9]{4,8}\/[^/]+$/.test(path);
-      } catch (e) {}
-
-      if (isGiveawayPath) {
+      if (isGleamGiveawayUrl(msg.href)) {
         const entry = {
           href: msg.href,
-          text: msg.title || '',
-          deadline: msg.deadline || '',
+          text: title,
+          deadline: deadline,
           t: new Date().toISOString()
         };
         links.push(entry);
+        hrefIndex.add(entry.href);
+        while (links.length > MAX_LINKS) {
+          const dropped = links.shift();
+          if (dropped) hrefIndex.delete(dropped.href);
+          if (lastExportIndex > 0) lastExportIndex--;
+        }
         persist();
         updateBadge();
         checkAutoExport();
@@ -550,7 +741,7 @@ function handleMessage(msg, sender, sendResponse) {
       }
     }
     // Always sync the metadata update to the local DB
-    syncMetaToLocalApi(msg.href, msg.title || '', msg.deadline || '', msg.ended || false);
+    syncMetaToLocalApi(msg.href, title, deadline, ended);
     sendResponse({ ok: true });
     return;
   }
@@ -591,6 +782,7 @@ function handleMessage(msg, sender, sendResponse) {
   // -- Clear everything --
   if (msg.type === 'clear') {
     links = [];
+    hrefIndex = new Set();
     lastExportIndex = 0;
     persist();
     updateBadge();
@@ -669,5 +861,5 @@ function handleMessage(msg, sender, sendResponse) {
     return;
   }
 
-  sendResponse(null);
+  sendResponse({ error: 'unknown_message_type', type: msg && msg.type });
 }
