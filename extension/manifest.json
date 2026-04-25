@@ -3,6 +3,7 @@
   "name": "Gleam Link Monitor",
   "version": "0.9.0",
   "description": "Collect Gleam.io links while browsing and auto-enter giveaways.",
+  "minimum_chrome_version": "116",
   "permissions": [
     "storage",
     "downloads",

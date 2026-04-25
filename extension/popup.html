@@ -1,5 +1,5 @@
 <!doctype html>
-<html>
+<html lang="en">
   <head>
     <meta charset="utf-8" />
     <title>Gleam Monitor</title>
@@ -85,8 +85,13 @@
       .entry-stats .reset-link {
         font-size: 10px; color: #555; cursor: pointer; text-align: right;
         margin-top: 4px;
+        background: none; border: none; padding: 0; display: block;
+        margin-left: auto; font-family: inherit;
       }
       .entry-stats .reset-link:hover { color: #ef4444; }
+      .entry-stats .reset-link:focus-visible {
+        outline: 1px solid #7c3aed; outline-offset: 2px; border-radius: 2px;
+      }
 
       /* ── Recent links ── */
       .recent { margin-top: 12px; border-top: 1px solid #2a2a4a; padding-top: 10px; }
@@ -139,11 +144,11 @@
     <h3>Gleam Link Monitor</h3>
 
     <div class="counter">
-      <div class="number" id="count">0</div>
+      <div class="number" id="count" aria-label="Entries collected" aria-live="polite">0</div>
       <div class="label">entries collected</div>
-      <div class="sub" id="unexported"></div>
-      <div class="sync-status" id="syncStatus"></div>
-      <div class="db-total" id="dbTotal"></div>
+      <div class="sub" id="unexported" aria-live="polite"></div>
+      <div class="sync-status" id="syncStatus" aria-live="polite"></div>
+      <div class="db-total" id="dbTotal" aria-live="polite"></div>
     </div>
 
     <div class="btn-row">
@@ -171,7 +176,7 @@
         </div>
       </div>
       <div class="last-entry" id="lastEntry"></div>
-      <div class="reset-link" id="resetStats">Reset stats</div>
+      <button type="button" class="reset-link" id="resetStats">Reset stats</button>
     </div>
 
     <div class="settings">
@@ -197,7 +202,7 @@
       </div>
     </div>
 
-    <div id="status"></div>
+    <div id="status" role="status" aria-live="polite"></div>
 
     <script src="popup.js"></script>
   </body>

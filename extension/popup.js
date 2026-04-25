@@ -1,6 +1,5 @@
 // -- State -------------------------------------------------------------
 
-let knownCount = 0;
 
 // -- UI helpers --------------------------------------------------------
 
@@ -46,7 +45,6 @@ function downloadNdjsonFile(entries) {
 function renderCount(state) {
   var count = state.count;
   var unexported = state.unexported;
-  knownCount = count;
 
   document.getElementById('count').textContent = count;
   document.getElementById('downloadBtn').disabled = count === 0;
@@ -153,7 +151,12 @@ function updateRecentLinks() { /* covered by refreshState */ }
 function updateEntryStats() { refreshState(); }
 
 function escapeHtml(str) {
-  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  return String(str == null ? '' : str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 // -- Export new links only ---------------------------------------------

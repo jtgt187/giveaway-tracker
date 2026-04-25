@@ -63,8 +63,11 @@
     },
   };
 
-  // Action types we can automate
-  const AUTOMATABLE_ACTIONS = ['follow', 'subscribe', 'visit', 'view', 'click', 'watch', 'retweet', 'like', 'share'];
+  // Action types we can automate (kept for reference / future feature
+  // gating). Not currently consumed at runtime — detectActionType()
+  // returns the matched string directly and the dispatcher trusts it.
+  // Leaving as a code-level allow-list documents what we expect to see.
+  // const AUTOMATABLE_ACTIONS = ['follow', 'subscribe', 'visit', 'view', 'click', 'watch', 'retweet', 'like', 'share'];
 
   // -- State ------------------------------------------------------------
   let entryMethods = [];
@@ -718,11 +721,20 @@
   }
 
   function escapeHtml(str) {
-    return str
+    // Defensive: stringify everything so a non-string title (e.g. number,
+    // null, undefined) doesn't throw on .replace.
+    return String(str == null ? '' : str)
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
       .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
+      .replace(/"/g, '&quot;')
+      // Apostrophe was previously left raw — when an attacker-controlled
+      // string lands inside a single-quoted attribute (or in a title=
+      // built via single-quote concat) it could break out. We have no
+      // such call site today, but escaping here closes the foot-gun for
+      // future edits to the inline-HTML render path.
+      .replace(/'/g, '&#39;')
+      .replace(/`/g, '&#96;');
   }
 
   // -- Entry Execution -------------------------------------------------
