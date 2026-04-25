@@ -26,10 +26,18 @@
     // YouTube shows "Subscribed" button when already subscribed
     const subBtn = document.querySelector('ytd-subscribe-button-renderer');
     if (subBtn) {
-      const subscribed = subBtn.getAttribute('subscribed');
-      if (subscribed !== null && subscribed !== 'false') return true;
+      // The Polymer property is the source of truth. The HTML attribute
+      // alone (which can be present-but-empty due to pre-render) is NOT
+      // reliable: `getAttribute('subscribed')` returns "" for `<…
+      // subscribed>`, and "" !== null && "" !== 'false' was being read
+      // as "subscribed", causing every channel page load to false-
+      // positive as already-subscribed.
+      if (subBtn.subscribed === true) return true;
+      // Only honor the attribute when it carries an explicit truthy value
+      const subscribedAttr = subBtn.getAttribute('subscribed');
+      if (subscribedAttr === 'true') return true;
 
-      // Check button text
+      // Check button text — must say literally "Subscribed"
       const btnText = (subBtn.textContent || '').trim().toLowerCase();
       if (btnText === 'subscribed') return true;
     }

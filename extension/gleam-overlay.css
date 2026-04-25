@@ -261,6 +261,11 @@
   color: #ccc;
 }
 
+#gleam-auto-entry-overlay .gae-btn-danger {
+  background: linear-gradient(135deg, #b91c1c, #ef4444);
+  color: #fff;
+}
+
 /* -- Minimized state -- */
 
 #gleam-auto-entry-overlay.minimized {

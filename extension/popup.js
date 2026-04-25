@@ -31,72 +31,126 @@ function downloadNdjsonFile(entries) {
 }
 
 // -- Update counter & unexported badge ---------------------------------
+//
+// Renderers are split into two layers:
+//   * `render*` functions accept already-fetched state and only touch the
+//     DOM. Cheap, synchronous, no IPC.
+//   * `update*` wrappers exist for callers that genuinely need a fresh
+//     read of just-one slice (e.g. after a write). They go through
+//     `refreshState()` so the wire format stays identical.
+//
+// The 3s poll uses `refreshState()` exactly once per tick — previously
+// the popup fired 4 separate `sendMessage` calls per tick, each waking
+// the service worker. The new flow cuts that to a single round-trip.
 
-function updateCount() {
-  chrome.runtime.sendMessage({ type: 'get-count' }, function(response) {
-    if (chrome.runtime.lastError || !response) return;
+function renderCount(state) {
+  var count = state.count;
+  var unexported = state.unexported;
+  knownCount = count;
 
-    var count = response.count;
-    var unexported = response.unexported;
-    knownCount = count;
+  document.getElementById('count').textContent = count;
+  document.getElementById('downloadBtn').disabled = count === 0;
+  document.getElementById('clearBtn').disabled = count === 0;
+  document.getElementById('exportNewBtn').disabled = unexported === 0;
 
-    document.getElementById('count').textContent = count;
-    document.getElementById('downloadBtn').disabled = count === 0;
-    document.getElementById('clearBtn').disabled = count === 0;
-    document.getElementById('exportNewBtn').disabled = unexported === 0;
+  if (unexported > 0) {
+    document.getElementById('unexported').textContent = unexported + ' new since last export';
+  } else if (count > 0) {
+    document.getElementById('unexported').textContent = 'all exported';
+  } else {
+    document.getElementById('unexported').textContent = '';
+  }
 
-    if (unexported > 0) {
-      document.getElementById('unexported').textContent = unexported + ' new since last export';
-    } else if (count > 0) {
-      document.getElementById('unexported').textContent = 'all exported';
+  // Update live DB sync indicator
+  var syncEl = document.getElementById('syncStatus');
+  if (state.apiConnected) {
+    syncEl.innerHTML = '<span class="sync-dot connected"></span><span style="color:#10b981">Live sync to DB</span>';
+  } else {
+    syncEl.innerHTML = '<span class="sync-dot disconnected"></span><span style="color:#666">DB offline</span>';
+  }
+}
+
+function renderRecentLinks(links) {
+  if (!links) return;
+  var list = document.getElementById('recentList');
+  var recent = links.slice(-5).reverse(); // last 5, newest first
+
+  if (recent.length === 0) {
+    list.innerHTML = '<div class="recent-empty">No links yet</div>';
+    return;
+  }
+
+  list.innerHTML = recent.map(function(l) {
+    var displayUrl = l.href.replace('https://', '').replace('http://', '');
+    var label = l.text || displayUrl;
+    // Sanitize URL: only allow http/https to prevent javascript: XSS
+    var safeHref = '';
+    try {
+      var urlObj = new URL(l.href);
+      if (urlObj.protocol === 'http:' || urlObj.protocol === 'https:') {
+        safeHref = l.href;
+      }
+    } catch (e) {}
+    if (!safeHref) return ''; // Skip invalid URLs
+    return '<div class="recent-item">' +
+      '<a href="' + escapeHtml(safeHref) + '" target="_blank" rel="noopener" title="' + escapeHtml(l.href) + '">' +
+        escapeHtml(label.substring(0, 60)) +
+      '</a>' +
+    '</div>';
+  }).join('');
+}
+
+function renderEntryStats(stats) {
+  if (!stats) return;
+  document.getElementById('statTotal').textContent = stats.total || 0;
+  document.getElementById('statCompleted').textContent = stats.completed || 0;
+  document.getElementById('statFailed').textContent = stats.failed || 0;
+
+  var lastEntryEl = document.getElementById('lastEntry');
+  if (stats.lastUrl && stats.lastTime) {
+    var safeUrl = '';
+    try {
+      var urlObj = new URL(stats.lastUrl);
+      if (urlObj.protocol === 'http:' || urlObj.protocol === 'https:') {
+        safeUrl = stats.lastUrl;
+      }
+    } catch (e) {}
+
+    var timeAgo = getTimeAgo(stats.lastTime);
+    var shortUrl = stats.lastUrl.replace('https://', '').replace('http://', '');
+    if (shortUrl.length > 40) shortUrl = shortUrl.substring(0, 40) + '...';
+    if (safeUrl) {
+      lastEntryEl.innerHTML = 'Last: <a href="' + escapeHtml(safeUrl) + '" target="_blank" rel="noopener">' +
+        escapeHtml(shortUrl) + '</a> (' + timeAgo + ')';
     } else {
-      document.getElementById('unexported').textContent = '';
+      lastEntryEl.textContent = 'Last: ' + shortUrl + ' (' + timeAgo + ')';
     }
+  } else {
+    lastEntryEl.textContent = 'No entries yet';
+  }
+}
 
-    // Update live DB sync indicator
-    var syncEl = document.getElementById('syncStatus');
-    if (response.apiConnected) {
-      syncEl.innerHTML = '<span class="sync-dot connected"></span><span style="color:#10b981">Live sync to DB</span>';
-    } else {
-      syncEl.innerHTML = '<span class="sync-dot disconnected"></span><span style="color:#666">DB offline</span>';
-    }
+function renderSettings(state) {
+  var ti = document.getElementById('thresholdInput');
+  if (ti && typeof state.autoExportThreshold === 'number') ti.value = state.autoExportThreshold || 0;
+  var pt = document.getElementById('prefetchToggle');
+  if (pt && typeof state.prefetchDeadlines === 'boolean') pt.checked = state.prefetchDeadlines !== false;
+}
+
+function refreshState(cb) {
+  chrome.runtime.sendMessage({ type: 'get-popup-state' }, function(response) {
+    if (chrome.runtime.lastError || !response) { if (cb) cb(null); return; }
+    renderCount(response);
+    renderRecentLinks(response.links);
+    renderEntryStats(response.entryStats);
+    if (cb) cb(response);
   });
 }
 
-// -- Render recent links -----------------------------------------------
-
-function updateRecentLinks() {
-  chrome.runtime.sendMessage({ type: 'get-links' }, function(response) {
-    if (chrome.runtime.lastError || !response || !response.links) return;
-
-    var list = document.getElementById('recentList');
-    var recent = response.links.slice(-5).reverse(); // last 5, newest first
-
-    if (recent.length === 0) {
-      list.innerHTML = '<div class="recent-empty">No links yet</div>';
-      return;
-    }
-
-    list.innerHTML = recent.map(function(l) {
-      var displayUrl = l.href.replace('https://', '').replace('http://', '');
-      var label = l.text || displayUrl;
-      // Sanitize URL: only allow http/https to prevent javascript: XSS
-      var safeHref = '';
-      try {
-        var urlObj = new URL(l.href);
-        if (urlObj.protocol === 'http:' || urlObj.protocol === 'https:') {
-          safeHref = l.href;
-        }
-      } catch (e) {}
-      if (!safeHref) return ''; // Skip invalid URLs
-      return '<div class="recent-item">' +
-        '<a href="' + escapeHtml(safeHref) + '" target="_blank" rel="noopener" title="' + escapeHtml(l.href) + '">' +
-          escapeHtml(label.substring(0, 60)) +
-        '</a>' +
-      '</div>';
-    }).join('');
-  });
-}
+// Back-compat one-slice shims (used by callers after a write)
+function updateCount() { refreshState(); }
+function updateRecentLinks() { /* covered by refreshState */ }
+function updateEntryStats() { refreshState(); }
 
 function escapeHtml(str) {
   return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -190,41 +244,7 @@ function clearLinks() {
 }
 
 // -- Auto-entry stats -------------------------------------------------
-
-function updateEntryStats() {
-  chrome.runtime.sendMessage({ type: 'get-entry-stats' }, function(response) {
-    if (chrome.runtime.lastError || !response || !response.entryStats) return;
-
-    var stats = response.entryStats;
-    document.getElementById('statTotal').textContent = stats.total || 0;
-    document.getElementById('statCompleted').textContent = stats.completed || 0;
-    document.getElementById('statFailed').textContent = stats.failed || 0;
-
-    var lastEntryEl = document.getElementById('lastEntry');
-    if (stats.lastUrl && stats.lastTime) {
-      // Sanitize URL: only allow http/https protocols to prevent javascript: XSS
-      var safeUrl = '';
-      try {
-        var urlObj = new URL(stats.lastUrl);
-        if (urlObj.protocol === 'http:' || urlObj.protocol === 'https:') {
-          safeUrl = stats.lastUrl;
-        }
-      } catch (e) {}
-
-      var timeAgo = getTimeAgo(stats.lastTime);
-      var shortUrl = stats.lastUrl.replace('https://', '').replace('http://', '');
-      if (shortUrl.length > 40) shortUrl = shortUrl.substring(0, 40) + '...';
-      if (safeUrl) {
-        lastEntryEl.innerHTML = 'Last: <a href="' + escapeHtml(safeUrl) + '" target="_blank" rel="noopener">' +
-          escapeHtml(shortUrl) + '</a> (' + timeAgo + ')';
-      } else {
-        lastEntryEl.textContent = 'Last: ' + shortUrl + ' (' + timeAgo + ')';
-      }
-    } else {
-      lastEntryEl.textContent = 'No entries yet';
-    }
-  });
-}
+// (renderer above; kept here only for the legacy reset hook below)
 
 function getTimeAgo(isoString) {
   var diff = Date.now() - new Date(isoString).getTime();
@@ -243,23 +263,15 @@ function resetEntryStats() {
     if (chrome.runtime.lastError) return;
     if (response && response.ok) {
       setStatus('Stats reset', 2000);
-      updateEntryStats();
+      refreshState();
     }
   });
 }
 
 // -- Auto-export threshold setting -------------------------------------
-
-function loadSettings() {
-  chrome.runtime.sendMessage({ type: 'get-settings' }, function(response) {
-    if (chrome.runtime.lastError || !response) return;
-    document.getElementById('thresholdInput').value = response.autoExportThreshold || 0;
-  });
-  chrome.runtime.sendMessage({ type: 'get-prefetch-setting' }, function(response) {
-    if (chrome.runtime.lastError || !response) return;
-    document.getElementById('prefetchToggle').checked = response.prefetchDeadlines !== false;
-  });
-}
+// loadSettings is now folded into refreshState() — kept as a no-op
+// alias for any legacy caller / future hook.
+function loadSettings() { /* handled by refreshState */ }
 
 function onThresholdChange() {
   var val = parseInt(document.getElementById('thresholdInput').value, 10) || 0;
@@ -305,17 +317,16 @@ function updateDbTotal() {
 let _pollInterval = null;
 
 document.addEventListener('DOMContentLoaded', function() {
-  updateCount();
-  updateRecentLinks();
-  updateEntryStats();
+  // First paint: one IPC for everything, then settings inputs.
+  refreshState(function(state) {
+    if (state) renderSettings(state);
+  });
   updateDbTotal();
-  loadSettings();
 
-  // Poll for updates every 3 seconds while popup is open
+  // Poll for updates every 3 seconds while popup is open.
+  // refreshState is a single sendMessage, vs. previously 4 per tick.
   _pollInterval = setInterval(function() {
-    updateCount();
-    updateRecentLinks();
-    updateEntryStats();
+    refreshState();
     updateDbTotal();
   }, 3000);
 

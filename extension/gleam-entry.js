@@ -69,6 +69,7 @@
   // -- State ------------------------------------------------------------
   let entryMethods = [];
   let isRunning = false;
+  let abortRequested = false;
   let overlay = null;
 
   // -- Utility ----------------------------------------------------------
@@ -201,62 +202,84 @@
   }
 
   function extractTargetUrl(element) {
-    // Look for links to social platforms inside the entry method
+    // Score each candidate href and return the best match. We previously
+    // returned the first href that matched any platform, which on entries
+    // like "Visit X and tweet about Y" would happily return a CDN avatar
+    // URL or a tracking redirect. Scoring prefers:
+    //   +3 if href matches a known platform domain
+    //   +2 if href appears in an <a> with non-trivial text (likely the CTA)
+    //   +1 if href is on an https:// URL (cosmetic / spam-bait filter)
+    //   -2 if href looks like an asset (svg/png/jpg/css/js) or analytics
     var links = element.querySelectorAll('a[href]');
+    var best = null;
+    var bestScore = -Infinity;
     for (var i = 0; i < links.length; i++) {
-      var href = links[i].href;
-      // Skip gleam.io internal links
-      if (href.indexOf('gleam.io') !== -1) continue;
-      // Skip javascript: links
+      var a = links[i];
+      var href = a.href;
+      if (!href || href.indexOf('gleam.io') !== -1) continue;
       if (href.indexOf('javascript:') === 0) continue;
-      // Check if it's a social platform URL
+      if (href.indexOf('mailto:') === 0) continue;
+
+      var score = 0;
+      var lowerHref = href.toLowerCase();
+      var matchedPlatform = false;
       for (var key in PLATFORM_PATTERNS) {
         var patterns = PLATFORM_PATTERNS[key].urlPatterns;
         for (var j = 0; j < patterns.length; j++) {
-          if (href.indexOf(patterns[j]) !== -1) return href;
+          if (lowerHref.indexOf(patterns[j]) !== -1) { matchedPlatform = true; break; }
         }
+        if (matchedPlatform) break;
       }
+      if (matchedPlatform) score += 3;
+
+      var aText = (a.textContent || '').trim();
+      if (aText.length > 2) score += 2;
+
+      if (lowerHref.indexOf('https://') === 0) score += 1;
+
+      if (/\.(?:svg|png|jpg|jpeg|gif|webp|css|js|ico)(?:[?#]|$)/.test(lowerHref)) score -= 2;
+      if (/(?:google-analytics|doubleclick|googletagmanager|adservice)/.test(lowerHref)) score -= 2;
+
+      if (score > bestScore) { bestScore = score; best = href; }
     }
+    if (best && bestScore > 0) return best;
 
     // Try ng-click or data attributes for the URL
     var ngClick = element.querySelector('[ng-click]');
     if (ngClick) {
       var clickAttr = ngClick.getAttribute('ng-click') || '';
-      // Try to extract URL from ng-click attribute
       var urlMatch = clickAttr.match(/https?:\/\/[^\s'"]+/);
       if (urlMatch) return urlMatch[0];
     }
 
-    // Try data attributes
     var dataUrl = element.getAttribute('data-url') || element.getAttribute('data-href');
     if (dataUrl) return dataUrl;
 
-    return null;
+    // Fall back to the first non-gleam link even if it scored 0
+    return best;
   }
 
   function isEntryCompleted(element) {
-    var classes = (element.className || '').toLowerCase();
-    if (classes.indexOf('completed') !== -1) return true;
-    if (classes.indexOf('entered') !== -1) return true;
-    if (classes.indexOf('done') !== -1) return true;
-
-    // Check for Angular ng-class indicating completion
-    var ngClass = element.getAttribute('ng-class') || '';
-    if (ngClass.indexOf('completed') !== -1 || ngClass.indexOf('entered') !== -1) {
-      // Check if the element actually has a completion class applied
-      if (element.classList.contains('completed') || element.classList.contains('entered')) {
-        return true;
-      }
+    // Strongest signal: Angular ng-class actually applied a completion class
+    if (element.classList.contains('completed')
+        || element.classList.contains('entered')
+        || element.classList.contains('done')
+        || element.classList.contains('em-action-success')) {
+      return true;
     }
 
-    // Check for checkmark icon indicating completion
+    // Visible green checkmark (Gleam swaps to fa-check on success).
+    // Don't trust the icon being present in the DOM — Gleam pre-renders
+    // hidden icons for animation. Require it to be visible.
     var checkIcons = element.querySelectorAll('.fa-check, .fa-check-circle, .icon-check');
-    if (checkIcons.length > 0) {
-      // Verify the check is visible
-      for (var i = 0; i < checkIcons.length; i++) {
-        var style = window.getComputedStyle(checkIcons[i]);
-        if (style.display !== 'none' && style.visibility !== 'hidden') return true;
-      }
+    for (var i = 0; i < checkIcons.length; i++) {
+      var icon = checkIcons[i];
+      var style = window.getComputedStyle(icon);
+      if (style.display === 'none' || style.visibility === 'hidden') continue;
+      // Must also have non-zero size — getComputedStyle returns "block"
+      // for elements with display set but offsetParent === null.
+      if (icon.offsetWidth === 0 && icon.offsetHeight === 0) continue;
+      return true;
     }
 
     return false;
@@ -290,14 +313,15 @@
       '.contest-entry',
     ];
 
-    var elements = [];
+    // Collect from all selectors and dedupe — Gleam often double-tags rows
+    // with both .entry-method and ng-repeat, so iterating selectors with
+    // "first match wins" silently drops valid rows on some templates.
+    var elementsSet = new Set();
     for (var s = 0; s < selectors.length; s++) {
       var found = document.querySelectorAll(selectors[s]);
-      if (found.length > 0) {
-        elements = found;
-        break;
-      }
+      for (var k = 0; k < found.length; k++) elementsSet.add(found[k]);
     }
+    var elements = Array.from(elementsSet);
 
     // Fallback: look for clickable entry items in the widget
     if (elements.length === 0) {
@@ -317,6 +341,18 @@
         }
       }
     }
+
+    // Filter out nested matches (one entry-method containing another)
+    // by skipping any element that is a descendant of another in the set.
+    var topLevel = [];
+    for (var a = 0; a < elements.length; a++) {
+      var isNested = false;
+      for (var b = 0; b < elements.length; b++) {
+        if (a !== b && elements[b].contains(elements[a])) { isNested = true; break; }
+      }
+      if (!isNested) topLevel.push(elements[a]);
+    }
+    elements = topLevel;
 
     for (var i = 0; i < elements.length; i++) {
       var el = elements[i];
@@ -365,8 +401,10 @@
 
   function isBadTitle(text) {
     var lower = text.toLowerCase();
+    // Substring match (was exact equality, which missed titles like
+    // "🎉 This giveaway has ended!" or "Sorry — competition ended.")
     for (var i = 0; i < BAD_TITLES.length; i++) {
-      if (lower === BAD_TITLES[i]) return true;
+      if (lower.indexOf(BAD_TITLES[i]) !== -1) return true;
     }
     return false;
   }
@@ -562,6 +600,7 @@
       '<div class="gae-log" id="gae-log"></div>' +
       '<div class="gae-footer">' +
       '  <button class="gae-btn gae-btn-secondary" id="gae-rescan">Rescan</button>' +
+      '  <button class="gae-btn gae-btn-danger" id="gae-abort" style="display:none;">Stop</button>' +
       '  <button class="gae-btn gae-btn-primary" id="gae-enter-all"' +
       (pendingEntries === 0 ? ' disabled' : '') + '>Enter All (' + pendingEntries + ')</button>' +
       '</div>';
@@ -638,9 +677,13 @@
     var closeBtn = document.getElementById('gae-close');
     var enterAllBtn = document.getElementById('gae-enter-all');
     var rescanBtn = document.getElementById('gae-rescan');
+    var abortBtn = document.getElementById('gae-abort');
 
     if (closeBtn) {
       closeBtn.addEventListener('click', function () {
+        // Closing while running implicitly aborts the loop so we don't
+        // leave a detached process driving DOM that no longer exists.
+        abortRequested = true;
         if (overlay) overlay.remove();
         overlay = null;
       });
@@ -658,6 +701,17 @@
           entryMethods = parseEntryMethods();
           createOverlay();
           log('Rescanned: found ' + entryMethods.length + ' entry methods', 'info');
+        }
+      });
+    }
+
+    if (abortBtn) {
+      abortBtn.addEventListener('click', function () {
+        if (isRunning) {
+          abortRequested = true;
+          abortBtn.disabled = true;
+          abortBtn.textContent = 'Stopping…';
+          log('Stop requested — finishing current entry, then halting.', 'warn');
         }
       });
     }
@@ -965,11 +1019,18 @@
   async function startAutoEntry() {
     if (isRunning) return;
     isRunning = true;
+    abortRequested = false;
 
     var enterBtn = document.getElementById('gae-enter-all');
     var rescanBtn = document.getElementById('gae-rescan');
+    var abortBtn = document.getElementById('gae-abort');
     if (enterBtn) enterBtn.disabled = true;
     if (rescanBtn) rescanBtn.disabled = true;
+    if (abortBtn) {
+      abortBtn.style.display = '';
+      abortBtn.disabled = false;
+      abortBtn.textContent = 'Stop';
+    }
 
     var pending = entryMethods.filter(function (m) { return m.status === 'pending'; });
     var total = pending.length;
@@ -980,8 +1041,10 @@
     var completed = 0;
     var failed = 0;
     var attempted = 0;
+    var aborted = false;
 
     for (var i = 0; i < entryMethods.length; i++) {
+      if (abortRequested) { aborted = true; break; }
       if (entryMethods[i].status !== 'pending') continue;
 
       try {
@@ -998,8 +1061,8 @@
         failed++;
       }
 
-      // Delay between entries
-      if (i < entryMethods.length - 1) {
+      // Delay between entries — but break out promptly on abort
+      if (i < entryMethods.length - 1 && !abortRequested) {
         await sleep(ENTRY_DELAY_MS);
       }
     }
@@ -1007,15 +1070,21 @@
     var summary = completed + ' completed';
     if (attempted > 0) summary += ', ' + attempted + ' unconfirmed';
     if (failed > 0) summary += ', ' + failed + ' failed';
-    updateProgress(total, total, 'Done! ' + summary);
-    log('Auto-entry finished. ' + summary, completed > 0 ? 'success' : 'error');
+    if (aborted) summary += ' (stopped by user)';
+    updateProgress(total, total, (aborted ? 'Stopped. ' : 'Done! ') + summary);
+    log('Auto-entry ' + (aborted ? 'aborted' : 'finished') + '. ' + summary,
+        completed > 0 ? 'success' : (aborted ? 'warn' : 'error'));
 
     isRunning = false;
+    abortRequested = false;
     if (enterBtn) {
-      enterBtn.textContent = 'Done';
-      enterBtn.disabled = true;
+      enterBtn.textContent = aborted ? 'Resume' : 'Done';
+      // Re-enable if there are still pending entries (e.g. after abort)
+      var stillPending = entryMethods.some(function (m) { return m.status === 'pending'; });
+      enterBtn.disabled = !stillPending;
     }
     if (rescanBtn) rescanBtn.disabled = false;
+    if (abortBtn) abortBtn.style.display = 'none';
 
     // Update pending count
     var pendingEl = document.getElementById('gae-pending-count');

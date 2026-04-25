@@ -927,5 +927,25 @@ function handleMessage(msg, sender, sendResponse) {
     return;
   }
 
+  // -- Coalesced popup state --
+  // The popup polls every 3s and previously fired 4 separate sendMessage
+  // calls per tick (count, links, entry-stats, plus settings/prefetch on
+  // first load). Each call wakes the service worker and round-trips
+  // through the message handler. This single read returns everything
+  // the popup renders so a poll = one IPC.
+  if (msg.type === 'get-popup-state') {
+    sendResponse({
+      count: links.length,
+      unexported: links.length - lastExportIndex,
+      apiConnected: localApiAvailable,
+      links: links,
+      entryStats: entryStats,
+      autoExportThreshold: autoExportThreshold,
+      prefetchDeadlines: prefetchDeadlines,
+      lastExportIndex: lastExportIndex
+    });
+    return;
+  }
+
   sendResponse({ error: 'unknown_message_type', type: msg && msg.type });
 }

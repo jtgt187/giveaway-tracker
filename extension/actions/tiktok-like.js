@@ -19,29 +19,51 @@
   }
 
   function isAlreadyLiked() {
-    // TikTok uses data-e2e="like-icon" or similar with an active/liked state
-    var likeBtn = document.querySelector('[data-e2e="like-icon"]');
-    if (likeBtn) {
-      // Check if the like icon has an active/filled state (color change)
-      var color = window.getComputedStyle(likeBtn).color;
-      // TikTok uses red (rgb(254, 44, 85) or #fe2c55) for liked state
-      // Check for the specific TikTok red, not just any color containing '254'
-      if (color && (color.includes('rgb(254, 44, 85)') || color.includes('rgb(255, 44, 85)') || color.includes('fe2c55'))) return true;
-      // Also check aria-pressed or class names
-      var classList = (likeBtn.className || '').toLowerCase();
+    // Strategy 1 (most reliable): aria-pressed on the like button.
+    // The like icon ([data-e2e="like-icon"]) is usually an SVG nested
+    // inside a <button aria-pressed="true|false" aria-label="Like…">.
+    // Walking from the icon up to the button is more reliable than the
+    // earlier color heuristic, which broke whenever TikTok shipped a
+    // new red shade or moved to CSS variables.
+    var likeIcon = document.querySelector('[data-e2e="like-icon"]');
+    if (likeIcon) {
+      var btn = likeIcon.closest('button, [role="button"]');
+      if (btn) {
+        var pressed = btn.getAttribute('aria-pressed');
+        if (pressed === 'true') return true;
+        if (pressed === 'false') return false; // explicit "not yet liked"
+      }
+      // Class hint on the icon itself
+      var classList = (likeIcon.className && likeIcon.className.baseVal !== undefined
+        ? likeIcon.className.baseVal // SVG className is SVGAnimatedString
+        : (likeIcon.className || '')).toLowerCase();
       if (classList.includes('active') || classList.includes('liked')) return true;
+
+      // SVG fill as a secondary signal — TikTok flips the SVG fill
+      // to its brand red when liked. We accept any reddish fill rather
+      // than the exact RGB literal that previously broke on theme changes.
+      var path = likeIcon.querySelector('path, svg');
+      if (path) {
+        var fill = (path.getAttribute('fill') || window.getComputedStyle(path).fill || '').toLowerCase();
+        // Accept any explicit non-currentColor red-ish hex/rgb token
+        if (/^#fe?[0-3][0-9a-f]/.test(fill) || /^rgb\(\s*2(?:5[0-5]|4\d|3\d)\s*,\s*(?:[0-5]\d|\d)\s*,/.test(fill)) {
+          return true;
+        }
+      }
+
+      // Color fallback (kept narrowly — only as last resort)
+      var color = (window.getComputedStyle(likeIcon).color || '').toLowerCase();
+      if (color.includes('rgb(254, 44, 85)') || color.includes('rgb(255, 44, 85)') || color.includes('fe2c55')) {
+        return true;
+      }
     }
 
-    // Check for aria-pressed on like buttons (avoid CSS case-insensitive flag for compat)
+    // Strategy 2: any aria-pressed=true with a label mentioning "like"
     var ariaButtons = document.querySelectorAll('[aria-pressed="true"]');
     for (var ab = 0; ab < ariaButtons.length; ab++) {
       var abLabel = (ariaButtons[ab].getAttribute('aria-label') || '').toLowerCase();
       if (abLabel.includes('like') && !abLabel.includes('unlike')) return true;
     }
-
-    // Check for "liked" class on any like-related element
-    var likedElements = document.querySelectorAll('[class*="like"][class*="active"], [class*="Like"][class*="active"]');
-    if (likedElements.length > 0) return true;
 
     return false;
   }
